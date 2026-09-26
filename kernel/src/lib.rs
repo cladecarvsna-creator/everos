@@ -12,6 +12,7 @@ mod fs;
 mod gui;
 mod heap;
 mod interrupts;
+mod js;
 mod keyboard;
 mod multiboot;
 mod net;

@@ -105,8 +105,8 @@ enable_paging:
     mov eax, p4_table
     mov cr3, eax
 
-    mov eax, cr4                ; enable PAE
-    or eax, 1 << 5
+    mov eax, cr4                ; enable PAE, and SSE (OSFXSR, OSXMMEXCPT)
+    or eax, (1 << 5) | (1 << 9) | (1 << 10)
     mov cr4, eax
 
     mov ecx, 0xC0000080         ; EFER MSR: set long mode bit
@@ -114,8 +114,9 @@ enable_paging:
     or eax, 1 << 8
     wrmsr
 
-    mov eax, cr0                ; enable paging
-    or eax, 1 << 31
+    mov eax, cr0                ; enable paging; SSE needs EM clear and MP set
+    and eax, ~(1 << 2)
+    or eax, (1 << 31) | (1 << 1)
     mov cr0, eax
     ret
 
@@ -137,5 +138,5 @@ p3_table:
 p2_tables:
     resb 4096 * 4
 stack_bottom:
-    resb 4096 * 64               ; 256 KiB: the desktop keeps icons on the stack
+    resb 4096 * 256              ; 1 MiB: icons live on the stack, and JavaScript recurses deeply
 stack_top:

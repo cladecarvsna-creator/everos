@@ -44,7 +44,7 @@ $(DISK):
 # Boot EverOS in a QEMU window. Serial output goes to the terminal, and
 # the taskbar clock shows local time.
 run: $(ISO) $(DISK)
-	$(QEMU) -cdrom $(ISO) -boot d -m 256M -serial stdio -rtc base=localtime \
+	$(QEMU) -cdrom $(ISO) -boot d -m 512M -serial stdio -rtc base=localtime \
 		-drive file=$(DISK),format=raw,if=ide,index=0,media=disk \
 		-nic user,model=e1000
 

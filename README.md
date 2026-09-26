@@ -87,11 +87,26 @@ EverOS — операционная система для x86_64 на ASM и Rus
   простые формы (поиск), прокрутка колёсиком, полосой и клавишами. Страницы
   грузятся по HTTP/1.1 и HTTPS (TLS 1.3, библиотека
   [embedded-tls](https://github.com/drogue-iot/embedded-tls)), с
-  перенаправлениями. HTML разбирается своим кодом и показывается сглаженными
-  шрифтами: заголовки, абзацы, жирный текст, ссылки, списки, код, таблицы
-  (построчно). Кодировки UTF-8 и Windows-1251. Пока нет JavaScript, CSS и
-  картинок, поэтому лучше всего открываются простые сайты: Википедия,
-  example.com, info.cern.ch, lite.cnn.com, text.npr.org, frogfind.com.
+  перенаправлениями и cookie. Свой движок страниц:
+  - **HTML** разбирается в дерево DOM, кодировки UTF-8 и Windows-1251.
+  - **CSS**: файлы `<link>` и `<style>`, `@import`, `@media`, каскад и
+    наследование, селекторы с классами, атрибутами, `:hover`-подобными
+    псевдоклассами и комбинаторами. Раскладка: блоки, строки, float,
+    `position`, **flexbox**, **grid**, таблицы, отступы, рамки, скругления,
+    градиенты, шрифты DejaVu (обычный, жирный, курсив, моноширинный) любого размера.
+  - **JavaScript**: настоящий движок [QuickJS](https://bellard.org/quickjs/)
+    (современный стандарт ES2023: классы, async/await, модули `import`,
+    Promise, Proxy, регулярные выражения) внутри ядра. Для скриптов есть DOM
+    (`querySelector`, `innerHTML`, `classList`, `style`, события и их
+    всплытие), таймеры, `fetch`, `XMLHttpRequest`, `localStorage`, `history`,
+    `URL`, `TextEncoder`. Каждый скрипт может работать до 4 секунд.
+  - **Картинки** PNG и JPEG (библиотеки zune-png и zune-jpeg), в том числе `data:`.
+  - **Формы**: поля ввода, флажки, списки, отправка GET и POST.
+
+  Честно о пределах: нет видео, `<canvas>`, WebGL, WebSocket, шрифтов с
+  сайтов и SVG, поэтому тяжёлые сайты (YouTube, VK, Google Docs) не
+  заработают. Хорошо открываются простые и средние сайты: Википедия,
+  example.com, info.cern.ch, Hacker News, text.npr.org, frogfind.com.
   HTTPS шифрует соединение, но сертификаты сайтов не проверяются.
 - **Графика**: GRUB включает режим 1920x1080x32. Если GRUB не дал графику,
   ядро работает в текстовом режиме VGA 80x25 с одной оболочкой.
@@ -134,9 +149,10 @@ EverOS — операционная система для x86_64 на ASM и Rus
 | `kernel/src/interrupts.rs` | IDT, PIC, таймер |
 | `kernel/src/keyboard.rs`, `ps2.rs`, `vmmouse.rs` | клавиатура, мышь PS/2 и абсолютная мышь VMware |
 | `kernel/src/shell.rs` | оболочка |
-| `kernel/src/heap.rs` | куча ядра (48 МиБ) для `Vec`, `String` и сети |
+| `kernel/src/heap.rs` | куча ядра (128 МиБ) для `Vec`, `String` и сети |
 | `kernel/src/pci.rs`, `kernel/src/net/` | шина PCI, драйвер e1000 (`e1000.rs`), TCP/IP, DHCP, DNS (`mod.rs`) |
-| `kernel/src/web/` | движок браузера: адреса (`url.rs`), HTTP и HTTPS (`http.rs`), разбор HTML (`html.rs`), перенос строк (`layout.rs`) |
+| `kernel/src/web/` | движок браузера: адреса (`url.rs`), HTTP и HTTPS (`http.rs`), DOM (`dom.rs`), CSS (`css.rs`, `style.rs`), раскладка (`layout.rs`), картинки (`image.rs`), страница и мост к JavaScript (`page.rs`, `runtime.js`) |
+| `kernel/src/js/`, `kernel/quickjs/` | движок JavaScript QuickJS (C, собирается clang из `kernel/build.rs`) и маленькая libc для него |
 | `kernel/src/gui/browser.rs` | окно браузера: панель, адресная строка, страница, прокрутка |
 | `kernel/src/fs/` | файлы: драйвер диска ATA (`ata.rs`), FAT32 с длинными именами и форматирование (`fat.rs`), пути и домашние папки (`mod.rs`) |
 | `kernel/src/gui/notepad.rs` | Блокнот |
@@ -144,7 +160,6 @@ EverOS — операционная система для x86_64 на ASM и Rus
 | `kernel/src/gui/filedialog.rs`, `widgets.rs` | окна Open и Save as; общие части: буфер обмена, поле ввода, меню, сообщения, полосы прокрутки, значки файлов и папок |
 | `fonts/`, `scripts/gen-font.py` | шрифт Terminus и генератор `kernel/src/font_data.rs` |
 | `scripts/gen-aa-font.py` | сглаженные шрифты DejaVu для рабочего стола, генерирует `kernel/src/gui/font_data.rs` (нужен Pillow) |
-| `scripts/gen-web-font.py` | шрифты страниц браузера, генерирует `kernel/src/gui/web_font_data.rs` |
 | `linker.ld` | скрипт линкера, ядро грузится по адресу 1 МиБ |
 | `iso/boot/grub/grub.cfg` | конфиг GRUB для загрузочного ISO |
 | `scripts/boot-test.sh` | запуск в QEMU без экрана: проверка старта ядра, рабочего стола, ввода с клавиатуры, загрузки страницы по сети и того, что файл на диске остаётся после перезапуска |
@@ -163,7 +178,7 @@ CI собирает ISO при каждом изменении в `main` и вы
 
    ```powershell
    & "C:\Program Files\qemu\qemu-img.exe" create -f vpc -o subformat=fixed everos-disk.vhd 128M
-   & "C:\Program Files\qemu\qemu-system-x86_64.exe" -cdrom everos.iso -boot d -m 256M -nic user,model=e1000 -drive file=everos-disk.vhd,format=vpc,if=ide,index=0,media=disk
+   & "C:\Program Files\qemu\qemu-system-x86_64.exe" -cdrom everos.iso -boot d -m 512M -nic user,model=e1000 -drive file=everos-disk.vhd,format=vpc,if=ide,index=0,media=disk
    ```
 
    Первая команда нужна один раз: она создаёт диск `everos-disk.vhd` на
@@ -193,7 +208,7 @@ EverOS извлеките этот диск (правый щелчок → «И�
 На Ubuntu/Debian:
 
 ```sh
-sudo apt install nasm build-essential grub-pc-bin grub-common xorriso mtools qemu-system-x86
+sudo apt install nasm build-essential clang grub-pc-bin grub-common xorriso mtools qemu-system-x86
 ```
 
 ### Команды

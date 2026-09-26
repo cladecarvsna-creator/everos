@@ -54,6 +54,16 @@ impl Url {
         })
     }
 
+    /// Parse an address that must start with http:// or https://.
+    pub fn parse_absolute(text: &str) -> Option<Url> {
+        let t = text.trim().to_ascii_lowercase();
+        if t.starts_with("http://") || t.starts_with("https://") {
+            Url::parse(text)
+        } else {
+            None
+        }
+    }
+
     /// Resolve a link found on this page.
     pub fn join(&self, link: &str) -> Option<Url> {
         let link = link.trim();
@@ -181,4 +191,25 @@ pub fn encode_query(text: &str) -> String {
         }
     }
     out
+}
+
+/// Undo %XX escapes (for javascript: links).
+pub fn decode_percent(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = alloc::vec::Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) =
+                u8::from_str_radix(core::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16)
+            {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }

@@ -30,7 +30,7 @@ mod text;
 mod theme;
 mod tray;
 #[rustfmt::skip]
-mod web_font_data;
+pub mod webfont;
 mod widgets;
 
 use alloc::boxed::Box;

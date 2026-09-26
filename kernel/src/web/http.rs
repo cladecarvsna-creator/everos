@@ -4,6 +4,7 @@
 //! HTTPS encrypts the connection but does not check the server's
 //! certificate: EverOS has no list of trusted certificate authorities.
 
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -24,47 +25,107 @@ const MAX_REDIRECTS: usize = 8;
 pub struct Response {
     /// Where the page came from, after redirects.
     pub url: Url,
+    pub status: u16,
     pub content_type: String,
     pub body: Vec<u8>,
 }
 
 /// Download `url`, following redirects. With `form`, send it as a POST.
-pub fn get(url: &Url, mut form: Option<&str>) -> Result<Response, String> {
+pub fn get(url: &Url, form: Option<&str>) -> Result<Response, String> {
+    match form {
+        Some(f) => request(
+            "POST",
+            url,
+            Some(("application/x-www-form-urlencoded", f.as_bytes())),
+        ),
+        None => request("GET", url, None),
+    }
+}
+
+/// Send a request with any method and an optional (content type, body).
+pub fn request(
+    method: &str,
+    url: &Url,
+    mut body: Option<(&str, &[u8])>,
+) -> Result<Response, String> {
     let mut url = url.clone();
+    let mut method = method.to_string();
     for _ in 0..MAX_REDIRECTS {
-        let raw = fetch_raw(&url, form)?;
-        // redirects after a POST are plain GETs
-        form = None;
+        let raw = fetch_raw(&method, &url, body)?;
         let head = parse_head(&raw).ok_or("bad reply from server")?;
-        if (300..400).contains(&head.status) {
+        for c in &head.cookies {
+            store_cookie(&url.host, c);
+        }
+        if (300..400).contains(&head.status) && head.status != 304 {
             if let Some(location) = &head.location {
                 url = url.join(location).ok_or("bad redirect")?;
+                // redirects after a POST are plain GETs
+                if head.status != 307 && head.status != 308 {
+                    method = String::from("GET");
+                    body = None;
+                }
                 continue;
             }
         }
-        let body = &raw[head.body_start..];
-        let body = if head.chunked {
-            dechunk(body)
+        let data = &raw[head.body_start..];
+        let data = if head.chunked {
+            dechunk(data)
         } else {
             match head.content_length {
-                Some(n) => body[..n.min(body.len())].to_vec(),
-                None => body.to_vec(),
+                Some(n) => data[..n.min(data.len())].to_vec(),
+                None => data.to_vec(),
             }
         };
         return Ok(Response {
             url,
+            status: head.status,
             content_type: head.content_type,
-            body,
+            body: data,
         });
     }
     Err("too many redirects".to_string())
 }
 
-fn fetch_raw(url: &Url, form: Option<&str>) -> Result<Vec<u8>, String> {
-    log(
-        if form.is_some() { "POST " } else { "GET " },
-        &url.to_string(),
-    );
+/// Cookies by host: name and value.
+static COOKIES: crate::sync::IrqMutex<BTreeMap<String, Vec<(String, String)>>> =
+    crate::sync::IrqMutex::new(BTreeMap::new());
+
+/// Store a Set-Cookie header (or a document.cookie assignment) for a host.
+pub fn store_cookie(host: &str, header: &str) {
+    let first = header.split(';').next().unwrap_or("");
+    let Some((name, value)) = first.split_once('=') else {
+        return;
+    };
+    let (name, value) = (name.trim().to_string(), value.trim().to_string());
+    let expired = header.to_ascii_lowercase().contains("max-age=0");
+    // cookies set for the parent domain go to the host we talk to
+    let mut jar = COOKIES.lock();
+    let list = jar.entry(host.to_string()).or_default();
+    list.retain(|(n, _)| *n != name);
+    if !expired && list.len() < 64 {
+        list.push((name, value));
+    }
+}
+
+/// The Cookie header value for a host.
+pub fn cookies(host: &str) -> String {
+    let jar = COOKIES.lock();
+    let mut out = String::new();
+    if let Some(list) = jar.get(host) {
+        for (n, v) in list {
+            if !out.is_empty() {
+                out.push_str("; ");
+            }
+            out.push_str(n);
+            out.push('=');
+            out.push_str(v);
+        }
+    }
+    out
+}
+
+fn fetch_raw(method: &str, url: &Url, body: Option<(&str, &[u8])>) -> Result<Vec<u8>, String> {
+    log(&format!("{} ", method), &url.to_string());
     let ip = net::resolve(&url.host)?;
     let mut stream = TcpStream::connect(ip, url.port)?;
     let host = if url.port == if url.https { 443 } else { 80 } {
@@ -73,25 +134,32 @@ fn fetch_raw(url: &Url, form: Option<&str>) -> Result<Vec<u8>, String> {
         format!("{}:{}", url.host, url.port)
     };
     let mut request = format!(
-        "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0 (EverOS; x86_64) EverBrowser/0.1\r\n\
-         Accept: text/html,text/plain;q=0.9,*/*;q=0.5\r\nAccept-Language: ru,en;q=0.8\r\n\
+        "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0 (EverOS; x86_64) EverBrowser/0.2\r\n\
+         Accept: text/html,application/xhtml+xml,*/*;q=0.8\r\nAccept-Language: ru,en;q=0.8\r\n\
          Accept-Encoding: identity\r\nConnection: close\r\n",
-        if form.is_some() { "POST" } else { "GET" },
-        url.path,
-        host
+        method, url.path, host
     );
-    match form {
-        Some(body) => {
-            request.push_str(&format!(
-                "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            ));
+    let cookie = cookies(&url.host);
+    if !cookie.is_empty() {
+        request.push_str(&format!("Cookie: {}\r\n", cookie));
+    }
+    let mut request = request.into_bytes();
+    match body {
+        Some((ty, data)) => {
+            request.extend_from_slice(
+                format!(
+                    "Content-Type: {}\r\nContent-Length: {}\r\n\r\n",
+                    ty,
+                    data.len()
+                )
+                .as_bytes(),
+            );
+            request.extend_from_slice(data);
         }
-        None => request.push_str("\r\n"),
+        None => request.extend_from_slice(b"\r\n"),
     }
     if !url.https {
-        stream.write_all(request.as_bytes())?;
+        stream.write_all(&request)?;
         return read_response(|buf| stream.read(buf));
     }
 
@@ -107,9 +175,17 @@ fn fetch_raw(url: &Url, form: Option<&str>) -> Result<Vec<u8>, String> {
         UnsecureProvider::new::<Aes128GcmSha256>(Rng::new()),
     ))
     .map_err(|e| format!("TLS handshake failed: {:?}", e))?;
-    tls.write(request.as_bytes())
-        .and_then(|_| tls.flush())
-        .map_err(|e| format!("TLS: {:?}", e))?;
+    let mut sent = 0;
+    while sent < request.len() {
+        let n = tls
+            .write(&request[sent..])
+            .map_err(|e| format!("TLS: {:?}", e))?;
+        tls.flush().map_err(|e| format!("TLS: {:?}", e))?;
+        if n == 0 {
+            return Err("TLS: could not send".to_string());
+        }
+        sent += n;
+    }
     read_response(|buf| match tls.read(buf) {
         Ok(n) => Ok(n),
         // the server closing the connection ends the page
@@ -172,6 +248,7 @@ struct Head {
     content_length: Option<usize>,
     chunked: bool,
     body_start: usize,
+    cookies: Vec<String>,
 }
 
 fn parse_head(data: &[u8]) -> Option<Head> {
@@ -187,6 +264,7 @@ fn parse_head(data: &[u8]) -> Option<Head> {
         content_length: None,
         chunked: false,
         body_start: end + 4,
+        cookies: Vec::new(),
     };
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
@@ -198,6 +276,7 @@ fn parse_head(data: &[u8]) -> Option<Head> {
             "location" => head.location = Some(value.to_string()),
             "content-length" => head.content_length = value.parse().ok(),
             "transfer-encoding" => head.chunked = value.to_ascii_lowercase().contains("chunked"),
+            "set-cookie" => head.cookies.push(value.to_string()),
             _ => {}
         }
     }

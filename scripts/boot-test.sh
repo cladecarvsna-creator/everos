@@ -29,7 +29,7 @@ web=$!
 # start QEMU with the disk; the serial log starts empty
 boot() {
     rm -f "$log" "$monitor"
-    timeout 90 qemu-system-x86_64 -cdrom "$iso" -boot d -m 256M -display none \
+    timeout 90 qemu-system-x86_64 -cdrom "$iso" -boot d -m 512M -display none \
         -serial "file:$log" -monitor "unix:$monitor,server,nowait" -no-reboot \
         -drive "file=$disk,format=raw,if=ide,index=0,media=disk" \
         -nic user,model=e1000 2> /dev/null &
