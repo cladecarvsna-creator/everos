@@ -19,6 +19,8 @@ use crate::serial;
 pub enum Pic {
     Computer,
     Drives,
+    BinEmpty,
+    BinFull,
 }
 
 /// Icon sizes, in pixels.
@@ -32,7 +34,7 @@ struct Set([Vec<u32>; 3]);
 
 pub struct Icons {
     apps: Vec<Set>,
-    pics: [Set; 2],
+    pics: [Set; 4],
 }
 
 static ICONS: AtomicPtr<Icons> = AtomicPtr::new(core::ptr::null_mut());
@@ -88,6 +90,8 @@ impl Icons {
         let pics = [
             pic(include_bytes!("../../assets/icons/computer.bmp")),
             pic(include_bytes!("../../assets/icons/drives.bmp")),
+            recycle_bin(false),
+            recycle_bin(true),
         ];
         // for the boot test
         let mut line = crate::StackString::<40>::new();
@@ -135,6 +139,111 @@ impl Set {
 }
 
 const TRANSPARENT: u32 = 0xffc8_c8c8;
+
+/// The Recycle Bin, drawn at 4x and shrunk so it is smooth: a glassy
+/// blue bin with the recycling arrows, and paper in it when `full`.
+fn recycle_bin(full: bool) -> Set {
+    const S: i32 = 192;
+    let mut big = vec![TRANSPARENT; (S * S) as usize];
+    let mut c = Canvas::new(&mut big, S as usize, S as usize);
+    if full {
+        // crumpled paper sticking out of the top
+        c.fill_polygon(
+            &[(44, 40), (84, 10), (112, 30), (100, 52), (48, 52)],
+            0xf4f4f0,
+        );
+        c.fill_polygon(&[(90, 36), (136, 12), (156, 46), (116, 56)], 0xe4e2da);
+        c.fill_polygon(&[(60, 26), (76, 16), (84, 40), (66, 46)], 0xffffff);
+        c.fill_polygon(&[(124, 22), (134, 18), (144, 40), (128, 44)], 0xd0cec4);
+    }
+    // the body narrows to the bottom
+    c.fill_polygon(
+        &[(26, 44), (166, 44), (150, 186), (42, 186)],
+        rgb(0x1c, 0x5a, 0xa6),
+    );
+    c.fill_polygon(
+        &[(33, 52), (159, 52), (144, 179), (48, 179)],
+        rgb(0x5a, 0xa2, 0xe6),
+    );
+    // glass shine on the left
+    c.fill_polygon(
+        &[(38, 54), (70, 54), (66, 176), (52, 176)],
+        rgb(0x9c, 0xcc, 0xf4),
+    );
+    // the rim
+    c.fill_round(Rect::new(18, 32, 156, 22), 10, rgb(0x16, 0x4c, 0x92));
+    c.fill_round(Rect::new(23, 35, 146, 12), 6, rgb(0x6c, 0xac, 0xe8));
+    // three arrows chasing each other round a triangle
+    let (cx, cy, r) = (98, 118, 44);
+    let corner = |k: i32| {
+        let (s, co) = sin_cos(k * 120 - 90);
+        (cx + co * r / 1000, cy + s * r / 1000)
+    };
+    let green = rgb(0x12, 0x8a, 0x3a);
+    for k in 0..3 {
+        let (a, b) = (corner(k), corner(k + 1));
+        // from a bit after one corner to a bit before the next
+        let at = |t: i32| (a.0 + (b.0 - a.0) * t / 100, a.1 + (b.1 - a.1) * t / 100);
+        let (p0, p1) = (at(14), at(66));
+        thick_line(&mut c, p0, p1, 7, green);
+        // the arrowhead, pointing at the next corner
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let len = super::canvas::isqrt((dx * dx + dy * dy) as u64) as i32;
+        let (nx, ny) = (-dy * 16 / len, dx * 16 / len);
+        let tip = at(88);
+        c.fill_polygon(
+            &[tip, (p1.0 + nx, p1.1 + ny), (p1.0 - nx, p1.1 - ny)],
+            green,
+        );
+    }
+    Picture::from_drawing(&big, S as usize).set()
+}
+
+/// A line `w` pixels either side of the one from `a` to `b`.
+fn thick_line(c: &mut Canvas, a: (i32, i32), b: (i32, i32), w: i32, color: u32) {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len = super::canvas::isqrt((dx * dx + dy * dy) as u64).max(1) as i32;
+    let (nx, ny) = (-dy * w / len, dx * w / len);
+    c.fill_polygon(
+        &[
+            (a.0 + nx, a.1 + ny),
+            (b.0 + nx, b.1 + ny),
+            (b.0 - nx, b.1 - ny),
+            (a.0 - nx, a.1 - ny),
+        ],
+        color,
+    );
+}
+
+/// sin and cos of a whole number of degrees, times 1000.
+fn sin_cos(deg: i32) -> (i32, i32) {
+    const SIN: [i32; 91] = {
+        let mut t = [0; 91];
+        let mut i = 0;
+        while i <= 90 {
+            // a Bhaskara approximation, good to about 0.2%
+            let x = i as i64;
+            t[i] = (4000 * x * (180 - x) / (40500 - x * (180 - x))) as i32;
+            i += 1;
+        }
+        t
+    };
+    let d = deg.rem_euclid(360);
+    let s = match d {
+        0..=90 => SIN[d as usize],
+        91..=180 => SIN[(180 - d) as usize],
+        181..=270 => -SIN[(d - 180) as usize],
+        _ => -SIN[(360 - d) as usize],
+    };
+    let dc = (d + 90).rem_euclid(360);
+    let co = match dc {
+        0..=90 => SIN[dc as usize],
+        91..=180 => SIN[(180 - dc) as usize],
+        181..=270 => -SIN[(dc - 180) as usize],
+        _ => -SIN[(360 - dc) as usize],
+    };
+    (s, co)
+}
 
 /// A square picture with straight (not premultiplied) alpha.
 struct Picture {

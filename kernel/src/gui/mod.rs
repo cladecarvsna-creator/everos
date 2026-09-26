@@ -10,6 +10,10 @@
 //! and fade when they open and close and fly to the taskbar when
 //! minimised, the start menu slides up, and highlights fade in and out.
 //! Animations follow the timer, and each frame redraws only what moves.
+//!
+//! The taskbar (taskbar.rs) has search (search.rs), pinned apps and Task
+//! View; windows live on virtual desktops (desktops.rs); the desktop has
+//! icons with a selection rectangle and the Recycle Bin (deskicons.rs).
 
 mod about;
 mod anim;
@@ -17,6 +21,8 @@ mod browser;
 mod calc;
 mod canvas;
 mod demo;
+mod deskicons;
+mod desktops;
 mod explorer;
 mod filedialog;
 #[rustfmt::skip]
@@ -25,8 +31,11 @@ mod icons;
 mod login;
 mod notepad;
 mod paint;
+mod popup;
+mod search;
 mod settings;
 mod start;
+mod taskbar;
 mod terminal;
 mod text;
 mod theme;
@@ -37,19 +46,25 @@ mod widgets;
 
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use anim::{lerp, Fader, Tween, ONE};
 use canvas::{fast_mix, mix, rgb, Canvas, Dirty, Rect};
+use deskicons::DeskIcons;
+use desktops::{Switcher, TaskView};
 use icons::Icons;
 use login::Login;
+use popup::{Cmd, Popup};
+use search::Search;
 use start::StartMenu;
+use taskbar::TaskItem;
 use tray::{Panel, Tray};
 
 use crate::framebuffer::Framebuffer;
 use crate::interrupts::{self, KEYBOARD_BYTES, MOUSE_BYTES};
-use crate::keyboard::{Key, Keyboard, Layout};
+use crate::keyboard::{self, Key, Keyboard, Layout};
 use crate::multiboot::BootInfo;
 use crate::sync::{ByteQueue, IrqMutex, StaticBuffer};
 use crate::{console::CONSOLE, fs, port, ps2, rtc, serial, users, vmmouse, StackString};
@@ -145,6 +160,40 @@ impl App {
         }
     }
 
+    /// A name for settings files.
+    fn key(self) -> &'static str {
+        match self {
+            App::Terminal => "terminal",
+            App::Explorer => "explorer",
+            App::Notepad => "notepad",
+            App::Paint => "paint",
+            App::Calculator => "calculator",
+            App::Demo => "graphics",
+            App::Browser => "browser",
+            App::Settings => "settings",
+            App::About => "about",
+        }
+    }
+
+    fn from_key(key: &str) -> Option<App> {
+        APPS.into_iter().find(|a| a.key() == key)
+    }
+
+    /// Other words search finds the app by, in English and Russian.
+    fn keywords(self) -> &'static str {
+        match self {
+            App::Terminal => "cmd console shell command терминал консоль командная",
+            App::Explorer => "files folders this pc проводник файлы папки компьютер",
+            App::Notepad => "text editor блокнот текст редактор",
+            App::Paint => "draw picture рисование паинт",
+            App::Calculator => "calc калькулятор",
+            App::Demo => "demo графика демо",
+            App::Browser => "web internet browser браузер интернет",
+            App::Settings => "control panel options параметры настройки",
+            App::About => "about system winver о системе",
+        }
+    }
+
     fn default_position(self) -> (i32, i32) {
         match self {
             App::Terminal => (240, 70),
@@ -237,11 +286,17 @@ struct Window {
     open: bool,
     minimized: bool,
     anim: Option<WindowAnim>,
+    /// The virtual desktop it is on, and whether that is not the one
+    /// shown now.
+    desk: usize,
+    away: bool,
+    /// When it opened, for the order of taskbar buttons.
+    opened: u64,
 }
 
 impl Window {
     fn visible(&self) -> bool {
-        self.open && !self.minimized
+        self.open && !self.minimized && !self.away
     }
 
     /// Whether it is on the screen, also while it animates away.
@@ -303,11 +358,14 @@ enum Phase {
 enum Hover {
     Minimize(App),
     Close(App),
-    /// A taskbar button: 0 is Start, then the apps.
-    Slot(usize),
-    /// A tray button: the layout, quick settings or the clock.
+    /// A button in the middle of the taskbar.
+    Task(TaskItem),
+    /// A tray button: the layout, quick settings, the clock or ^.
     Tray(usize),
+    ShowDesktop,
     Quick(tray::Target),
+    /// An icon behind ^.
+    Hidden(usize),
 }
 
 pub struct Desktop<'a> {
@@ -360,8 +418,6 @@ pub struct Desktop<'a> {
     vm_buttons: (bool, bool),
     /// Last vmmouse position, to tell moves from button-only events.
     vm_position: (u32, u32),
-    selected_icon: Option<usize>,
-    last_click: (u64, usize),
 
     layout: Layout,
     clock: StackString<16>,
@@ -384,6 +440,32 @@ pub struct Desktop<'a> {
     about: about::About,
     /// The window the mouse was last over, for hover highlights.
     hover_app: Option<App>,
+
+    /// Apps pinned to the taskbar, in order.
+    pins: Vec<App>,
+    /// What the mouse rests on, since when, and its tooltip.
+    hover_now: Option<Hover>,
+    hover_since: u64,
+    tip_checked: bool,
+    tip: Option<(Rect, String)>,
+    /// Windows "Show desktop" minimised, to bring back.
+    peeked: Vec<App>,
+    popup: Option<Popup>,
+    search: Box<Search>,
+    /// Asking before emptying the Recycle Bin.
+    confirm_empty: bool,
+    desk_count: usize,
+    current_desk: usize,
+    /// Sliding to another desktop: progress and direction.
+    slide: Option<(Tween, i32)>,
+    /// Fading from SNAPSHOT to the new screen (Task View opening).
+    crossfade: Option<Tween>,
+    tv: TaskView,
+    switcher: Option<Switcher>,
+    /// The wallpaper shrunk, for desktop pictures in Task View.
+    wall_thumb: Vec<u32>,
+    desk_icons: DeskIcons,
+    open_count: u64,
 }
 
 impl<'a> Desktop<'a> {
@@ -395,6 +477,9 @@ impl<'a> Desktop<'a> {
             open: false,
             minimized: false,
             anim: None,
+            desk: 0,
+            away: false,
+            opened: 0,
         }; APPS.len()];
         for app in APPS {
             let (w, h) = app.client_size();
@@ -414,6 +499,18 @@ impl<'a> Desktop<'a> {
         let wallpaper = WALLPAPER.take();
         draw_wallpaper(&mut Canvas::new(wallpaper, width as usize, height as usize));
         let login = Login::new(wallpaper, BACKDROP.take(), width, height);
+        let mut wall_thumb = alloc::vec![0u32; (desktops::TILE_W * desktops::TILE_H) as usize];
+        Canvas::new(
+            &mut wall_thumb,
+            desktops::TILE_W as usize,
+            desktops::TILE_H as usize,
+        )
+        .blit_smooth(
+            Rect::new(0, 0, desktops::TILE_W, desktops::TILE_H),
+            wallpaper,
+            width,
+            height,
+        );
         Self {
             fb,
             back: BACK_BUFFER.take(),
@@ -451,8 +548,6 @@ impl<'a> Desktop<'a> {
             ps2_buttons: (false, false),
             vm_buttons: (false, false),
             vm_position: (0, 0),
-            selected_icon: None,
-            last_click: (0, usize::MAX),
             layout: Layout::Us,
             clock: StackString::new(),
             date: StackString::new(),
@@ -471,6 +566,24 @@ impl<'a> Desktop<'a> {
             settings: settings::Settings::new(),
             about: about::About::new(),
             hover_app: None,
+            pins: taskbar::DEFAULT_PINS.to_vec(),
+            hover_now: None,
+            hover_since: 0,
+            tip_checked: true,
+            tip: None,
+            peeked: Vec::new(),
+            popup: None,
+            search: Box::new(Search::new()),
+            confirm_empty: false,
+            desk_count: 1,
+            current_desk: 0,
+            slide: None,
+            crossfade: None,
+            tv: TaskView::new(),
+            switcher: None,
+            wall_thumb,
+            desk_icons: DeskIcons::new(),
+            open_count: 0,
         }
     }
 
@@ -513,7 +626,12 @@ impl<'a> Desktop<'a> {
     /// Where a window minimises to: a small frame over its taskbar button.
     fn minimized_rect(&self, app: App) -> Rect {
         let r = self.windows[app.index()].rect;
-        let slot = self.slot_rect(app.index() + 1);
+        let slot = self.task_rect(TaskItem::App(app)).unwrap_or(Rect::new(
+            self.width / 2 - 22,
+            self.height - TASKBAR_H,
+            44,
+            40,
+        ));
         let (w, h) = (r.w / 6, r.h / 6);
         Rect::new(
             slot.x + slot.w / 2 - w / 2,
@@ -613,6 +731,15 @@ impl<'a> Desktop<'a> {
                 self.damage(self.hover_rect(h));
             }
         }
+        if self.slide.is_some_and(|(t, _)| t.done()) {
+            self.slide = None;
+            self.damage(self.screen());
+        }
+        if self.crossfade.is_some_and(|t| t.done()) {
+            self.crossfade = None;
+            self.damage(self.screen());
+        }
+        self.tick_tip();
     }
 
     // ---- signing in and out -----------------------------------------------
@@ -643,6 +770,10 @@ impl<'a> Desktop<'a> {
             self.session_user = user;
             *self.notepad = notepad::Notepad::new();
             *self.explorer = explorer::Explorer::new();
+            self.load_pins();
+            self.search.forget();
+            self.desk_icons = DeskIcons::new();
+            self.refresh_icons();
         }
         self.phase = Phase::Unlocking(Tween::new(0, ONE, anim::ms(450)));
         self.damage(self.screen());
@@ -662,6 +793,14 @@ impl<'a> Desktop<'a> {
         self.slider = None;
         self.drag = None;
         self.capture = None;
+        self.popup = None;
+        self.tip = None;
+        self.search.open = false;
+        self.switcher = None;
+        self.confirm_empty = false;
+        self.tv.open = false;
+        self.slide = None;
+        self.crossfade = None;
         self.take_snapshot();
         if sign_out {
             users::sign_out();
@@ -679,9 +818,14 @@ impl<'a> Desktop<'a> {
             w.open = false;
             w.minimized = false;
             w.anim = None;
+            w.desk = 0;
+            w.away = false;
         }
         self.order_len = 0;
         self.focused = None;
+        self.desk_count = 1;
+        self.current_desk = 0;
+        self.peeked.clear();
     }
 
     fn login_outcome(&mut self, outcome: login::Outcome) {
@@ -747,6 +891,13 @@ impl<'a> Desktop<'a> {
         }
     }
 
+    /// Show a folder in File Explorer.
+    fn show_folder(&mut self, path: &str) {
+        self.explorer.show(path);
+        self.open(App::Explorer);
+        self.app_changed(App::Explorer);
+    }
+
     /// Open a file in Notepad.
     fn open_file(&mut self, path: &str) {
         self.open(App::Notepad);
@@ -757,10 +908,20 @@ impl<'a> Desktop<'a> {
     // ---- window management ----------------------------------------------
 
     fn open(&mut self, app: App) {
+        let w = self.windows[app.index()];
+        if w.open && w.away {
+            // it is on another desktop: go there
+            self.switch_desktop(w.desk);
+        }
+        self.open_count += 1;
+        let (count, desk) = (self.open_count, self.current_desk);
         let w = &mut self.windows[app.index()];
         if !w.open {
             w.open = true;
             w.minimized = false;
+            w.desk = desk;
+            w.away = false;
+            w.opened = count;
             // for the boot test, which only sees the serial port
             serial::write_str("\ndesktop: opened ");
             serial::write_str(app.title());
@@ -816,6 +977,90 @@ impl<'a> Desktop<'a> {
         if let Some(i) = self.order[..self.order_len].iter().position(|&a| a == app) {
             self.order.copy_within(i + 1..self.order_len, i);
             self.order_len -= 1;
+        }
+    }
+
+    /// Let the desktop have the keyboard: no window is active.
+    fn focused_away(&mut self) {
+        if let Some(old) = self.focused.take() {
+            self.damage_window(old);
+            self.damage_taskbar();
+        }
+    }
+
+    /// Show a right-click menu.
+    fn show_popup(&mut self, menu: Popup) {
+        if let Some(old) = self.popup.take() {
+            self.damage(old.bounds());
+        }
+        self.hover_moved(None);
+        self.damage(menu.bounds());
+        self.popup = Some(menu);
+    }
+
+    fn close_popup(&mut self) {
+        if let Some(old) = self.popup.take() {
+            self.damage(old.bounds());
+        }
+    }
+
+    /// Do what a right-click menu item says.
+    fn run_cmd(&mut self, cmd: Cmd) {
+        self.close_popup();
+        match cmd {
+            Cmd::Open(app) => self.open(app),
+            Cmd::Pin(app) => self.pin(app),
+            Cmd::Unpin(app) => self.unpin(app),
+            Cmd::Close(app) => {
+                self.close(app);
+                if self.tv.open {
+                    self.damage(self.screen());
+                }
+            }
+            Cmd::Minimize(app) => self.minimize(app),
+            Cmd::MoveTo(app, d) => self.move_to_desktop(app, Some(d)),
+            Cmd::MoveToNew(app) => self.move_to_desktop(app, None),
+            Cmd::NewDesktop => {
+                if let Some(d) = self.new_desktop() {
+                    self.switch_desktop(d);
+                }
+            }
+            Cmd::TaskView => self.toggle_task_view(),
+            Cmd::ShowDesktop => self.toggle_show_desktop(),
+            Cmd::Search => self.open_search(),
+            Cmd::OpenIcon(i) => self.open_icon(i),
+            Cmd::RenameIcon(i) => self.rename_icon(i),
+            Cmd::DeleteIcons => self.delete_icons(),
+            Cmd::EmptyBin => {
+                self.confirm_empty = true;
+                self.damage(self.screen());
+            }
+            Cmd::Refresh => {
+                self.desk_icons.forget();
+                self.refresh_icons();
+            }
+            Cmd::NewFolder => self.new_on_desktop(true),
+            Cmd::NewFile => self.new_on_desktop(false),
+            Cmd::Lock => self.lock(false),
+            Cmd::SignOut => self.lock(true),
+            Cmd::Restart => restart(),
+            Cmd::ShutDown => shut_down(),
+        }
+    }
+
+    /// The Yes and No of "Empty the Recycle Bin?".
+    fn confirm_rects(&self) -> (Rect, Vec<Rect>) {
+        let area = Rect::new(0, 0, self.width, self.height - TASKBAR_H);
+        let r = widgets::message_rect(area, &CONFIRM_LINES, &["Yes", "No"]);
+        (r, widgets::message_buttons(r, 2))
+    }
+
+    fn answer_confirm(&mut self, yes: bool) {
+        self.confirm_empty = false;
+        self.damage(self.screen());
+        if yes {
+            self.empty_bin();
+            self.app_changed(App::Explorer);
         }
     }
 
@@ -891,11 +1136,69 @@ impl<'a> Desktop<'a> {
             self.damage_client(App::Settings);
             return;
         }
+        if self.confirm_empty {
+            match key {
+                Key::Enter => self.answer_confirm(true),
+                Key::Escape => self.answer_confirm(false),
+                _ => {}
+            }
+            return;
+        }
+        if self.popup.is_some() {
+            self.close_popup();
+            if let Key::Escape = key {
+                return;
+            }
+        }
+        // Alt+Tab and Alt+F4
+        if let Key::AltUp = key {
+            self.alt_up();
+            return;
+        }
+        if keyboard::alt_held() {
+            match key {
+                Key::Char('\t') => return self.alt_tab(),
+                Key::Function(4) => {
+                    if let Some(app) = self.focused {
+                        self.close(app);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if self.switcher.is_some() {
+            if let Key::Escape = key {
+                self.cancel_switcher();
+            }
+            return;
+        }
+        if keyboard::super_held() {
+            self.win_shortcut(key);
+            return;
+        }
+        if let Key::Super = key {
+            if self.start.open {
+                self.close_menu();
+            } else {
+                self.open_menu();
+            }
+            return;
+        }
+        if self.tv.open {
+            self.tv_key(key);
+            return;
+        }
         if self.panel.is_some() {
             if let Key::Escape = key {
                 self.close_panel();
                 return;
             }
+        }
+        if self.search.open {
+            let action = self.search.on_key(key);
+            self.search_action(action);
+            return;
         }
         if self.start.open {
             match self.start.on_key(key) {
@@ -904,11 +1207,10 @@ impl<'a> Desktop<'a> {
             }
             return;
         }
-        if let Key::Super = key {
-            self.open_menu();
-            return;
-        }
         let Some(app) = self.focused else {
+            if matches!(self.phase, Phase::Desktop) {
+                self.icons_key(key);
+            }
             return;
         };
         let changed = match app {
@@ -926,6 +1228,47 @@ impl<'a> Desktop<'a> {
         if changed {
             self.cursor_on = true;
             self.app_changed(app);
+        }
+    }
+
+    /// Win plus a key.
+    fn win_shortcut(&mut self, key: Key) {
+        let ctrl = keyboard::ctrl_held();
+        match key {
+            Key::Char('\t') => self.toggle_task_view(),
+            Key::Left if ctrl => {
+                let d = self.current_desk;
+                if d > 0 {
+                    self.switch_desktop(d - 1);
+                }
+            }
+            Key::Right if ctrl => self.switch_desktop(self.current_desk + 1),
+            Key::Ctrl('d') => {
+                if let Some(d) = self.new_desktop() {
+                    self.switch_desktop(d);
+                }
+            }
+            Key::Function(4) if ctrl => {
+                let d = self.current_desk;
+                self.close_desktop(d);
+            }
+            Key::Char(c) => match c.to_ascii_lowercase() {
+                'd' | 'в' | 'm' | 'ь' => self.toggle_show_desktop(),
+                'e' | 'у' => {
+                    self.explorer.start();
+                    self.open(App::Explorer);
+                }
+                's' | 'ы' | 'q' | 'й' => self.open_search(),
+                'l' | 'д' => self.lock(false),
+                'i' | 'ш' => self.open(App::Settings),
+                'x' | 'ч' => {
+                    let r = self.task_rect(TaskItem::Start).unwrap_or_default();
+                    let menu = self.start_menu_popup(r.x, self.height - TASKBAR_H - 8);
+                    self.show_popup(menu);
+                }
+                _ => {}
+            },
+            _ => {}
         }
     }
 
@@ -1000,6 +1343,26 @@ impl<'a> Desktop<'a> {
             self.held_move();
         } else if moved {
             self.hover_apps();
+            if let Some(p) = &mut self.popup {
+                if p.set_hover(self.mouse_x, self.mouse_y) {
+                    let r = p.rect;
+                    self.damage(r);
+                }
+            }
+            if self.tv.open {
+                self.tv_hover(self.mouse_x, self.mouse_y);
+            }
+            if self.search.open {
+                let (p, top) = (self.search_panel(), self.top_apps());
+                if self.search.set_hover(p, &top, self.mouse_x, self.mouse_y) {
+                    self.damage(p);
+                }
+            }
+            let over_desktop = !self.tv.open
+                && self.popup.is_none()
+                && self.mouse_y < self.height - TASKBAR_H
+                && self.window_at(self.mouse_x, self.mouse_y).is_none();
+            self.icons_hover(self.mouse_x, self.mouse_y, over_desktop);
         }
         if (was_left && !self.left) || (was_right && !self.right) {
             self.release();
@@ -1010,7 +1373,9 @@ impl<'a> Desktop<'a> {
     /// Tell the app under the mouse where it is, so it can light up what
     /// is under it (the browser shows where a link goes).
     fn hover_apps(&mut self) {
-        let app = self.window_at(self.mouse_x, self.mouse_y);
+        let app = self
+            .window_at(self.mouse_x, self.mouse_y)
+            .filter(|_| !self.tv.open);
         // the window the mouse left forgets its highlight
         if let Some(old) = self.hover_app.filter(|&a| Some(a) != app) {
             if self.app_hover(old, -1000, -1000) {
@@ -1037,11 +1402,12 @@ impl<'a> Desktop<'a> {
 
     /// Light up whatever is under the mouse now.
     fn update_hover(&mut self) {
-        let hover = if self.drag.is_some() {
+        let hover = if self.drag.is_some() || self.desk_icons.busy() {
             None
         } else {
             self.hover_at(self.mouse_x, self.mouse_y)
         };
+        self.hover_moved(hover);
         if self.hover.set(hover) {
             for h in self.hover.lit().into_iter().flatten() {
                 self.damage(self.hover_rect(h));
@@ -1057,7 +1423,13 @@ impl<'a> Desktop<'a> {
     }
 
     fn hover_at(&self, x: i32, y: i32) -> Option<Hover> {
+        if self.popup.as_ref().is_some_and(|p| p.rect.contains(x, y)) || self.confirm_empty {
+            return None;
+        }
         if self.start.open && self.menu_panel().contains(x, y) {
+            return None;
+        }
+        if self.search.open && self.search_panel().contains(x, y) {
             return None;
         }
         if let Some(panel) = self.panel {
@@ -1066,16 +1438,23 @@ impl<'a> Desktop<'a> {
                 return match panel {
                     Panel::Quick => self.tray.target_at(r, x, y).map(Hover::Quick),
                     Panel::Calendar => None,
+                    Panel::Hidden => (0..tray::HIDDEN_ICONS)
+                        .find(|&i| tray::hidden_icon_rect(r, i).contains(x, y))
+                        .map(|i| Hover::Hidden(i as usize)),
                 };
             }
         }
         if y >= self.height - TASKBAR_H {
-            if let Some(i) = (0..3).find(|&i| self.tray_rect(i).contains(x, y)) {
+            if self.show_desktop_rect().contains(x, y) {
+                return Some(Hover::ShowDesktop);
+            }
+            if let Some(i) = (0..4).find(|&i| self.tray_rect(i).contains(x, y)) {
                 return Some(Hover::Tray(i));
             }
-            return (0..=APPS.len())
-                .find(|&i| self.slot_rect(i).contains(x, y))
-                .map(Hover::Slot);
+            return self.task_at(x, y).map(Hover::Task);
+        }
+        if self.tv.open {
+            return None;
         }
         let app = self.window_at(x, y)?;
         let w = self.windows[app.index()];
@@ -1092,14 +1471,61 @@ impl<'a> Desktop<'a> {
         match hover {
             Hover::Minimize(app) => self.windows[app.index()].minimize_button(),
             Hover::Close(app) => self.windows[app.index()].close_button(),
-            Hover::Slot(i) => self.slot_rect(i),
+            Hover::Task(item) => self.task_rect(item).unwrap_or_default(),
             Hover::Tray(i) => self.tray_rect(i),
+            Hover::ShowDesktop => self.show_desktop_rect().inset(-2),
             Hover::Quick(_) => self.panel_rect(Panel::Quick),
+            Hover::Hidden(_) => self.panel_rect(Panel::Hidden),
         }
     }
 
     fn press(&mut self, right: bool) {
         let (x, y) = (self.mouse_x, self.mouse_y);
+        self.hover_moved(None);
+        if self.confirm_empty {
+            if !right {
+                let (_, buttons) = self.confirm_rects();
+                if let Some(i) = buttons.iter().position(|b| b.contains(x, y)) {
+                    self.answer_confirm(i == 0);
+                }
+            }
+            return;
+        }
+        if let Some(p) = &self.popup {
+            let inside = p.rect.contains(x, y);
+            let cmd = p.cmd_at(x, y);
+            if inside {
+                if let (Some(cmd), false) = (cmd, right) {
+                    self.run_cmd(cmd);
+                }
+                return;
+            }
+            self.close_popup();
+            if !right {
+                return;
+            }
+        }
+        if self.switcher.is_some() {
+            return;
+        }
+        if self.search.open {
+            let panel = self.search_panel();
+            if panel.contains(x, y) {
+                if !right {
+                    let (top, pins) = (self.top_apps(), self.pins.clone());
+                    let action = self.search.on_click(panel, &top, &pins, x, y);
+                    self.search_action(action);
+                }
+                return;
+            }
+            let on_box = self
+                .task_rect(TaskItem::Search)
+                .is_some_and(|r| r.contains(x, y));
+            self.close_search();
+            if on_box && !right {
+                return;
+            }
+        }
         if self.start.open {
             let panel = self.menu_panel();
             if panel.contains(x, y) {
@@ -1109,9 +1535,11 @@ impl<'a> Desktop<'a> {
                 }
                 return;
             }
-            let on_start = self.slot_rect(0).contains(x, y);
+            let on_start = self
+                .task_rect(TaskItem::Start)
+                .is_some_and(|r| r.contains(x, y));
             self.close_menu();
-            if on_start {
+            if on_start && !right {
                 return;
             }
         }
@@ -1121,25 +1549,46 @@ impl<'a> Desktop<'a> {
                 if !right && panel == Panel::Quick {
                     self.quick_click(r, x, y);
                 }
+                if !right && panel == Panel::Hidden {
+                    if let Some(i) = (0..tray::HIDDEN_ICONS)
+                        .find(|&i| tray::hidden_icon_rect(r, i).contains(x, y))
+                    {
+                        self.hidden_click(i as usize);
+                    }
+                }
                 return;
             }
             // a click on the button that opened it only closes it
-            let own = self.tray_rect(if panel == Panel::Quick { 1 } else { 2 });
+            let own = self.tray_rect(match panel {
+                Panel::Quick => 1,
+                Panel::Calendar => 2,
+                Panel::Hidden => 3,
+            });
             self.close_panel();
             if own.contains(x, y) {
                 return;
             }
         }
         if y >= self.height - TASKBAR_H {
-            if !right {
-                self.taskbar_click(x, y);
+            let task_view_button = self
+                .task_rect(TaskItem::TaskView)
+                .is_some_and(|r| r.contains(x, y));
+            if self.tv.open && !task_view_button {
+                self.close_task_view(false);
             }
+            self.taskbar_press(x, y, right);
+            return;
+        }
+        if self.tv.open {
+            self.tv_press(x, y, right);
             return;
         }
         if let Some(app) = self.window_at(x, y) {
             self.focus(app);
             let w = self.windows[app.index()];
-            if !right && w.close_button().contains(x, y) {
+            if right && w.title_bar().contains(x, y) {
+                self.title_menu(app, x, y);
+            } else if !right && w.close_button().contains(x, y) {
                 self.close(app);
             } else if !right && w.minimize_button().contains(x, y) {
                 self.minimize(app);
@@ -1151,30 +1600,38 @@ impl<'a> Desktop<'a> {
             }
             return;
         }
-        if right {
-            return;
+        // the desktop itself: icons and the selection rectangle
+        self.focused_away();
+        self.icons_press(x, y, right);
+    }
+
+    /// Right-click on a title bar.
+    fn title_menu(&mut self, app: App, x: i32, y: i32) {
+        let mut b = popup::Builder::default()
+            .item("Minimize", Cmd::Minimize(app))
+            .keyed("Close", "Alt+F4", Cmd::Close(app))
+            .sep();
+        for d in (0..self.desk_count).filter(|&d| d != self.current_desk) {
+            let mut label = String::from("Move to ");
+            label.push_str(desktops::desk_name(d).as_str());
+            b = b.item(&label, Cmd::MoveTo(app, d));
         }
-        // the desktop itself: icons
-        let hit = (0..APPS.len()).find(|&i| icon_rect(i).contains(x, y));
-        if hit != self.selected_icon {
-            for i in [hit, self.selected_icon].into_iter().flatten() {
-                self.damage(icon_rect(i));
-            }
-            self.selected_icon = hit;
-        }
-        if let Some(i) = hit {
-            let now = interrupts::ticks();
-            if self.last_click.1 == i && now - self.last_click.0 <= DOUBLE_CLICK_TICKS {
-                self.open(APPS[i]);
-                self.last_click = (0, usize::MAX);
-            } else {
-                self.last_click = (now, i);
-            }
-        }
+        let menu = b
+            .maybe(
+                "Move to new desktop",
+                Cmd::MoveToNew(app),
+                self.desk_count < desktops::MAX_DESKTOPS,
+            )
+            .at(x, y, false, self.screen());
+        self.show_popup(menu);
     }
 
     fn held_move(&mut self) {
-        if let Some(s) = self.slider {
+        if self.tv.drag.is_some() {
+            self.tv_move(self.mouse_x, self.mouse_y);
+        } else if self.desk_icons.busy() {
+            self.icons_move(self.mouse_x, self.mouse_y);
+        } else if let Some(s) = self.slider {
             self.drag_slider(s);
         } else if let Some((app, dx, dy)) = self.drag {
             self.move_window(app, self.mouse_x - dx, self.mouse_y - dy);
@@ -1191,6 +1648,12 @@ impl<'a> Desktop<'a> {
         self.slider = None;
         if let Some(app) = self.capture.take() {
             self.send_mouse(app, MouseKind::Up);
+        }
+        if self.tv.drag.is_some() {
+            self.tv_release();
+        }
+        if self.desk_icons.busy() {
+            self.icons_release();
         }
     }
 
@@ -1220,48 +1683,19 @@ impl<'a> Desktop<'a> {
         }
     }
 
-    fn taskbar_click(&mut self, x: i32, y: i32) {
-        match (0..3).find(|&i| self.tray_rect(i).contains(x, y)) {
-            Some(0) => {
-                self.toggle_layout = true;
-                return;
-            }
-            Some(1) => return self.open_panel(Panel::Quick),
-            Some(_) => return self.open_panel(Panel::Calendar),
-            None => {}
-        }
-        let Some(slot) = (0..=APPS.len()).find(|&i| self.slot_rect(i).contains(x, y)) else {
-            return;
-        };
-        if slot == 0 {
-            self.open_menu();
-            return;
-        }
-        let app = APPS[slot - 1];
-        let w = self.windows[app.index()];
-        if w.visible() && self.focused == Some(app) {
-            self.minimize(app);
-        } else {
-            self.open(app);
-        }
-    }
-
     // ---- tray ------------------------------------------------------------------
-
-    /// Tray button `i` from the left: the layout, quick settings, the clock.
-    fn tray_rect(&self, i: usize) -> Rect {
-        let top = self.height - TASKBAR_H + 4;
-        match i {
-            0 => Rect::new(self.width - 240, top, 52, 40),
-            1 => Rect::new(self.width - 184, top, 72, 40),
-            _ => Rect::new(self.width - 108, top, 100, 40),
-        }
-    }
 
     /// Where a tray flyout sits: above the taskbar, at the right.
     fn panel_rect(&self, panel: Panel) -> Rect {
         let (w, h) = panel.size();
-        Rect::new(self.width - 12 - w, self.height - TASKBAR_H - 12 - h, w, h)
+        let x = if panel == Panel::Hidden {
+            // over its ^ button
+            let b = self.tray_rect(3);
+            b.x + b.w / 2 - w / 2
+        } else {
+            self.width - 12 - w
+        };
+        Rect::new(x, self.height - TASKBAR_H - 12 - h, w, h)
     }
 
     fn damage_panel(&mut self) {
@@ -1271,7 +1705,9 @@ impl<'a> Desktop<'a> {
     }
 
     fn open_panel(&mut self, panel: Panel) {
+        self.hide_tip();
         self.close_menu();
+        self.close_search();
         if self.panel.is_some() {
             self.damage(self.panel_rect(self.panel_shown).inset(-SPREAD));
         }
@@ -1332,7 +1768,10 @@ impl<'a> Desktop<'a> {
     }
 
     fn open_menu(&mut self) {
+        self.hide_tip();
         self.close_panel();
+        self.close_search();
+        self.close_task_view(false);
         self.start.show();
         self.start
             .set_hover(self.menu_panel(), self.mouse_x, self.mouse_y);
@@ -1375,14 +1814,6 @@ impl<'a> Desktop<'a> {
         self.menu_panel().inset(-SPREAD)
     }
 
-    /// Taskbar button `i` (0 is Start), centred like Windows 11.
-    fn slot_rect(&self, i: usize) -> Rect {
-        let n = APPS.len() as i32 + 1;
-        let total = n * 44 + (n - 1) * 4;
-        let x0 = (self.width - total) / 2;
-        Rect::new(x0 + i as i32 * 48, self.height - TASKBAR_H + 4, 44, 40)
-    }
-
     fn damage_taskbar(&mut self) {
         self.damage(Rect::new(0, self.height - TASKBAR_H, self.width, TASKBAR_H));
     }
@@ -1392,9 +1823,9 @@ impl<'a> Desktop<'a> {
     fn render(&mut self) {
         let fading = match self.phase {
             Phase::Unlocking(t) | Phase::Locking(t) => Some(t),
-            _ => None,
+            _ => self.crossfade,
         };
-        if self.dirty.is_empty() && fading.is_none() && !self.present_all {
+        if self.dirty.is_empty() && fading.is_none() && self.slide.is_none() && !self.present_all {
             return;
         }
         self.update_surfaces();
@@ -1409,9 +1840,14 @@ impl<'a> Desktop<'a> {
         }
         core::mem::swap(&mut self.back, &mut back);
         core::mem::swap(&mut self.scratch, &mut scratch);
+        if let Some((t, dir)) = self.slide {
+            self.present_slide(t.value(), dir);
+            self.present_all = false;
+            return;
+        }
         match fading {
             // the old screen over the new one, fading out
-            Some(t) => self.present_fade((ONE - t.value()) as u32),
+            Some(t) => self.present_fade(Self::crossfade_alpha(t)),
             None if self.present_all => self.present(self.screen()),
             None => {
                 for r in &rects[..n] {
@@ -1468,28 +1904,55 @@ impl<'a> Desktop<'a> {
             self.login.draw(c, self.wallpaper);
             return;
         }
-        c.blit(
-            0,
-            0,
-            self.width,
-            self.height,
-            self.wallpaper,
-            self.width as usize,
-        );
-        self.draw_icons(c);
-        for i in 0..self.order_len {
-            let app = self.order[i];
-            if self.windows[app.index()].drawn() {
-                self.draw_window(c, app, scratch);
+        if self.tv.open {
+            self.draw_task_view(c, scratch);
+        } else {
+            c.blit(
+                0,
+                0,
+                self.width,
+                self.height,
+                self.wallpaper,
+                self.width as usize,
+            );
+            self.draw_desk_icons(c);
+            self.draw_icon_rename(c);
+            for i in 0..self.order_len {
+                let app = self.order[i];
+                if self.windows[app.index()].drawn() {
+                    self.draw_window(c, app, scratch);
+                }
             }
         }
         self.draw_taskbar(c);
         if self.start.open || self.menu.value() > 0 {
             self.draw_menu(c, scratch);
         }
+        if self.search.open {
+            let top = self.top_apps();
+            self.search
+                .draw(c, self.search_panel(), self.icons, &top, &self.pins);
+        }
         if self.panel.is_some() || self.panel_anim.value() > 0 {
             self.draw_panel(c, scratch);
         }
+        self.draw_switcher(c, scratch);
+        if self.confirm_empty {
+            let area = Rect::new(0, 0, self.width, self.height - TASKBAR_H);
+            widgets::draw_message(
+                c,
+                area,
+                "Delete Multiple Items",
+                &CONFIRM_LINES,
+                &["Yes", "No"],
+                None,
+            );
+        }
+        if let Some(p) = &self.popup {
+            p.draw(c);
+        }
+        self.draw_icon_drag(c);
+        self.draw_tip(c);
     }
 
     /// Copy part of the back buffer to the screen.
@@ -1551,23 +2014,6 @@ impl<'a> Desktop<'a> {
                     put_pixel(fb, x, y, p);
                 }
             }
-        }
-    }
-
-    fn draw_icons(&self, c: &mut Canvas) {
-        for (i, app) in APPS.into_iter().enumerate() {
-            let r = icon_rect(i);
-            if !c.visible(r) {
-                continue;
-            }
-            if self.selected_icon == Some(i) {
-                c.fill_round_alpha(r, 6, rgb(0xb0, 0xd0, 0xff), 90);
-                c.outline_round(r, 6, rgb(0x9c, 0xc4, 0xf4));
-            }
-            self.icons.draw_large(c, app, r.x + (r.w - 48) / 2, r.y + 6);
-            let label = Rect::new(r.x, r.y + 58, r.w, 16);
-            c.text_centered(label.offset(1, 1), app.title(), rgb(0x10, 0x10, 0x20));
-            c.text_centered(label, app.title(), 0xffffff);
         }
     }
 
@@ -1699,10 +2145,10 @@ impl<'a> Desktop<'a> {
         self.draw_sliding(c, scratch, r, self.panel_anim.value(), |c, p| {
             let mut m = c.sub(Rect::new(0, 0, c.width, c.height));
             m.clip_round(p, 8);
-            if panel == Panel::Quick {
-                self.tray.draw_quick(&mut m, p, self.layout, hover);
-            } else {
-                Tray::draw_calendar(&mut m, p);
+            match panel {
+                Panel::Quick => self.tray.draw_quick(&mut m, p, self.layout, hover),
+                Panel::Calendar => Tray::draw_calendar(&mut m, p),
+                Panel::Hidden => self.draw_hidden_icons(&mut m, p),
             }
         });
         if shown {
@@ -1744,88 +2190,11 @@ impl<'a> Desktop<'a> {
         }
         m.outline_round_alpha(frame, 8, rgb(0xc8, 0xca, 0xd2), p);
     }
-
-    fn draw_taskbar(&self, c: &mut Canvas) {
-        let top = self.height - TASKBAR_H;
-        let bar = Rect::new(0, top, self.width, TASKBAR_H);
-        if !c.visible(bar) {
-            return;
-        }
-        // see-through, like acrylic
-        c.fill_round_alpha(bar, 0, rgb(0xf0, 0xf2, 0xf8), 220);
-        c.fill_rect(0, top, self.width, 1, rgb(0xd0, 0xd4, 0xdc));
-
-        for i in 0..=APPS.len() {
-            let r = self.slot_rect(i);
-            let app = if i == 0 { None } else { Some(APPS[i - 1]) };
-            let active = match app {
-                None => self.start.open,
-                Some(a) => self.focused == Some(a) && self.windows[a.index()].visible(),
-            };
-            if active {
-                c.fill_round_alpha(r, 5, 0xffffff, 200);
-                c.outline_round(r, 5, rgb(0xe0, 0xe2, 0xe8));
-            } else {
-                let lit = self.hover.level(Hover::Slot(i));
-                if lit > 0 {
-                    c.fill_round_alpha(r, 5, 0xffffff, 140 * lit / ONE);
-                }
-            }
-            match app {
-                None => draw_start_logo(c, r.x + 10, r.y + 8),
-                Some(a) => {
-                    self.icons.draw_medium(c, a, r.x + 10, r.y + 7);
-                    let w = self.windows[a.index()];
-                    if w.open {
-                        // a pill under open apps, longer for the active one
-                        let (len, color) = if active {
-                            (16, theme::ACCENT)
-                        } else {
-                            (6, rgb(0x8a, 0x8a, 0x92))
-                        };
-                        let pill = Rect::new(r.x + (r.w - len) / 2, r.bottom() - 4, len, 3);
-                        c.fill_round(pill, 1, color);
-                    }
-                }
-            }
-        }
-
-        // the tray: layout, network and volume, clock and date
-        for i in 0..3 {
-            let r = self.tray_rect(i);
-            let open = match i {
-                1 => self.panel == Some(Panel::Quick),
-                2 => self.panel == Some(Panel::Calendar),
-                _ => false,
-            };
-            let lit = if open {
-                ONE
-            } else {
-                self.hover.level(Hover::Tray(i))
-            };
-            if lit > 0 {
-                c.fill_round_alpha(r, 5, 0xffffff, 170 * lit / ONE);
-            }
-        }
-        let layout = self.tray_rect(0);
-        c.text_centered(layout, tray::layout_label(self.layout), theme::TEXT);
-        let quick = self.tray_rect(1);
-        let bg = rgb(0xf0, 0xf2, 0xf8);
-        let y = quick.y + 12;
-        tray::network_icon(c, quick.x + 14, y, self.tray.net, theme::TEXT, bg);
-        tray::volume_icon(c, quick.x + 42, y, self.tray.volume, theme::TEXT);
-        let clock = self.tray_rect(2);
-        let line = |i: i32| Rect::new(clock.x, clock.y + 2 + i * 18, clock.w, 18);
-        c.text_centered(line(0), self.clock.as_str(), theme::TEXT);
-        c.text_centered(line(1), self.date.as_str(), theme::TEXT);
-    }
 }
 
-// ---- layout helpers ---------------------------------------------------------
-
-fn icon_rect(i: usize) -> Rect {
-    Rect::new(16, 16 + i as i32 * 92, 88, 80)
-}
+/// What asking before emptying the Recycle Bin says.
+const CONFIRM_LINES: [&str; 1] =
+    ["Are you sure you want to permanently delete everything in the Recycle Bin?"];
 
 // ---- pictures ---------------------------------------------------------------
 
@@ -1964,7 +2333,7 @@ fn draw_wallpaper(c: &mut Canvas) {
 }
 
 /// The start button: four rounded squares.
-fn draw_start_logo(c: &mut Canvas, x: i32, y: i32) {
+pub(crate) fn draw_start_logo(c: &mut Canvas, x: i32, y: i32) {
     for (i, color) in [
         rgb(0x2a, 0x9c, 0xf4),
         rgb(0x18, 0x84, 0xe8),
@@ -2055,6 +2424,9 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
         }
         desk.layout = keyboard.layout();
         desk.poll_apps();
+        if matches!(desk.phase, Phase::Desktop) {
+            desk.refresh_icons();
+        }
         crate::net::poll();
         if desk.browser.tick() {
             desk.damage_client(App::Browser);
@@ -2073,6 +2445,13 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
             } else if desk.start.open {
                 // the caret in the search box
                 desk.damage(desk.menu_rect());
+            } else if desk.search.open {
+                if let Some(r) = desk.task_rect(TaskItem::Search) {
+                    desk.damage(r);
+                }
+            } else if let Some((i, _)) = &desk.desk_icons.renaming {
+                let r = desk.icon_rect(*i).inset(-8);
+                desk.damage(r);
             } else if let Some(app @ (App::Terminal | App::Notepad | App::Explorer)) = desk.focused
             {
                 // the text caret blinks

@@ -133,4 +133,20 @@ echo "files survive a restart"
 type_keys s e t t i n g s ret
 wait_for "desktop: opened Settings" || fail "the shell could not open Settings"
 echo "Settings opens"
+
+# search from the taskbar: Win+S, type, Enter opens the best match
+type_keys meta_l-s
+wait_for "search: indexed" || fail "the taskbar search did not open"
+type_keys c a l c ret
+wait_for "desktop: opened Calculator" || fail "search did not open Calculator"
+echo "taskbar search works"
+
+# virtual desktops: Win+Ctrl+D makes one, Win+Ctrl+Left goes back
+type_keys ctrl-meta_l-d
+wait_for "desktops: switched to Desktop 2" || fail "Win+Ctrl+D did not make a new desktop"
+type_keys ctrl-meta_l-left
+wait_for "desktops: switched to Desktop 1" || fail "Win+Ctrl+Left did not switch back"
+type_keys meta_l-tab
+wait_for "desktops: task view" || fail "Win+Tab did not open Task View"
+echo "virtual desktops and Task View work"
 echo "boot test passed"

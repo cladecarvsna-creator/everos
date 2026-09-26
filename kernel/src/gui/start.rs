@@ -129,6 +129,11 @@ impl StartMenu {
         }
     }
 
+    /// Recently opened apps, newest first.
+    pub fn recent(&self) -> impl Iterator<Item = App> + '_ {
+        self.recent.into_iter().flatten()
+    }
+
     fn matches(&self) -> impl Iterator<Item = App> + '_ {
         SORTED
             .into_iter()

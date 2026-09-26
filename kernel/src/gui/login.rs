@@ -94,6 +94,11 @@ pub struct Login {
 }
 
 impl Login {
+    /// The blurred, darkened wallpaper, also behind Task View.
+    pub fn backdrop(&self) -> &[u32] {
+        self.backdrop
+    }
+
     pub fn new(wallpaper: &[u32], backdrop: &'static mut [u32], width: i32, height: i32) -> Self {
         make_backdrop(wallpaper, backdrop, width as usize, height as usize);
         let mut login = Self {

@@ -543,6 +543,47 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Draw a `sw` x `sh` image shrunk into `dst`, each new pixel the
+    /// average of the ones it covers, so small copies of windows (Task
+    /// View, Alt+Tab) stay readable. For growing, use `blit_scaled`.
+    pub fn blit_smooth(&mut self, dst: Rect, src: &[u32], sw: i32, sh: i32) {
+        let d = dst.offset(self.ox, self.oy);
+        let area = d.intersect(&self.clip);
+        if area.is_empty() || sw <= 0 || sh <= 0 {
+            return;
+        }
+        let (sw, sh) = (sw as usize, sh as usize);
+        // source columns per destination column, found once
+        let mut cols = [(0usize, 0usize); 1920];
+        for x in area.x..area.right().min(area.x + 1920) {
+            let i = (x - area.x) as usize;
+            let x0 = (x - d.x) as usize * sw / d.w as usize;
+            let x1 = ((x - d.x + 1) as usize * sw / d.w as usize).clamp(x0 + 1, sw);
+            cols[i] = (x0.min(sw - 1), x1);
+        }
+        for y in area.y..area.bottom() {
+            let (x0c, x1c) = self.span(y);
+            let (x0c, x1c) = (x0c.max(area.x), x1c.min(area.right()));
+            let y0 = (y - d.y) as usize * sh / d.h as usize;
+            let y1 = ((y - d.y + 1) as usize * sh / d.h as usize).clamp(y0 + 1, sh);
+            let y0 = y0.min(sh - 1);
+            let row = y as usize * self.stride;
+            for x in x0c..x1c {
+                let (sx0, sx1) = cols[((x - area.x) as usize).min(1919)];
+                let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+                for sy in y0..y1 {
+                    for &p in &src[sy * sw + sx0..sy * sw + sx1] {
+                        r += (p >> 16) & 0xff;
+                        g += (p >> 8) & 0xff;
+                        b += p & 0xff;
+                        n += 1;
+                    }
+                }
+                self.pixels[row + x as usize] = (r / n) << 16 | (g / n) << 8 | (b / n);
+            }
+        }
+    }
+
     /// Like `outline_round`, blended with `alpha` (0 to 256).
     pub fn outline_round_alpha(&mut self, r: Rect, radius: i32, c: Color, alpha: i32) {
         if alpha >= 256 {
@@ -634,7 +675,7 @@ fn distance256(dx2: i32, dy2: i32) -> i32 {
     isqrt(squared) as i32
 }
 
-fn isqrt(n: u64) -> u64 {
+pub fn isqrt(n: u64) -> u64 {
     if n < 2 {
         return n;
     }

@@ -2,6 +2,8 @@
 //! address bar with the path's parts, search, a command bar, the
 //! navigation pane with the home folders, and the files as a details
 //! list or large icons. Double-clicking a file opens it in Notepad.
+//! Deleted items go to the Recycle Bin, which it shows like a folder
+//! with Restore and Empty Recycle Bin.
 
 use alloc::string::String;
 use alloc::vec;
@@ -14,7 +16,7 @@ use super::text::UI;
 use super::theme;
 use super::widgets::{self, FieldEvent, Item, TextField};
 use super::{MouseEvent, MouseKind};
-use crate::fs::{self, Info};
+use crate::fs::{self, recycle, Info};
 use crate::keyboard::{self, Key};
 use crate::{interrupts, users};
 
@@ -59,9 +61,19 @@ enum Cmd {
     Refresh,
     Details,
     Icons,
+    Restore,
+    Empty,
 }
 
 const ITEM_MENU: [Option<Cmd>; 4] = [Some(Cmd::Open), None, Some(Cmd::Rename), Some(Cmd::Delete)];
+const BIN_ITEM_MENU: [Option<Cmd>; 3] = [Some(Cmd::Restore), None, Some(Cmd::Delete)];
+const BIN_BACK_MENU: [Option<Cmd>; 5] = [
+    Some(Cmd::Empty),
+    None,
+    Some(Cmd::Details),
+    Some(Cmd::Icons),
+    Some(Cmd::Refresh),
+];
 const BACK_MENU: [Option<Cmd>; 6] = [
     Some(Cmd::NewFolder),
     Some(Cmd::NewFile),
@@ -74,6 +86,8 @@ const BACK_MENU: [Option<Cmd>; 6] = [
 enum Dialog {
     /// Delete this item for good?
     Delete(usize),
+    /// Delete everything in the Recycle Bin for good?
+    Empty,
     Message(&'static str),
 }
 
@@ -86,11 +100,19 @@ enum Focus {
     Rename,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlaceKind {
+    Home,
+    Library,
+    Drive,
+    Bin,
+}
+
 /// A place in the navigation pane.
 struct Place {
     label: &'static str,
     path: String,
-    drive: bool,
+    kind: PlaceKind,
 }
 
 pub struct Explorer {
@@ -155,16 +177,26 @@ fn search_rect() -> Rect {
 }
 
 /// Command bar buttons: what they do, their label and where they are.
-fn commands() -> [(Cmd, &'static str, Rect); 6] {
+/// The Recycle Bin has its own.
+fn commands(bin: bool) -> [(Cmd, &'static str, Rect); 6] {
     let y = NAV_H + 6;
     let mut x = 12;
     let mut out = [(Cmd::Open, "", Rect::default()); 6];
-    let buttons = [
-        (Cmd::NewFolder, "New folder"),
-        (Cmd::NewFile, "New text document"),
-        (Cmd::Rename, "Rename"),
-        (Cmd::Delete, "Delete"),
-    ];
+    let buttons = if bin {
+        [
+            (Cmd::Empty, "Empty Recycle Bin"),
+            (Cmd::Restore, "Restore"),
+            (Cmd::Delete, "Delete"),
+            (Cmd::Refresh, "Refresh"),
+        ]
+    } else {
+        [
+            (Cmd::NewFolder, "New folder"),
+            (Cmd::NewFile, "New text document"),
+            (Cmd::Rename, "Rename"),
+            (Cmd::Delete, "Delete"),
+        ]
+    };
     for (i, (cmd, label)) in buttons.into_iter().enumerate() {
         let w = UI.width(label) + 44;
         out[i] = (cmd, label, Rect::new(x, y, w, 32));
@@ -180,8 +212,17 @@ fn commands() -> [(Cmd, &'static str, Rect); 6] {
     out
 }
 
+fn user() -> String {
+    String::from(users::current_name().unwrap_or_default().as_str())
+}
+
 fn home() -> String {
-    fs::home(users::current_name().unwrap_or_default().as_str())
+    fs::home(&user())
+}
+
+/// The current user's Recycle Bin folder.
+pub fn bin_folder() -> String {
+    recycle::folder(&user())
 }
 
 fn places() -> Vec<Place> {
@@ -189,29 +230,34 @@ fn places() -> Vec<Place> {
     let mut out = vec![Place {
         label: "Home",
         path: home.clone(),
-        drive: false,
+        kind: PlaceKind::Home,
     }];
     for lib in fs::LIBRARIES {
         out.push(Place {
             label: lib,
             path: fs::join(&home, lib),
-            drive: false,
+            kind: PlaceKind::Library,
         });
     }
     out.push(Place {
         label: "Local Disk (C:)",
         path: String::from("/"),
-        drive: true,
+        kind: PlaceKind::Drive,
+    });
+    out.push(Place {
+        label: "Recycle Bin",
+        path: bin_folder(),
+        kind: PlaceKind::Bin,
     });
     out
 }
 
 /// Where place `i` is in the navigation pane: a gap before the libraries
-/// and another before the disk.
+/// and another before the disk and the Recycle Bin.
 fn place_rect(i: usize, n: usize) -> Rect {
     let gap = if i == 0 {
         0
-    } else if i + 1 == n {
+    } else if i + 2 >= n {
         56
     } else {
         12
@@ -272,21 +318,6 @@ fn fit(text: &str, w: i32) -> String {
     s
 }
 
-/// A name that is not taken yet: "New folder", "New folder (2)", ...
-fn unique_name(dir: &str, base: &str, ext: &str) -> String {
-    for n in 1.. {
-        let mut name = String::from(base);
-        if n > 1 {
-            let _ = write!(name, " ({})", n);
-        }
-        name.push_str(ext);
-        if !fs::exists(&fs::join(dir, &name)) {
-            return name;
-        }
-    }
-    String::from(base)
-}
-
 impl Explorer {
     pub fn new() -> Self {
         Self {
@@ -338,8 +369,29 @@ impl Explorer {
         self.navigate(path);
     }
 
+    /// Whether the Recycle Bin (or a folder in it) is shown.
+    fn in_bin(&self) -> bool {
+        recycle::contains(&user(), &self.path)
+    }
+
+    /// Whether the Recycle Bin itself is shown, where items can be
+    /// restored.
+    fn at_bin(&self) -> bool {
+        fs::same_name(&self.path, &bin_folder())
+    }
+
+    /// Show the folder a file or folder is in, with it selected.
+    pub fn reveal(&mut self, path: &str) {
+        self.started = true;
+        self.navigate(&fs::parent(path));
+        self.select_name(fs::file_name(path));
+    }
+
     /// The window title: the folder's name.
     pub fn title(&self) -> String {
+        if self.at_bin() {
+            return String::from("Recycle Bin - File Explorer");
+        }
         let name = fs::file_name(&self.path);
         let mut t = String::from(if name.is_empty() {
             "Local Disk (C:)"
@@ -422,7 +474,9 @@ impl Explorer {
     }
 
     fn go_up(&mut self) {
-        if self.path != "/" {
+        if self.at_bin() {
+            self.navigate("/");
+        } else if self.path != "/" {
             let up = fs::parent(&self.path);
             let from = String::from(fs::file_name(&self.path));
             self.navigate(&up);
@@ -482,7 +536,26 @@ impl Explorer {
             }
             Cmd::Delete => {
                 if let Some(i) = self.selected {
-                    self.dialog = Some(Dialog::Delete(i));
+                    if self.in_bin() {
+                        self.dialog = Some(Dialog::Delete(i));
+                    } else {
+                        // to the Recycle Bin, without asking, like Windows
+                        self.recycle(i);
+                    }
+                }
+            }
+            Cmd::Restore => {
+                if let Some(i) = self.selected.filter(|_| self.at_bin()) {
+                    let name = self.items[i].name.clone();
+                    if let Err(e) = recycle::restore(&user(), &name) {
+                        self.dialog = Some(Dialog::Message(e.message()));
+                    }
+                    self.reload_near(i);
+                }
+            }
+            Cmd::Empty => {
+                if !self.items.is_empty() {
+                    self.dialog = Some(Dialog::Empty);
                 }
             }
             Cmd::NewFolder => self.create(true),
@@ -496,9 +569,9 @@ impl Explorer {
 
     fn create(&mut self, folder: bool) {
         let name = if folder {
-            unique_name(&self.path, "New folder", "")
+            fs::unique_name(&self.path, "New folder", "")
         } else {
-            unique_name(&self.path, "New Text Document", ".txt")
+            fs::unique_name(&self.path, "New Text Document", ".txt")
         };
         let path = fs::join(&self.path, &name);
         let result = if folder {
@@ -554,14 +627,44 @@ impl Explorer {
         }
     }
 
+    /// Delete an item for good (in the Recycle Bin).
     fn delete(&mut self, i: usize) {
         let Some(item) = self.items.get(i) else {
             return;
         };
-        let path = fs::join(&self.path, &item.name);
-        if let Err(e) = fs::remove(&path) {
+        let result = if self.at_bin() {
+            recycle::purge(&user(), &item.name)
+        } else {
+            fs::remove(&fs::join(&self.path, &item.name))
+        };
+        if let Err(e) = result {
             self.dialog = Some(Dialog::Message(e.message()));
         }
+        self.reload_near(i);
+    }
+
+    /// Move an item to the Recycle Bin.
+    fn recycle(&mut self, i: usize) {
+        let Some(item) = self.items.get(i) else {
+            return;
+        };
+        let path = fs::join(&self.path, &item.name);
+        if let Err(e) = recycle::recycle(&user(), &path) {
+            self.dialog = Some(Dialog::Message(e.message()));
+        }
+        self.reload_near(i);
+    }
+
+    fn empty_bin(&mut self) {
+        if let Err(e) = recycle::empty(&user()) {
+            self.dialog = Some(Dialog::Message(e.message()));
+        }
+        self.reload_near(0);
+    }
+
+    /// Read the folder again after an item went, selecting the one that
+    /// took its place.
+    fn reload_near(&mut self, i: usize) {
         let path = self.path.clone();
         self.load(&path);
         if !self.items.is_empty() {
@@ -638,10 +741,17 @@ impl Explorer {
         let a = address_rect();
         let mut parts = vec![(String::from("Local Disk (C:)"), String::from("/"))];
         let mut acc = String::new();
+        let bin = bin_folder();
         for p in self.path.split('/').filter(|p| !p.is_empty()) {
             acc.push('/');
             acc.push_str(p);
-            parts.push((String::from(p), acc.clone()));
+            if fs::same_name(&acc, &bin) {
+                // the Recycle Bin is a place of its own
+                parts.clear();
+                parts.push((String::from("Recycle Bin"), acc.clone()));
+            } else if !fs::same_name(&acc, recycle::ROOT) {
+                parts.push((String::from(p), acc.clone()));
+            }
         }
         // drop parts from the front until they fit
         let sep = 22;
@@ -667,14 +777,17 @@ impl Explorer {
     pub fn on_key(&mut self, key: Key) -> bool {
         if let Some(d) = &self.dialog {
             match key {
-                Key::Enter => {
-                    if let Dialog::Delete(i) = *d {
+                Key::Enter => match *d {
+                    Dialog::Delete(i) => {
                         self.dialog = None;
                         self.delete(i);
-                    } else {
-                        self.dialog = None;
                     }
-                }
+                    Dialog::Empty => {
+                        self.dialog = None;
+                        self.empty_bin();
+                    }
+                    Dialog::Message(_) => self.dialog = None,
+                },
                 Key::Escape => self.dialog = None,
                 _ => return false,
             }
@@ -860,7 +973,34 @@ impl Explorer {
         }
     }
 
+    fn menu_cmds(&self, on_item: bool) -> &'static [Option<Cmd>] {
+        match (self.at_bin(), on_item) {
+            (true, true) => &BIN_ITEM_MENU,
+            (true, false) => &BIN_BACK_MENU,
+            (false, true) => &ITEM_MENU,
+            (false, false) => &BACK_MENU,
+        }
+    }
+
     fn menu_items(&self, on_item: bool) -> Vec<Item<'static>> {
+        if self.at_bin() {
+            return if on_item {
+                vec![
+                    ("Restore", "", true),
+                    ("", "", false),
+                    ("Delete", "Del", true),
+                ]
+            } else {
+                let any = !self.items.is_empty();
+                vec![
+                    ("Empty Recycle Bin", "", any),
+                    ("", "", false),
+                    ("Details", "", true),
+                    ("Large icons", "", true),
+                    ("Refresh", "F5", true),
+                ]
+            };
+        }
         if on_item {
             vec![
                 ("Open", "Enter", true),
@@ -890,11 +1030,11 @@ impl Explorer {
             let r = widgets::message_rect(client(), &lines, buttons);
             let rects = widgets::message_buttons(r, buttons.len());
             match rects.iter().position(|b| b.contains(x, y)) {
-                Some(0) => {
-                    if let Some(Dialog::Delete(i)) = self.dialog.take() {
-                        self.delete(i);
-                    }
-                }
+                Some(0) => match self.dialog.take() {
+                    Some(Dialog::Delete(i)) => self.delete(i),
+                    Some(Dialog::Empty) => self.empty_bin(),
+                    _ => {}
+                },
                 Some(_) => self.dialog = None,
                 None => return false,
             }
@@ -903,8 +1043,7 @@ impl Explorer {
         if let Some((on_item, r)) = self.menu.take() {
             let items = self.menu_items(on_item);
             if let Some(i) = widgets::menu_item_at(r, &items, x, y) {
-                let cmds: &[Option<Cmd>] = if on_item { &ITEM_MENU } else { &BACK_MENU };
-                if let Some(cmd) = cmds[i] {
+                if let Some(cmd) = self.menu_cmds(on_item)[i] {
                     self.run(cmd);
                 }
                 return true;
@@ -958,7 +1097,9 @@ impl Explorer {
         }
         if y < TOP {
             if !right {
-                if let Some((cmd, _, _)) = commands().into_iter().find(|(_, _, r)| r.contains(x, y))
+                if let Some((cmd, _, _)) = commands(self.at_bin())
+                    .into_iter()
+                    .find(|(_, _, r)| r.contains(x, y))
                 {
                     self.run(cmd);
                 }
@@ -1036,6 +1177,20 @@ impl Explorer {
                 lines.push(name);
                 (lines, &["Yes", "No"])
             }
+            Dialog::Empty => {
+                let n = self.items.len();
+                let mut first = String::new();
+                if n == 1 {
+                    first.push_str("Are you sure you want to permanently delete this item?");
+                } else {
+                    let _ = write!(
+                        first,
+                        "Are you sure you want to permanently delete these {} items?",
+                        n
+                    );
+                }
+                (vec![first], &["Yes", "No"])
+            }
             Dialog::Message(m) => (vec![String::from(*m)], &["OK"]),
         }
     }
@@ -1066,6 +1221,7 @@ impl Explorer {
             let lines: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
             let title = match d {
                 Dialog::Delete(_) => "Delete",
+                Dialog::Empty => "Empty Recycle Bin",
                 Dialog::Message(_) => "File Explorer",
             };
             widgets::draw_message(c, client(), title, &lines, buttons, None);
@@ -1117,7 +1273,9 @@ impl Explorer {
             c.outline_round(a, 4, theme::STROKE);
             let crumbs = self.crumbs();
             let icon_y = a.y + 8;
-            if crumbs.len() > 1 {
+            if self.at_bin() {
+                icons::get().draw_pic(c, Pic::BinEmpty, SMALL, a.x + 8, icon_y);
+            } else if crumbs.len() > 1 {
                 widgets::folder_icon(c, a.x + 8, icon_y, 16);
             } else {
                 drive_icon(c, a.x + 8, icon_y);
@@ -1136,7 +1294,9 @@ impl Explorer {
         if self.search.text.is_empty() && self.focus != Focus::Search {
             let mut label = String::from("Search ");
             let name = fs::file_name(&self.path);
-            label.push_str(if name.is_empty() {
+            label.push_str(if self.at_bin() {
+                "Recycle Bin"
+            } else if name.is_empty() {
                 "Local Disk (C:)"
             } else {
                 name
@@ -1155,9 +1315,12 @@ impl Explorer {
         c.fill(bar, theme::FACE);
         c.fill_rect(0, TOP - 1, CLIENT_W, 1, theme::STROKE);
         let has_sel = self.selected.is_some();
-        for (cmd, label, r) in commands() {
+        let bin = self.at_bin();
+        for (cmd, label, r) in commands(bin) {
             let enabled = match cmd {
                 Cmd::Rename | Cmd::Delete => has_sel,
+                Cmd::Restore => has_sel && bin,
+                Cmd::Empty => !self.items.is_empty(),
                 _ => true,
             };
             let on = (cmd == Cmd::Details && self.view == View::Details)
@@ -1194,6 +1357,19 @@ impl Explorer {
                         c.fill_rect(ix, iy + 2 + k * 4, 16, 2, color);
                     }
                 }
+                Cmd::Empty => icons::get().draw_pic(c, Pic::BinEmpty, SMALL, ix, iy),
+                Cmd::Restore | Cmd::Refresh => {
+                    // an arrow going back up
+                    let color = if cmd == Cmd::Restore && enabled {
+                        theme::ACCENT
+                    } else {
+                        color
+                    };
+                    c.line(ix + 3, iy + 6, ix + 13, iy + 6, color);
+                    c.line(ix + 3, iy + 6, ix + 7, iy + 2, color);
+                    c.line(ix + 3, iy + 6, ix + 7, iy + 10, color);
+                    c.line(ix + 13, iy + 6, ix + 13, iy + 14, color);
+                }
                 _ => {
                     for k in 0..4 {
                         let (dx, dy) = (k % 2 * 9, k / 2 * 9);
@@ -1204,7 +1380,7 @@ impl Explorer {
             c.draw_text(r.x + 34, r.y + 7, label, color);
         }
         // a separator between creating and changing
-        let r = commands()[1].2;
+        let r = commands(bin)[1].2;
         c.fill_rect(r.right() + 10, bar.y + 12, 1, 20, theme::STROKE);
     }
 
@@ -1222,17 +1398,23 @@ impl Explorer {
             } else if self.side_hover == Some(i) {
                 c.fill_round(r, 4, rgb(0xea, 0xee, 0xf4));
             }
-            if p.drive {
-                drive_icon(c, r.x + 12, r.y + 8);
-            } else if i == 0 {
-                home_icon(c, r.x + 12, r.y + 7);
-            } else {
-                widgets::folder_icon(c, r.x + 12, r.y + 7, 16);
+            match p.kind {
+                PlaceKind::Drive => drive_icon(c, r.x + 12, r.y + 8),
+                PlaceKind::Home => home_icon(c, r.x + 12, r.y + 7),
+                PlaceKind::Library => widgets::folder_icon(c, r.x + 12, r.y + 7, 16),
+                PlaceKind::Bin => {
+                    let pic = if recycle::is_empty(&user()) {
+                        Pic::BinEmpty
+                    } else {
+                        Pic::BinFull
+                    };
+                    icons::get().draw_pic(c, pic, SMALL, r.x + 12, r.y + 7);
+                }
             }
             c.draw_text(r.x + 38, r.y + 7, p.label, theme::TEXT);
         }
         // "This PC" above the disk
-        let disk = place_rect(n - 1, n);
+        let disk = place_rect(n - 2, n);
         c.fill_rect(12, disk.y - 42, SIDE_W - 24, 1, theme::STROKE);
         icons::get().draw_pic(c, Pic::Computer, SMALL, 12, disk.y - 30);
         c.draw_text(38, disk.y - 30, "This PC", theme::TEXT_DIM);
@@ -1347,6 +1529,11 @@ impl Explorer {
             let _ = write!(s, "      1 item selected");
             if !self.items[i].dir {
                 let _ = write!(s, "  {}", size_text(self.items[i].size));
+            }
+            if self.at_bin() {
+                if let Some(from) = recycle::original(&user(), &self.items[i].name) {
+                    let _ = write!(s, "      deleted from {}", fs::display(&fs::parent(&from)));
+                }
             }
         }
         c.draw_text(12, ty, &s, theme::TEXT);

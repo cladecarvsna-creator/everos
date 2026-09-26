@@ -7,6 +7,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// Shift+arrows or jump by words with Ctrl+arrows.
 static SHIFT: AtomicBool = AtomicBool::new(false);
 static CTRL: AtomicBool = AtomicBool::new(false);
+static ALT: AtomicBool = AtomicBool::new(false);
+static SUPER: AtomicBool = AtomicBool::new(false);
 
 pub fn shift_held() -> bool {
     SHIFT.load(Ordering::Relaxed)
@@ -14,6 +16,15 @@ pub fn shift_held() -> bool {
 
 pub fn ctrl_held() -> bool {
     CTRL.load(Ordering::Relaxed)
+}
+
+pub fn alt_held() -> bool {
+    ALT.load(Ordering::Relaxed)
+}
+
+/// Whether the Windows key is held, for Win+Tab, Win+Ctrl+Left and so on.
+pub fn super_held() -> bool {
+    SUPER.load(Ordering::Relaxed)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -43,8 +54,10 @@ pub enum Key {
     Down,
     Left,
     Right,
-    /// The Windows key.
+    /// The Windows key, pressed and let go on its own.
     Super,
+    /// Alt was let go (Alt+Tab picks the window then).
+    AltUp,
     PageUp,
     PageDown,
     Home,
@@ -106,6 +119,10 @@ pub struct Keyboard {
     right_shift: bool,
     ctrl: bool,
     alt: bool,
+    /// The Windows key is down, and whether another key was pressed
+    /// with it (then letting it go doesn't open the start menu).
+    win: bool,
+    win_used: bool,
     caps_lock: bool,
     /// The previous byte was the 0xe0 prefix of an extended key.
     extended: bool,
@@ -119,6 +136,8 @@ impl Keyboard {
             right_shift: false,
             ctrl: false,
             alt: false,
+            win: false,
+            win_used: false,
             caps_lock: false,
             extended: false,
             layout: Layout::Us,
@@ -150,6 +169,8 @@ impl Keyboard {
         let key = self.decode(scancode);
         SHIFT.store(self.shift(), Ordering::Relaxed);
         CTRL.store(self.ctrl, Ordering::Relaxed);
+        ALT.store(self.alt, Ordering::Relaxed);
+        SUPER.store(self.win, Ordering::Relaxed);
         key
     }
 
@@ -187,14 +208,27 @@ impl Keyboard {
                 self.alt = !released;
                 return if !released && !was_down && self.shift() {
                     self.switch_layout()
+                } else if released && was_down {
+                    Some(Key::AltUp)
                 } else {
                     None
                 };
+            }
+            (0x5b | 0x5c, true) => {
+                let was_down = self.win;
+                self.win = !released;
+                if !released && !was_down {
+                    self.win_used = false;
+                }
+                return (released && was_down && !self.win_used).then_some(Key::Super);
             }
             _ => {}
         }
         if released {
             return None;
+        }
+        if self.win {
+            self.win_used = true;
         }
         if extended {
             return match code {
@@ -208,7 +242,6 @@ impl Keyboard {
                 0x4f => Some(Key::End),
                 0x53 => Some(Key::Delete),
                 0x1c => Some(Key::Enter), // keypad enter
-                0x5b | 0x5c => Some(Key::Super),
                 _ => None,
             };
         }
