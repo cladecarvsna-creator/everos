@@ -33,6 +33,13 @@ pub enum Cmd {
     Refresh,
     NewFolder,
     NewFile,
+    /// Settings on the Personalization or the System page.
+    Personalize,
+    DisplaySettings,
+    /// The next built-in desktop background.
+    NextBackground,
+    /// Use desktop icon `n` (a picture) as the background.
+    SetBackground(usize),
     Lock,
     SignOut,
     Restart,

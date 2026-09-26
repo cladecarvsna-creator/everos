@@ -2,10 +2,22 @@
 //!
 //! Left button paints with the chosen colour, right button with white.
 //! Tools: brush, eraser and flood fill, four brush sizes, and Clear.
+//! Pictures are opened from and saved to the disk as PNG or BMP
+//! (Ctrl+O, Ctrl+S), and one click makes the picture the desktop
+//! background.
+
+use alloc::format;
+use alloc::string::String;
 
 use super::canvas::{mix, rgb, Canvas, Color, Rect};
-use super::theme;
+use super::filedialog::{self, FileDialog, Mode};
+use super::personalize::{self, Fit};
+use super::text::UI;
+use super::{picture, theme, wallpaper};
 use super::{MouseEvent, MouseKind};
+use crate::fs;
+use crate::keyboard::Key;
+use crate::serial;
 use crate::sync::StaticBuffer;
 
 pub const PICTURE_W: usize = 960;
@@ -72,6 +84,40 @@ pub struct Paint {
     tool: Tool,
     /// Last painted point while a button is held, and its colour.
     stroke: Option<(i32, i32, Color)>,
+    /// The file the picture came from or was saved to.
+    path: Option<String>,
+    /// Changed since it was opened or saved.
+    modified: bool,
+    dialog: Option<FileDialog>,
+    /// What happened last, shown in the toolbar: saved, opened, failed.
+    note: String,
+    /// The file button held down.
+    pressed: Option<FileButton>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileButton {
+    New,
+    Open,
+    Save,
+    SaveAs,
+    Background,
+}
+
+const FILE_BUTTONS: [(FileButton, &str, Rect); 5] = [
+    (FileButton::New, "New", Rect::new(560, 5, 60, 20)),
+    (FileButton::Open, "Open", Rect::new(626, 5, 60, 20)),
+    (FileButton::Save, "Save", Rect::new(692, 5, 60, 20)),
+    (FileButton::SaveAs, "Save as", Rect::new(758, 5, 80, 20)),
+    (
+        FileButton::Background,
+        "Set as background",
+        Rect::new(560, 29, 160, 20),
+    ),
+];
+
+fn client() -> Rect {
+    Rect::new(0, 0, CLIENT_W, CLIENT_H)
 }
 
 fn tool_button(i: usize) -> Rect {
@@ -107,14 +153,216 @@ impl Paint {
             size: 1,
             tool: Tool::Brush,
             stroke: None,
+            path: None,
+            modified: false,
+            dialog: None,
+            note: String::new(),
+            pressed: None,
         }
     }
 
+    // ---- files -------------------------------------------------------------
+
+    fn pictures_folder() -> String {
+        let user = crate::users::current_name().unwrap_or_default();
+        fs::join(&fs::home(user.as_str()), "Pictures")
+    }
+
+    /// The name shown in the toolbar.
+    fn file_label(&self) -> String {
+        let name = self.path.as_deref().map_or("Untitled", fs::file_name);
+        format!("{}{}", name, if self.modified { " *" } else { "" })
+    }
+
+    /// Load a picture file, shrinking it to the page if it is bigger.
+    pub fn open_file(&mut self, path: &str) {
+        self.dialog = None;
+        let img = fs::read(path).ok().and_then(|d| picture::decode(&d));
+        let Some(img) = img else {
+            self.note = String::from("Can't open that file: it is not a PNG, JPEG or BMP picture");
+            return;
+        };
+        let fit = if img.width > PICTURE_W || img.height > PICTURE_H {
+            Fit::Fit
+        } else {
+            Fit::Center
+        };
+        let (w, h) = (PICTURE_W as i32, PICTURE_H as i32);
+        wallpaper::fit(&img, fit, WHITE, self.picture, w, h);
+        self.path = Some(String::from(path));
+        self.modified = false;
+        self.note = format!("Opened, {} x {}", img.width, img.height);
+        serial::write_str("paint: opened ");
+        serial::write_str(path);
+        serial::write_str("\n");
+    }
+
+    /// Save to `path`: BMP if the name ends in .bmp, PNG otherwise.
+    fn save_to(&mut self, path: &str) -> bool {
+        let mut path = String::from(path);
+        let lower = path.to_ascii_lowercase();
+        let bmp = lower.ends_with(".bmp");
+        if !bmp && !lower.ends_with(".png") {
+            path.push_str(".png");
+        }
+        let data = if bmp {
+            picture::encode_bmp(self.picture, PICTURE_W, PICTURE_H)
+        } else {
+            picture::encode_png(self.picture, PICTURE_W, PICTURE_H)
+        };
+        match fs::write(&path, &data) {
+            Ok(()) => {
+                self.note = format!("Saved, {} KB", data.len().div_ceil(1024));
+                self.path = Some(path.clone());
+                self.modified = false;
+                serial::write_str("paint: saved ");
+                serial::write_str(&path);
+                serial::write_str("\n");
+                true
+            }
+            Err(e) => {
+                self.note = format!("Could not save: {}", e.message());
+                false
+            }
+        }
+    }
+
+    fn save_as(&mut self) {
+        let dir = match &self.path {
+            Some(p) => fs::parent(p),
+            None => Self::pictures_folder(),
+        };
+        let name = match &self.path {
+            Some(p) => String::from(fs::file_name(p)),
+            None => fs::unique_name(&dir, "Drawing", ".png"),
+        };
+        self.dialog = Some(FileDialog::new(Mode::Save, &dir, &name));
+    }
+
+    fn save(&mut self) {
+        match self.path.clone() {
+            Some(p) => {
+                self.save_to(&p);
+            }
+            None => self.save_as(),
+        }
+    }
+
+    /// Make the picture the desktop background, saving it first.
+    fn set_background(&mut self) {
+        if self.path.is_none() {
+            // nowhere yet: straight into Pictures, no questions
+            let dir = Self::pictures_folder();
+            let _ = fs::create_dir(&dir);
+            let name = fs::unique_name(&dir, "Paint background", ".png");
+            if !self.save_to(&fs::join(&dir, &name)) {
+                return;
+            }
+        } else if self.modified {
+            let p = self.path.clone().unwrap_or_default();
+            if !self.save_to(&p) {
+                return;
+            }
+        }
+        if let Some(p) = &self.path {
+            personalize::set_wallpaper(p);
+            self.note = String::from("Set as background");
+        }
+    }
+
+    fn new_picture(&mut self) {
+        self.picture.fill(WHITE);
+        self.path = None;
+        self.modified = false;
+        self.note.clear();
+    }
+
+    fn file_command(&mut self, b: FileButton) {
+        match b {
+            FileButton::New => self.new_picture(),
+            FileButton::Open => {
+                let dir = Self::pictures_folder();
+                self.dialog = Some(FileDialog::new(Mode::Open, &dir, ""));
+            }
+            FileButton::Save => self.save(),
+            FileButton::SaveAs => self.save_as(),
+            FileButton::Background => self.set_background(),
+        }
+    }
+
+    fn dialog_event(&mut self, event: filedialog::Event) -> bool {
+        match event {
+            filedialog::Event::None => false,
+            filedialog::Event::Redraw => true,
+            filedialog::Event::Cancel => {
+                self.dialog = None;
+                true
+            }
+            filedialog::Event::Chosen(path) => {
+                let saving = self.dialog.as_ref().is_some_and(|d| d.mode == Mode::Save);
+                self.dialog = None;
+                if saving {
+                    self.save_to(&path);
+                } else {
+                    self.open_file(&path);
+                }
+                true
+            }
+        }
+    }
+
+    pub fn on_key(&mut self, key: Key) -> bool {
+        if let Some(d) = &mut self.dialog {
+            let event = d.on_key(key, client());
+            return self.dialog_event(event);
+        }
+        match key {
+            Key::Ctrl('s') => self.save(),
+            Key::Ctrl('o') => self.file_command(FileButton::Open),
+            Key::Ctrl('n') => self.new_picture(),
+            _ => return false,
+        }
+        true
+    }
+
+    pub fn on_wheel(&mut self, clicks: i32) -> bool {
+        match &mut self.dialog {
+            Some(d) => d.on_wheel(clicks, client()),
+            None => false,
+        }
+    }
+
+    // ---- mouse -------------------------------------------------------------
+
     pub fn on_mouse(&mut self, ev: MouseEvent) -> bool {
+        if let Some(d) = &mut self.dialog {
+            if let MouseKind::Down { right: false } = ev.kind {
+                let event = d.on_click(client(), ev.x, ev.y);
+                return self.dialog_event(event);
+            }
+            return false;
+        }
+        if let MouseKind::Up = ev.kind {
+            if let Some(b) = self.pressed.take() {
+                if FILE_BUTTONS
+                    .iter()
+                    .any(|f| f.0 == b && f.2.contains(ev.x, ev.y))
+                {
+                    self.file_command(b);
+                }
+                return true;
+            }
+        }
         let (x, y) = (ev.x, ev.y - TOOLBAR_H);
         match ev.kind {
             MouseKind::Down { right } => {
                 if ev.y < TOOLBAR_H {
+                    if let Some(f) = FILE_BUTTONS.iter().find(|f| f.2.contains(ev.x, ev.y)) {
+                        if !right {
+                            self.pressed = Some(f.0);
+                        }
+                        return true;
+                    }
                     return self.toolbar_click(ev.x, ev.y, right);
                 }
                 if !(0..PICTURE_W as i32).contains(&x) || !(0..PICTURE_H as i32).contains(&y) {
@@ -124,6 +372,7 @@ impl Paint {
                     (Tool::Eraser, _) | (_, true) => WHITE,
                     _ => self.color,
                 };
+                self.modified = true;
                 if self.tool == Tool::Fill {
                     self.flood_fill(x, y, color);
                 } else {
@@ -167,6 +416,7 @@ impl Paint {
         }
         if clear_button().contains(x, y) {
             self.picture.fill(WHITE);
+            self.modified = true;
             return true;
         }
         false
@@ -239,23 +489,23 @@ impl Paint {
         }
     }
 
-    pub fn draw(&self, c: &mut Canvas) {
-        c.fill_rect(0, 0, CLIENT_W, TOOLBAR_H, theme::FACE);
-        c.fill_rect(0, TOOLBAR_H - 1, CLIENT_W, 1, theme::STROKE);
+    pub fn draw(&mut self, c: &mut Canvas) {
+        c.fill_rect(0, 0, CLIENT_W, TOOLBAR_H, theme::face());
+        c.fill_rect(0, TOOLBAR_H - 1, CLIENT_W, 1, theme::stroke());
 
         // current colour
         let current = Rect::new(8, 7, 36, 36);
         c.fill_round(current, 8, self.color);
-        c.outline_round(current, 8, theme::SHADOW);
+        c.outline_round(current, 8, theme::shadow());
         for (i, &color) in PALETTE.iter().enumerate() {
             let r = swatch(i);
             if color == self.color {
-                c.fill_round(r.inset(-2), 12, theme::ACCENT);
-                c.fill_round(r, 10, theme::FACE);
+                c.fill_round(r.inset(-2), 12, theme::accent());
+                c.fill_round(r, 10, theme::face());
             }
             let dot = r.inset(1);
             c.fill_round(dot, 9, color);
-            c.outline_round(dot, 9, mix(color, theme::TEXT, 60));
+            c.outline_round(dot, 9, mix(color, theme::text(), 60));
         }
 
         for (i, &(tool, name)) in TOOLS.iter().enumerate() {
@@ -266,9 +516,24 @@ impl Paint {
             theme::toggle_button(c, r, "", self.size == i);
             let d = (2 * size - 1).clamp(1, 14);
             let dot = Rect::new(r.x + (r.w - d) / 2, r.y + (r.h - d) / 2, d, d);
-            c.fill_round(dot, d / 2, theme::TEXT);
+            c.fill_round(dot, d / 2, theme::text());
         }
         theme::button(c, clear_button(), "Clear", false);
+        for (b, label, r) in FILE_BUTTONS {
+            if b == FileButton::Background {
+                theme::accent_button(c, r, label, self.pressed == Some(b));
+            } else {
+                theme::button(c, r, label, self.pressed == Some(b));
+            }
+        }
+        let status = if self.note.is_empty() {
+            self.file_label()
+        } else {
+            format!("{}  -  {}", self.file_label(), self.note)
+        };
+        let mut status = status;
+        while UI.width(&status) > CLIENT_W - 736 && status.pop().is_some() {}
+        c.draw_text(730, 31, &status, theme::text_dim());
 
         c.blit(
             0,
@@ -278,5 +543,8 @@ impl Paint {
             self.picture,
             PICTURE_W,
         );
+        if let Some(d) = &mut self.dialog {
+            d.draw(c, client(), true);
+        }
     }
 }

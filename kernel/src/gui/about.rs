@@ -45,22 +45,22 @@ impl About {
     }
 
     pub fn draw(&self, c: &mut Canvas, info: &Info) {
-        c.fill_rect(0, 0, CLIENT_W, CLIENT_H, theme::LIGHT);
+        c.fill_rect(0, 0, CLIENT_W, CLIENT_H, theme::light());
 
         // the logo and the name
         draw_logo(c, 32, 30);
-        c.draw_text_in(&HEADING, 104, 36, "EverOS", theme::TEXT);
-        c.fill_rect(24, 110, CLIENT_W - 48, 1, theme::STROKE);
+        c.draw_text_in(&HEADING, 104, 36, "EverOS", theme::text());
+        c.fill_rect(24, 110, CLIENT_W - 48, 1, theme::stroke());
 
         let mut y = 128;
-        c.draw_text_in(&UI_BOLD, 32, y, "EverOS", theme::TEXT);
+        c.draw_text_in(&UI_BOLD, 32, y, "EverOS", theme::text());
         y += 22;
-        c.draw_text(32, y, &format!("Version {}", VERSION), theme::TEXT);
+        c.draw_text(32, y, &format!("Version {}", VERSION), theme::text());
         y += 22;
         let about = "A hobby operating system for x86_64, written in assembly and Rust.";
-        c.draw_text(32, y, about, theme::TEXT);
+        c.draw_text(32, y, about, theme::text());
         y += 22;
-        c.draw_text(32, y, "MIT License.", theme::TEXT_DIM);
+        c.draw_text(32, y, "MIT License.", theme::text_dim());
         y += 36;
 
         let user = crate::users::current_name();
@@ -74,8 +74,8 @@ impl About {
             ),
         ];
         for (label, value) in rows {
-            c.draw_text(32, y, label, theme::TEXT_DIM);
-            c.draw_text(160, y, &value, theme::TEXT);
+            c.draw_text(32, y, label, theme::text_dim());
+            c.draw_text(160, y, &value, theme::text());
             y += 22;
         }
 
