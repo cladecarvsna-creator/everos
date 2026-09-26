@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Boot the ISO in QEMU without a display, wait for the kernel's serial
-# message, then type a command on the emulated PS/2 keyboard and check
-# that the shell ran it. Exits 0 if both work, 1 otherwise.
+# message and the desktop, then type commands on the emulated PS/2
+# keyboard and check that the shell in the terminal window ran them.
+# Exits 0 if everything works, 1 otherwise.
 set -u
 
 iso="${1:-build/everos.iso}"
@@ -34,17 +35,26 @@ fail() {
 wait_for "EverOS: kernel started" || fail "the kernel did not start"
 echo "kernel started"
 
-# type "echo keyboard-ok" and Enter through the QEMU monitor
-python3 - "$monitor" << 'PY'
+# press keys on the emulated keyboard through the QEMU monitor
+type_keys() {
+    python3 - "$monitor" "$@" << 'PY'
 import socket, sys, time
-keys = list("echo") + ["spc"] + list("keyboard") + ["minus"] + list("ok") + ["ret"]
 s = socket.socket(socket.AF_UNIX)
 s.connect(sys.argv[1])
-for key in keys:
+for key in sys.argv[2:]:
     s.sendall(f"sendkey {key}\n".encode())
     time.sleep(0.1)
 PY
+}
 
+wait_for "desktop: opened Terminal" || fail "the desktop did not start"
+echo "desktop started"
+
+type_keys e c h o spc k e y b o a r d minus o k ret
 wait_for "keyboard-ok" || fail "the shell did not answer typed input"
 echo "keyboard input works"
+
+type_keys p a i n t ret
+wait_for "desktop: opened Paint" || fail "the shell could not open Paint"
+echo "apps open from the shell"
 echo "boot test passed"

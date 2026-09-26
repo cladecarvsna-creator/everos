@@ -121,3 +121,31 @@ impl ByteQueue {
         self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Acquire)
     }
 }
+
+/// A large zeroed array in .bss that can be borrowed exactly once, for
+/// buffers too big for the stack (the kernel has no heap).
+pub struct StaticBuffer<const N: usize> {
+    taken: AtomicBool,
+    data: UnsafeCell<[u32; N]>,
+}
+
+unsafe impl<const N: usize> Sync for StaticBuffer<N> {}
+
+impl<const N: usize> StaticBuffer<N> {
+    pub const fn new() -> Self {
+        Self {
+            taken: AtomicBool::new(false),
+            data: UnsafeCell::new([0; N]),
+        }
+    }
+
+    /// Panics if called twice, so there is only ever one `&mut`.
+    #[allow(clippy::mut_from_ref)]
+    pub fn take(&'static self) -> &'static mut [u32] {
+        assert!(
+            !self.taken.swap(true, Ordering::AcqRel),
+            "buffer taken twice"
+        );
+        unsafe { &mut *self.data.get() }
+    }
+}

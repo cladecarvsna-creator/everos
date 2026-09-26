@@ -7,6 +7,12 @@ pub unsafe fn outb(port: u16, value: u8) {
 }
 
 /// # Safety
+/// Writing to an I/O port can reconfigure hardware.
+pub unsafe fn outw(port: u16, value: u16) {
+    core::arch::asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack));
+}
+
+/// # Safety
 /// Reading some I/O ports has side effects (for example it pops a byte
 /// from the PS/2 controller).
 pub unsafe fn inb(port: u16) -> u8 {

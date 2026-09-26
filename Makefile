@@ -33,9 +33,10 @@ $(ISO): $(KERNEL) iso/boot/grub/grub.cfg
 	cp iso/boot/grub/grub.cfg $(BUILD)/iso/boot/grub/grub.cfg
 	grub-mkrescue -o $@ $(BUILD)/iso 2> /dev/null
 
-# Boot EverOS in a QEMU window. Serial output goes to the terminal.
+# Boot EverOS in a QEMU window. Serial output goes to the terminal, and
+# the taskbar clock shows local time.
 run: $(ISO)
-	$(QEMU) -cdrom $(ISO) -serial stdio
+	$(QEMU) -cdrom $(ISO) -m 256M -serial stdio -rtc base=localtime
 
 # Boot headless and check that the kernel reached Rust code.
 test: $(ISO)
