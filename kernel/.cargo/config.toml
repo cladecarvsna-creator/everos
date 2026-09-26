@@ -1,0 +1,7 @@
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+# The ASM boot code identity-maps low memory and links the kernel at 1 MiB,
+# so use the small code model instead of the target's higher-half default.
+rustflags = ["-C", "code-model=small", "-C", "relocation-model=static"]
