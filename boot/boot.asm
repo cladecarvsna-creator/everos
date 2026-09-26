@@ -137,5 +137,5 @@ p3_table:
 p2_tables:
     resb 4096 * 4
 stack_bottom:
-    resb 4096 * 16
+    resb 4096 * 64               ; 256 KiB: the desktop keeps icons on the stack
 stack_top:
