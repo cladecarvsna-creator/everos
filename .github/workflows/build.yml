@@ -17,7 +17,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm grub-pc-bin grub-common xorriso mtools qemu-system-x86
+          sudo apt-get install -y nasm grub-pc-bin grub-common xorriso mtools qemu-system-x86 clang
 
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy --target x86_64-unknown-none
