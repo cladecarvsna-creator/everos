@@ -1,17 +1,9 @@
 //! Output to the COM1 serial port, so headless runs (tests, CI) can see
 //! what the kernel prints.
 
+use crate::port::{inb, outb};
+
 const COM1: u16 = 0x3f8;
-
-unsafe fn outb(port: u16, value: u8) {
-    core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack));
-}
-
-unsafe fn inb(port: u16) -> u8 {
-    let value: u8;
-    core::arch::asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack));
-    value
-}
 
 pub fn init() {
     unsafe {
@@ -34,6 +26,9 @@ fn write_byte(byte: u8) {
 
 pub fn write_str(text: &str) {
     for byte in text.bytes() {
+        if byte == b'\n' {
+            write_byte(b'\r');
+        }
         write_byte(byte);
     }
 }

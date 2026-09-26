@@ -69,24 +69,35 @@ check_long_mode:
     mov al, "2"
     jmp error
 
-; Identity-map the first 1 GiB with 2 MiB huge pages.
+; Identity-map the first 4 GiB with 2 MiB huge pages. The low 4 GiB
+; include the kernel, the multiboot info and the framebuffer, which
+; GRUB usually places just below 4 GiB (0xfd000000 in QEMU).
 set_up_page_tables:
     mov eax, p3_table
     or eax, 0b11                ; present + writable
     mov [p4_table], eax
 
-    mov eax, p2_table
+    ; point the first four P3 entries at the four P2 tables
+    mov ecx, 0
+.map_p3_table:
+    mov eax, 4096
+    mul ecx
+    add eax, p2_tables
     or eax, 0b11
-    mov [p3_table], eax
+    mov [p3_table + ecx * 8], eax
+    inc ecx
+    cmp ecx, 4
+    jne .map_p3_table
 
+    ; fill 4 * 512 P2 entries, each mapping 2 MiB
     mov ecx, 0
 .map_p2_table:
     mov eax, 0x200000           ; 2 MiB
     mul ecx
     or eax, 0b10000011          ; present + writable + huge
-    mov [p2_table + ecx * 8], eax
+    mov [p2_tables + ecx * 8], eax
     inc ecx
-    cmp ecx, 512
+    cmp ecx, 512 * 4
     jne .map_p2_table
     ret
 
@@ -123,8 +134,8 @@ p4_table:
     resb 4096
 p3_table:
     resb 4096
-p2_table:
-    resb 4096
+p2_tables:
+    resb 4096 * 4
 stack_bottom:
     resb 4096 * 16
 stack_top:
