@@ -28,6 +28,8 @@ pub enum Key {
     Down,
     Left,
     Right,
+    /// The Windows key.
+    Super,
     /// Alt+Shift switched the layout.
     LayoutChanged,
 }
@@ -167,6 +169,7 @@ impl Keyboard {
                 0x4b => Some(Key::Left),
                 0x4d => Some(Key::Right),
                 0x1c => Some(Key::Enter), // keypad enter
+                0x5b | 0x5c => Some(Key::Super),
                 _ => None,
             };
         }

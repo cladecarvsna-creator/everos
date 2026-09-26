@@ -17,6 +17,7 @@ mod serial;
 mod shell;
 mod sync;
 mod vga;
+mod vmmouse;
 
 use core::fmt::Write;
 use core::panic::PanicInfo;

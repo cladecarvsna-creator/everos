@@ -4,6 +4,7 @@
 //! rectangle, so a window can draw in its own coordinates without
 //! touching anything outside its area.
 
+use super::text::{self, Font};
 use crate::font;
 
 /// A colour as `0x00RRGGBB`.
@@ -279,7 +280,8 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    pub fn draw_char(&mut self, x: i32, y: i32, ch: char, c: Color) {
+    /// Draw one 8x16 bitmap character (the boot console font).
+    pub fn draw_bitmap_char(&mut self, x: i32, y: i32, ch: char, c: Color) {
         if !self.visible(Rect::new(x, y, font::WIDTH as i32, font::HEIGHT as i32)) {
             return;
         }
@@ -292,22 +294,55 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    /// Draw text and return its width in pixels.
-    pub fn draw_text(&mut self, x: i32, y: i32, text: &str, c: Color) -> i32 {
-        let mut n = 0;
-        for ch in text.chars() {
-            self.draw_char(x + n * font::WIDTH as i32, y, ch, c);
-            n += 1;
+    /// Draw one anti-aliased character with its line top at `y`. Returns
+    /// false when the font has no glyph for it.
+    pub fn draw_glyph(&mut self, f: &Font, x: i32, y: i32, ch: char, c: Color) -> bool {
+        let Some(g) = f.glyph(ch) else {
+            return false;
+        };
+        let (gx, gy) = (x + g.x as i32, y + g.y as i32);
+        let (w, h) = (g.w as i32, g.h as i32);
+        if w == 0 || !self.visible(Rect::new(gx, gy, w, h)) {
+            return true;
         }
-        n * font::WIDTH as i32
+        let coverage = f.coverage(g);
+        for row in 0..h {
+            for col in 0..w {
+                let a = coverage[(row * w + col) as usize] as i32;
+                if a != 0 {
+                    let a = if a == 255 { 256 } else { a };
+                    self.blend(gx + col + self.ox, gy + row + self.oy, c, a);
+                }
+            }
+        }
+        true
+    }
+
+    /// Draw text in a font and return its width in pixels.
+    pub fn draw_text_in(&mut self, f: &Font, x: i32, y: i32, s: &str, c: Color) -> i32 {
+        let mut pen = x * 16;
+        for ch in s.chars() {
+            let fallback = if f.glyph(ch).is_some() { ch } else { '?' };
+            self.draw_glyph(f, (pen + 8) / 16, y, fallback, c);
+            pen += f.advance16(ch) as i32;
+        }
+        (pen + 8) / 16 - x
+    }
+
+    /// Draw text in the normal UI font and return its width in pixels.
+    pub fn draw_text(&mut self, x: i32, y: i32, s: &str, c: Color) -> i32 {
+        self.draw_text_in(&text::UI, x, y, s, c)
     }
 
     /// Draw text centred in `r`.
-    pub fn text_centered(&mut self, r: Rect, text: &str, c: Color) {
-        let w = text_width(text);
-        let x = r.x + (r.w - w) / 2;
-        let y = r.y + (r.h - font::HEIGHT as i32) / 2;
-        self.draw_text(x, y, text, c);
+    pub fn text_centered(&mut self, r: Rect, s: &str, c: Color) {
+        self.text_centered_in(&text::UI, r, s, c);
+    }
+
+    pub fn text_centered_in(&mut self, f: &Font, r: Rect, s: &str, c: Color) {
+        let x = r.x + (r.w - f.width(s)) / 2;
+        let y = r.y + (r.h - f.line_height) / 2;
+        self.draw_text_in(f, x, y, s, c);
     }
 
     /// Copy a `w` x `h` block of pixels with row length `src_stride`.
@@ -449,7 +484,11 @@ impl<'a> Canvas<'a> {
                 // distance from the rounded rectangle, in 1/256 pixels
                 let dx = (s.x + radius - x).max(x - (s.right() - 1 - radius)).max(0);
                 let dy = (s.y + radius - y).max(y - (s.bottom() - 1 - radius)).max(0);
-                let d = distance256(2 * dx, 2 * dy) - radius * 256;
+                // straight edges need no square root, only the corners do
+                let d = match (dx, dy) {
+                    (0, d) | (d, 0) => d * 256,
+                    _ => distance256(2 * dx, 2 * dy),
+                } - radius * 256;
                 let t = 256 - (d.max(0) / spread).min(256);
                 let a = strength * t * t / 65536;
                 if a > 0 {
@@ -463,13 +502,29 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    /// Draw a small picture given as strings: each character is looked up
-    /// in `palette` as (char, colour); characters not in it are skipped.
-    pub fn sprite(&mut self, x: i32, y: i32, rows: &[&[u8]], palette: &[(u8, Color)]) {
-        for (dy, row) in rows.iter().enumerate() {
-            for (dx, ch) in row.iter().enumerate() {
-                if let Some(&(_, c)) = palette.iter().find(|(p, _)| p == ch) {
-                    self.pixel(x + dx as i32, y + dy as i32, c);
+    /// Fill a polygon (even-odd rule, pixel centres), without smoothing.
+    pub fn fill_polygon(&mut self, points: &[(i32, i32)], c: Color) {
+        let top = points.iter().map(|p| p.1).min().unwrap_or(0);
+        let bottom = points.iter().map(|p| p.1).max().unwrap_or(0);
+        for y in top..bottom {
+            // crossings of the line through this row's pixel centres, in
+            // doubled coordinates to stay in integers
+            let cy = 2 * y + 1;
+            let mut xs = [0i32; 16];
+            let mut n = 0;
+            for i in 0..points.len() {
+                let (x0, y0) = points[i];
+                let (x1, y1) = points[(i + 1) % points.len()];
+                let (y0, y1) = (2 * y0, 2 * y1);
+                if ((y0 <= cy && cy < y1) || (y1 <= cy && cy < y0)) && n < xs.len() {
+                    xs[n] = x0 + (x1 - x0) * (cy - y0) / (y1 - y0);
+                    n += 1;
+                }
+            }
+            xs[..n].sort_unstable();
+            for pair in xs[..n].chunks(2) {
+                if let [a, b] = pair {
+                    self.fill_rect(*a, y, b - a, 1, c);
                 }
             }
         }
@@ -506,6 +561,7 @@ fn isqrt(n: u64) -> u64 {
     x
 }
 
-pub fn text_width(text: &str) -> i32 {
-    (text.chars().count() * font::WIDTH) as i32
+/// Width of text in the normal UI font.
+pub fn text_width(s: &str) -> i32 {
+    text::UI.width(s)
 }

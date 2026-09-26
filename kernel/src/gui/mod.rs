@@ -9,27 +9,37 @@
 mod calc;
 mod canvas;
 mod demo;
+#[rustfmt::skip]
+mod font_data;
+mod icons;
 mod paint;
+mod start;
 mod terminal;
+mod text;
 mod theme;
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use canvas::{mix, rgb, Canvas, Rect};
+use icons::{draw_icon, Icons};
+use start::StartMenu;
 
 use crate::framebuffer::Framebuffer;
 use crate::interrupts::{self, KEYBOARD_BYTES, MOUSE_BYTES};
 use crate::keyboard::{Key, Keyboard, Layout};
 use crate::multiboot::BootInfo;
 use crate::sync::{ByteQueue, StaticBuffer};
-use crate::{console::CONSOLE, port, ps2, rtc, serial, StackString};
+use crate::{console::CONSOLE, port, ps2, rtc, serial, vmmouse, StackString};
 
 const MAX_W: usize = 1920;
 const MAX_H: usize = 1200;
 static BACK_BUFFER: StaticBuffer<{ MAX_W * MAX_H }> = StaticBuffer::new();
 /// The desktop background, drawn once at start.
 static WALLPAPER: StaticBuffer<{ MAX_W * MAX_H }> = StaticBuffer::new();
+/// Window contents. Each app draws into its own part only when its content
+/// changes, so moving a window just copies pixels.
+static SURFACES: StaticBuffer<{ 4 * 1024 * 1024 }> = StaticBuffer::new();
 
 /// Whether the desktop is running (the shell asks before opening apps).
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -82,10 +92,10 @@ impl App {
 
     fn default_position(self) -> (i32, i32) {
         match self {
-            App::Terminal => (150, 40),
-            App::Paint => (250, 100),
-            App::Calculator => (760, 60),
-            App::Demo => (380, 170),
+            App::Terminal => (240, 70),
+            App::Paint => (520, 150),
+            App::Calculator => (1440, 90),
+            App::Demo => (760, 330),
         }
     }
 }
@@ -165,25 +175,6 @@ impl Window {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MenuItem {
-    Open(App),
-    Restart,
-    ShutDown,
-}
-
-const MENU: [MenuItem; 6] = [
-    MenuItem::Open(App::Terminal),
-    MenuItem::Open(App::Paint),
-    MenuItem::Open(App::Calculator),
-    MenuItem::Open(App::Demo),
-    MenuItem::Restart,
-    MenuItem::ShutDown,
-];
-const MENU_W: i32 = 520;
-const MENU_H: i32 = 250;
-const MENU_FOOTER: i32 = 64;
-
 /// What is under the mouse and lights up.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Hover {
@@ -192,68 +183,6 @@ enum Hover {
     Close(App),
     /// A taskbar button: 0 is Start, then the apps.
     Slot(usize),
-    Menu(usize),
-}
-
-/// App icons, shrunk from the 48 pixel drawings, with alpha.
-struct Icons {
-    medium: [[u32; 24 * 24]; APPS.len()],
-    small: [[u32; 16 * 16]; APPS.len()],
-}
-
-impl Icons {
-    fn new() -> Self {
-        let mut icons = Icons {
-            medium: [[0; 24 * 24]; APPS.len()],
-            small: [[0; 16 * 16]; APPS.len()],
-        };
-        for app in APPS {
-            // pixels left at the marker value are transparent
-            let mut big = [TRANSPARENT; 48 * 48];
-            draw_icon(&mut Canvas::new(&mut big, 48, 48), app, 0, 0);
-            shrink(&big, 2, &mut icons.medium[app.index()]);
-            shrink(&big, 3, &mut icons.small[app.index()]);
-        }
-        icons
-    }
-
-    fn draw_medium(&self, c: &mut Canvas, app: App, x: i32, y: i32) {
-        c.blit_alpha(x, y, 24, 24, &self.medium[app.index()]);
-    }
-
-    fn draw_small(&self, c: &mut Canvas, app: App, x: i32, y: i32) {
-        c.blit_alpha(x, y, 16, 16, &self.small[app.index()]);
-    }
-}
-
-const TRANSPARENT: u32 = 0xffc8_c8c8;
-
-/// Scale a 48x48 picture down by `k`, averaging the opaque pixels of each
-/// block and turning how many there were into alpha.
-fn shrink(big: &[u32], k: usize, out: &mut [u32]) {
-    let n = 48 / k;
-    for oy in 0..n {
-        for ox in 0..n {
-            let (mut r, mut g, mut b, mut count) = (0, 0, 0, 0);
-            for y in oy * k..oy * k + k {
-                for x in ox * k..ox * k + k {
-                    let p = big[y * 48 + x];
-                    if p != TRANSPARENT {
-                        r += (p >> 16) & 0xff;
-                        g += (p >> 8) & 0xff;
-                        b += p & 0xff;
-                        count += 1;
-                    }
-                }
-            }
-            out[oy * n + ox] = if count == 0 {
-                0
-            } else {
-                let alpha = count * 255 / (k * k) as u32;
-                alpha << 24 | (r / count) << 16 | (g / count) << 8 | (b / count)
-            };
-        }
-    }
 }
 
 pub struct Desktop<'a> {
@@ -264,6 +193,7 @@ pub struct Desktop<'a> {
     height: i32,
     boot: &'a BootInfo,
     icons: Icons,
+    pointer_image: Pointer,
 
     windows: [Window; APPS.len()],
     /// Open windows from bottom to top.
@@ -280,7 +210,12 @@ pub struct Desktop<'a> {
     /// App that got the button press and gets the moves until release.
     capture: Option<App>,
     hover: Hover,
-    menu_open: bool,
+    start: StartMenu,
+    /// Mouse buttons as the PS/2 mouse and the vmmouse last reported them.
+    ps2_buttons: (bool, bool),
+    vm_buttons: (bool, bool),
+    /// Last vmmouse position, to tell moves from button-only events.
+    vm_position: (u32, u32),
     selected_icon: Option<usize>,
     last_click: (u64, usize),
 
@@ -288,6 +223,9 @@ pub struct Desktop<'a> {
     clock: StackString<16>,
     cursor_on: bool,
     dirty: Rect,
+    surfaces: [&'static mut [u32]; APPS.len()],
+    /// Apps whose surface must be drawn again.
+    stale: [bool; APPS.len()],
 
     terminal: terminal::Terminal,
     paint: paint::Paint,
@@ -311,6 +249,13 @@ impl<'a> Desktop<'a> {
             let y = y.min(height - TASKBAR_H - h - TITLE_H - BORDER).max(0);
             windows[app.index()].rect = Rect::new(x, y, w + 2 * BORDER, h + TITLE_H + BORDER);
         }
+        let mut pool = SURFACES.take();
+        let surfaces = core::array::from_fn(|i| {
+            let (w, h) = APPS[i].client_size();
+            let (mine, rest) = core::mem::take(&mut pool).split_at_mut((w * h) as usize);
+            pool = rest;
+            mine
+        });
         let wallpaper = WALLPAPER.take();
         draw_wallpaper(&mut Canvas::new(wallpaper, width as usize, height as usize));
         Self {
@@ -321,6 +266,7 @@ impl<'a> Desktop<'a> {
             height,
             boot,
             icons: Icons::new(),
+            pointer_image: Pointer::new(),
             windows,
             order: APPS,
             order_len: 0,
@@ -332,13 +278,18 @@ impl<'a> Desktop<'a> {
             drag: None,
             capture: None,
             hover: Hover::None,
-            menu_open: false,
+            start: StartMenu::new(),
+            ps2_buttons: (false, false),
+            vm_buttons: (false, false),
+            vm_position: (0, 0),
             selected_icon: None,
             last_click: (0, usize::MAX),
             layout: Layout::Us,
             clock: StackString::new(),
             cursor_on: true,
             dirty: Rect::default(),
+            surfaces,
+            stale: [true; APPS.len()],
             terminal: terminal::Terminal::new(),
             paint: paint::Paint::new(),
             calc: calc::Calc::new(),
@@ -360,7 +311,9 @@ impl<'a> Desktop<'a> {
         }
     }
 
+    /// The app's content changed: draw its surface again.
     fn damage_client(&mut self, app: App) {
+        self.stale[app.index()] = true;
         let w = self.windows[app.index()];
         if w.visible() {
             self.damage(w.client());
@@ -379,6 +332,7 @@ impl<'a> Desktop<'a> {
             serial::write_str("\ndesktop: opened ");
             serial::write_str(app.title());
             serial::write_str("\n");
+            self.start.note_opened(app);
         }
         w.minimized = false;
         self.focus(app);
@@ -474,11 +428,16 @@ impl<'a> Desktop<'a> {
             self.damage_taskbar();
             return;
         }
-        if self.menu_open {
-            if let Key::Escape = key {
-                self.close_menu();
-                return;
+        if self.start.open {
+            match self.start.on_key(key) {
+                start::Action::None => {}
+                action => self.menu_action(action),
             }
+            return;
+        }
+        if let Key::Super = key {
+            self.open_menu();
+            return;
         }
         let Some(app) = self.focused else {
             return;
@@ -497,10 +456,34 @@ impl<'a> Desktop<'a> {
         }
     }
 
-    fn on_mouse(&mut self, packet: ps2::MousePacket) {
+    /// A PS/2 mouse packet: relative movement.
+    fn on_ps2(&mut self, packet: ps2::MousePacket) {
+        self.ps2_buttons = (packet.left, packet.right);
+        self.pointer(self.mouse_x + packet.dx, self.mouse_y + packet.dy);
+    }
+
+    /// A vmmouse event: an absolute position.
+    fn on_vmmouse(&mut self, ev: vmmouse::Event) {
+        self.vm_buttons = (
+            ev.buttons & vmmouse::LEFT != 0,
+            ev.buttons & vmmouse::RIGHT != 0,
+        );
+        // button-only events repeat the last position; skip those, so the
+        // PS/2 mouse (as QEMU's monitor drives it) is not thrown back
+        let (mut x, mut y) = (self.mouse_x, self.mouse_y);
+        if (ev.x, ev.y) != self.vm_position {
+            self.vm_position = (ev.x, ev.y);
+            x = (ev.x as u64 * self.width as u64 / 65536) as i32;
+            y = (ev.y as u64 * self.height as u64 / 65536) as i32;
+        }
+        self.pointer(x, y);
+    }
+
+    /// Move the pointer to a position and handle button changes.
+    fn pointer(&mut self, x: i32, y: i32) {
         let (old_x, old_y) = (self.mouse_x, self.mouse_y);
-        self.mouse_x = (self.mouse_x + packet.dx).clamp(0, self.width - 1);
-        self.mouse_y = (self.mouse_y + packet.dy).clamp(0, self.height - 1);
+        self.mouse_x = x.clamp(0, self.width - 1);
+        self.mouse_y = y.clamp(0, self.height - 1);
         let moved = (old_x, old_y) != (self.mouse_x, self.mouse_y);
         if moved {
             self.damage(pointer_rect(old_x, old_y));
@@ -508,8 +491,8 @@ impl<'a> Desktop<'a> {
         }
 
         let (was_left, was_right) = (self.left, self.right);
-        self.left = packet.left;
-        self.right = packet.right;
+        self.left = self.ps2_buttons.0 || self.vm_buttons.0;
+        self.right = self.ps2_buttons.1 || self.vm_buttons.1;
 
         if self.left && !was_left {
             self.press(false);
@@ -537,16 +520,18 @@ impl<'a> Desktop<'a> {
             self.damage(old);
             self.damage(new);
         }
+        if self.start.open
+            && self
+                .start
+                .set_hover(self.menu_panel(), self.mouse_x, self.mouse_y)
+        {
+            self.damage(self.menu_rect());
+        }
     }
 
     fn hover_at(&self, x: i32, y: i32) -> Hover {
-        if self.menu_open {
-            if let Some(i) = self.menu_item_at(x, y) {
-                return Hover::Menu(i);
-            }
-            if self.menu_rect().contains(x, y) {
-                return Hover::None;
-            }
+        if self.start.open && self.menu_panel().contains(x, y) {
+            return Hover::None;
         }
         if y >= self.height - TASKBAR_H {
             return match (0..=APPS.len()).find(|&i| self.slot_rect(i).contains(x, y)) {
@@ -575,21 +560,18 @@ impl<'a> Desktop<'a> {
             Hover::Minimize(app) => self.windows[app.index()].minimize_button(),
             Hover::Close(app) => self.windows[app.index()].close_button(),
             Hover::Slot(i) => self.slot_rect(i),
-            Hover::Menu(i) => self.menu_item_rect(i),
         }
     }
 
     fn press(&mut self, right: bool) {
         let (x, y) = (self.mouse_x, self.mouse_y);
-        if self.menu_open {
-            if let Some(i) = self.menu_item_at(x, y) {
-                self.close_menu();
+        if self.start.open {
+            let panel = self.menu_panel();
+            if panel.contains(x, y) {
                 if !right {
-                    self.activate(MENU[i]);
+                    let action = self.start.on_click(panel, x, y);
+                    self.menu_action(action);
                 }
-                return;
-            }
-            if self.menu_rect().contains(x, y) {
                 return;
             }
             let on_start = self.slot_rect(0).contains(x, y);
@@ -681,9 +663,7 @@ impl<'a> Desktop<'a> {
             return;
         };
         if slot == 0 {
-            self.menu_open = true;
-            self.damage(self.menu_rect());
-            self.damage_taskbar();
+            self.open_menu();
             return;
         }
         let app = APPS[slot - 1];
@@ -695,47 +675,43 @@ impl<'a> Desktop<'a> {
         }
     }
 
+    fn open_menu(&mut self) {
+        self.start.show();
+        self.start
+            .set_hover(self.menu_panel(), self.mouse_x, self.mouse_y);
+        self.damage(self.menu_rect());
+        self.damage_taskbar();
+    }
+
     fn close_menu(&mut self) {
-        if self.menu_open {
-            self.menu_open = false;
+        if self.start.open {
+            self.start.open = false;
             self.damage(self.menu_rect());
             self.damage_taskbar();
         }
     }
 
-    fn activate(&mut self, item: MenuItem) {
-        match item {
-            MenuItem::Open(app) => self.open(app),
-            MenuItem::Restart => restart(),
-            MenuItem::ShutDown => shut_down(),
+    fn menu_action(&mut self, action: start::Action) {
+        match action {
+            start::Action::None => {}
+            start::Action::Redraw => self.damage(self.menu_rect()),
+            start::Action::Close => self.close_menu(),
+            start::Action::Open(app) => {
+                self.close_menu();
+                self.open(app);
+            }
+            start::Action::Restart => restart(),
+            start::Action::ShutDown => shut_down(),
         }
+    }
+
+    fn menu_panel(&self) -> Rect {
+        StartMenu::panel(self.width, self.height, TASKBAR_H)
     }
 
     /// The start menu, with room for its shadow.
     fn menu_rect(&self) -> Rect {
         self.menu_panel().inset(-SPREAD)
-    }
-
-    fn menu_panel(&self) -> Rect {
-        Rect::new(
-            (self.width - MENU_W) / 2,
-            self.height - TASKBAR_H - 12 - MENU_H,
-            MENU_W,
-            MENU_H,
-        )
-    }
-
-    fn menu_item_rect(&self, i: usize) -> Rect {
-        let p = self.menu_panel();
-        match MENU[i] {
-            MenuItem::Open(_) => Rect::new(p.x + 28 + i as i32 * 96, p.y + 64, 88, 92),
-            MenuItem::Restart => Rect::new(p.right() - 240, p.bottom() - 50, 108, 36),
-            MenuItem::ShutDown => Rect::new(p.right() - 124, p.bottom() - 50, 108, 36),
-        }
-    }
-
-    fn menu_item_at(&self, x: i32, y: i32) -> Option<usize> {
-        (0..MENU.len()).find(|&i| self.menu_item_rect(i).contains(x, y))
     }
 
     /// Taskbar button `i` (0 is Start), centred like Windows 11.
@@ -758,6 +734,24 @@ impl<'a> Desktop<'a> {
         if dirty.is_empty() {
             return;
         }
+        // bring stale window contents up to date first
+        let surfaces = core::mem::take(&mut self.surfaces);
+        for app in APPS {
+            if self.stale[app.index()] && self.windows[app.index()].visible() {
+                self.stale[app.index()] = false;
+                let (w, h) = app.client_size();
+                let mut c = Canvas::new(surfaces[app.index()], w as usize, h as usize);
+                let focused = self.focused == Some(app);
+                match app {
+                    App::Terminal => self.terminal.draw(&mut c, focused && self.cursor_on),
+                    App::Paint => self.paint.draw(&mut c),
+                    App::Calculator => self.calc.draw(&mut c),
+                    App::Demo => demo::draw(&mut c),
+                }
+            }
+        }
+        self.surfaces = surfaces;
+
         let back = core::mem::take(&mut self.back);
         {
             let mut c = Canvas::new(back, self.width as usize, self.height as usize);
@@ -778,10 +772,12 @@ impl<'a> Desktop<'a> {
                 }
             }
             self.draw_taskbar(&mut c);
-            if self.menu_open {
-                self.draw_menu(&mut c);
+            if self.start.open {
+                let blink = self.cursor_on;
+                self.start
+                    .draw(&mut c, self.menu_panel(), &self.icons, blink);
             }
-            draw_pointer(&mut c, self.mouse_x, self.mouse_y);
+            self.pointer_image.draw(&mut c, self.mouse_x, self.mouse_y);
         }
         self.back = back;
         self.present(dirty);
@@ -874,13 +870,15 @@ impl<'a> Desktop<'a> {
             win.line(cx + 9, cy, cx, cy + 9, close_glyph);
 
             let client = w.client();
-            let mut sub = win.sub(client);
-            match app {
-                App::Terminal => self.terminal.draw(&mut sub, focused && self.cursor_on),
-                App::Paint => self.paint.draw(&mut sub),
-                App::Calculator => self.calc.draw(&mut sub),
-                App::Demo => demo::draw(&mut sub),
-            }
+            let surface = &self.surfaces[app.index()];
+            win.blit(
+                client.x,
+                client.y,
+                client.w,
+                client.h,
+                surface,
+                client.w as usize,
+            );
         }
         let border = if focused {
             rgb(0x8c, 0x90, 0x9c)
@@ -904,7 +902,7 @@ impl<'a> Desktop<'a> {
             let r = self.slot_rect(i);
             let app = if i == 0 { None } else { Some(APPS[i - 1]) };
             let active = match app {
-                None => self.menu_open,
+                None => self.start.open,
                 Some(a) => self.focused == Some(a) && self.windows[a.index()].visible(),
             };
             if active {
@@ -938,75 +936,6 @@ impl<'a> Desktop<'a> {
         let layout = Rect::new(self.width - 124, top + 12, 34, 24);
         c.text_centered(layout, self.layout.name(), theme::TEXT);
     }
-
-    fn draw_menu(&self, c: &mut Canvas) {
-        let p = self.menu_panel();
-        c.shadow(p, WINDOW_RADIUS, SPREAD, SHADOW_DROP, 110);
-        {
-            let mut m = c.sub(Rect::new(0, 0, c.width, c.height));
-            m.clip_round(p, WINDOW_RADIUS);
-            m.fill_round_alpha(p, 0, rgb(0xf6, 0xf7, 0xfb), 250);
-            // "Pinned" in bold, by drawing it twice
-            m.draw_text(p.x + 36, p.y + 26, "Pinned", theme::TEXT);
-            m.draw_text(p.x + 37, p.y + 26, "Pinned", theme::TEXT);
-
-            for (i, item) in MENU.into_iter().enumerate() {
-                let r = self.menu_item_rect(i);
-                let hover = self.hover == Hover::Menu(i);
-                match item {
-                    MenuItem::Open(app) => {
-                        if hover {
-                            m.fill_round_alpha(r, 6, 0xffffff, 230);
-                            m.outline_round(r, 6, theme::STROKE);
-                        }
-                        draw_icon(&mut m, app, r.x + 20, r.y + 10);
-                        let label = Rect::new(r.x, r.y + 64, r.w, 16);
-                        m.text_centered(label, app.title(), theme::TEXT);
-                    }
-                    MenuItem::Restart | MenuItem::ShutDown => {}
-                }
-            }
-
-            let footer = Rect::new(p.x, p.bottom() - MENU_FOOTER, p.w, MENU_FOOTER);
-            m.fill(footer, rgb(0xec, 0xee, 0xf4));
-            m.fill_rect(p.x, footer.y, p.w, 1, theme::STROKE);
-            let avatar = Rect::new(p.x + 28, footer.y + 16, 32, 32);
-            m.fill_round(avatar, 16, theme::ACCENT);
-            m.text_centered(avatar, "E", 0xffffff);
-            m.draw_text(p.x + 72, footer.y + 24, "EverOS", theme::TEXT);
-
-            for (i, item) in MENU.into_iter().enumerate() {
-                let r = self.menu_item_rect(i);
-                let label = match item {
-                    MenuItem::Restart => "Restart",
-                    MenuItem::ShutDown => "Shut down",
-                    MenuItem::Open(_) => continue,
-                };
-                if self.hover == Hover::Menu(i) {
-                    m.fill_round(r, 5, 0xffffff);
-                    m.outline_round(r, 5, theme::STROKE);
-                }
-                // a power symbol: a ring with a gap and a bar
-                let (cx, cy) = (r.x + 18, r.y + 18);
-                let ring = Rect::new(cx - 7, cy - 7, 14, 14);
-                m.outline_round(ring, 7, theme::TEXT);
-                m.outline_round(ring.inset(1), 6, theme::TEXT);
-                if let MenuItem::ShutDown = item {
-                    let bg = if self.hover == Hover::Menu(i) {
-                        0xffffff
-                    } else {
-                        rgb(0xec, 0xee, 0xf4)
-                    };
-                    m.fill_rect(cx - 3, cy - 8, 6, 6, bg);
-                    m.fill_rect(cx - 1, cy - 9, 2, 8, theme::TEXT);
-                } else {
-                    m.fill_round(Rect::new(cx + 3, cy - 9, 5, 5), 2, theme::TEXT);
-                }
-                m.draw_text(r.x + 32, r.y + 10, label, theme::TEXT);
-            }
-        }
-        c.outline_round(p, WINDOW_RADIUS, rgb(0xc8, 0xca, 0xd2));
-    }
 }
 
 // ---- layout helpers ---------------------------------------------------------
@@ -1017,35 +946,70 @@ fn icon_rect(i: usize) -> Rect {
 
 // ---- pictures ---------------------------------------------------------------
 
-/// Mouse pointer: 'X' is the outline, '.' the fill, ' ' transparent.
-const POINTER: [&[u8]; 19] = [
-    b"X           ",
-    b"XX          ",
-    b"X.X         ",
-    b"X..X        ",
-    b"X...X       ",
-    b"X....X      ",
-    b"X.....X     ",
-    b"X......X    ",
-    b"X.......X   ",
-    b"X........X  ",
-    b"X.........X ",
-    b"X......XXXXX",
-    b"X...X..X    ",
-    b"X..XX..X    ",
-    b"X.X  X..X   ",
-    b"XX   X..X   ",
-    b"X     X..X  ",
-    b"      X..X  ",
-    b"       XX   ",
-];
-
-fn pointer_rect(x: i32, y: i32) -> Rect {
-    Rect::new(x, y, 12, 19)
+/// The mouse pointer, drawn at 4x with polygons and shrunk with alpha
+/// so its edges are smooth.
+struct Pointer {
+    pixels: [u32; POINTER_W * POINTER_H],
 }
 
-fn draw_pointer(c: &mut Canvas, x: i32, y: i32) {
-    c.sprite(x, y, &POINTER, &[(b'X', 0x000000), (b'.', 0xffffff)]);
+const POINTER_W: usize = 16;
+const POINTER_H: usize = 24;
+
+impl Pointer {
+    fn new() -> Self {
+        // the arrow outline and its white inside, in 1/4 pixels
+        const OUTER: [(i32, i32); 7] = [
+            (2, 2),
+            (2, 82),
+            (21, 64),
+            (35, 94),
+            (48, 88),
+            (35, 60),
+            (60, 60),
+        ];
+        const INNER: [(i32, i32); 7] = [
+            (8, 16),
+            (8, 68),
+            (22, 55),
+            (37, 86),
+            (41, 84),
+            (27, 54),
+            (45, 54),
+        ];
+        const S: usize = 4;
+        let mut big = [0u32; POINTER_W * S * POINTER_H * S];
+        let marker = 0xff00_0000;
+        big.fill(marker);
+        let mut c = Canvas::new(&mut big, POINTER_W * S, POINTER_H * S);
+        c.fill_polygon(&OUTER, 0x000000);
+        c.fill_polygon(&INNER, 0xffffff);
+        let mut pixels = [0u32; POINTER_W * POINTER_H];
+        for (i, out) in pixels.iter_mut().enumerate() {
+            let (ox, oy) = (i % POINTER_W, i / POINTER_W);
+            let (mut sum, mut count) = (0u32, 0u32);
+            for y in oy * S..oy * S + S {
+                for x in ox * S..ox * S + S {
+                    let p = big[y * POINTER_W * S + x];
+                    if p != marker {
+                        sum += p & 0xff;
+                        count += 1;
+                    }
+                }
+            }
+            if let Some(grey) = sum.checked_div(count) {
+                *out = (count * 255 / (S * S) as u32) << 24 | grey << 16 | grey << 8 | grey;
+            }
+        }
+        Self { pixels }
+    }
+
+    fn draw(&self, c: &mut Canvas, x: i32, y: i32) {
+        c.blit_alpha(x, y, POINTER_W as i32, POINTER_H as i32, &self.pixels);
+    }
+}
+
+fn pointer_rect(x: i32, y: i32) -> Rect {
+    Rect::new(x, y, POINTER_W as i32, POINTER_H as i32)
 }
 
 /// Deep blue with a soft flower of light in the middle.
@@ -1101,67 +1065,6 @@ fn draw_start_logo(c: &mut Canvas, x: i32, y: i32) {
     }
 }
 
-/// A 48x48 app icon.
-fn draw_icon(c: &mut Canvas, app: App, x: i32, y: i32) {
-    let tile = Rect::new(x + 2, y + 2, 44, 44);
-    match app {
-        App::Terminal => {
-            c.fill_round(tile, 8, rgb(0x2b, 0x2d, 0x36));
-            {
-                let mut s = c.sub(Rect::new(0, 0, c.width, c.height));
-                s.clip_round(tile, 8);
-                s.fill_rect(tile.x, tile.y, tile.w, 10, rgb(0x4a, 0x4e, 0x5c));
-            }
-            c.outline_round(tile, 8, rgb(0x16, 0x18, 0x1e));
-            c.draw_text(x + 10, y + 20, ">_", rgb(0xe8, 0xe8, 0xf0));
-        }
-        App::Paint => {
-            c.fill_round(tile, 8, rgb(0xfa, 0xfa, 0xfc));
-            c.outline_round(tile, 8, rgb(0xb8, 0xbc, 0xc8));
-            c.fill_round(Rect::new(x + 9, y + 9, 13, 13), 6, rgb(0xe8, 0x3c, 0x3c));
-            c.fill_round(Rect::new(x + 24, y + 10, 13, 13), 6, rgb(0x2c, 0xb8, 0x5c));
-            c.fill_round(Rect::new(x + 14, y + 23, 13, 13), 6, rgb(0x1c, 0x8c, 0xf0));
-            for i in 0..3 {
-                c.line(
-                    x + 28 + i,
-                    y + 42,
-                    x + 41 + i,
-                    y + 29,
-                    rgb(0xa8, 0x6a, 0x2c),
-                );
-            }
-            c.fill_round(Rect::new(x + 38, y + 25, 6, 6), 2, rgb(0x40, 0x40, 0x48));
-        }
-        App::Calculator => {
-            c.fill_round(tile, 8, rgb(0x3a, 0x3e, 0x4c));
-            c.outline_round(tile, 8, rgb(0x20, 0x22, 0x2c));
-            c.fill_round(Rect::new(x + 9, y + 8, 30, 9), 2, rgb(0xd8, 0xe4, 0xf4));
-            for row in 0..3 {
-                for col in 0..3 {
-                    let color = if (row, col) == (2, 2) {
-                        rgb(0x3a, 0x9c, 0xff)
-                    } else {
-                        rgb(0xe8, 0xe8, 0xf0)
-                    };
-                    let r = Rect::new(x + 9 + col * 11, y + 20 + row * 8, 8, 6);
-                    c.fill_round(r, 2, color);
-                }
-            }
-        }
-        App::Demo => {
-            {
-                let mut s = c.sub(Rect::new(0, 0, c.width, c.height));
-                s.clip_round(tile, 8);
-                s.vertical_gradient(tile, rgb(0x16, 0x20, 0x5c), rgb(0x6a, 0x1c, 0x5c));
-            }
-            c.fill_round(Rect::new(x + 15, y + 15, 18, 18), 9, rgb(0xff, 0xc0, 0x40));
-            c.fill_round(Rect::new(x + 9, y + 10, 8, 8), 4, rgb(0x60, 0xc0, 0xff));
-            c.fill_round(Rect::new(x + 33, y + 31, 6, 6), 3, rgb(0xff, 0x70, 0x70));
-            c.outline_round(tile, 8, rgb(0x10, 0x10, 0x30));
-        }
-    }
-}
-
 // ---- power ------------------------------------------------------------------
 
 fn restart() {
@@ -1193,6 +1096,12 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
 
     let mut keyboard = Keyboard::new();
     let mut mouse = ps2::MouseDecoder::new();
+    let absolute = vmmouse::init();
+    serial::write_str(if absolute {
+        "desktop: absolute mouse\n"
+    } else {
+        "desktop: PS/2 mouse\n"
+    });
     let mut next_blink = 0;
     let mut last_second = u64::MAX;
     loop {
@@ -1204,7 +1113,12 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
         }
         while let Some(byte) = MOUSE_BYTES.pop() {
             if let Some(packet) = mouse.feed(byte) {
-                desk.on_mouse(packet);
+                desk.on_ps2(packet);
+            }
+        }
+        if absolute {
+            while let Some(ev) = vmmouse::poll() {
+                desk.on_vmmouse(ev);
             }
         }
         while let Some(request) = REQUESTS.pop() {
@@ -1223,10 +1137,11 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
         if now >= next_blink {
             next_blink = now + BLINK_TICKS;
             desk.cursor_on = !desk.cursor_on;
-            if desk.focused == Some(App::Terminal) {
-                let client = desk.windows[App::Terminal.index()].client();
-                let cursor = desk.terminal.cursor_rect().offset(client.x, client.y);
-                desk.damage(cursor);
+            if desk.start.open {
+                // the caret in the search box
+                desk.damage(desk.menu_rect());
+            } else if desk.focused == Some(App::Terminal) {
+                desk.damage_client(App::Terminal);
             }
         }
         let second = now / interrupts::TIMER_HZ;

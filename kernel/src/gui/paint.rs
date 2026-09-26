@@ -8,8 +8,8 @@ use super::theme;
 use super::{MouseEvent, MouseKind};
 use crate::sync::StaticBuffer;
 
-pub const PICTURE_W: usize = 640;
-pub const PICTURE_H: usize = 400;
+pub const PICTURE_W: usize = 960;
+pub const PICTURE_H: usize = 600;
 const TOOLBAR_H: i32 = 54;
 pub const CLIENT_W: i32 = PICTURE_W as i32;
 pub const CLIENT_H: i32 = TOOLBAR_H + PICTURE_H as i32;

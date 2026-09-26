@@ -68,8 +68,10 @@ pub fn init() -> bool {
     command(0xae); // enable keyboard port
     command(0xa8); // enable mouse port
 
-    // defaults (100 samples/s, 4 counts/mm), then start sending packets
-    let mouse = mouse_command(0xf6) && mouse_command(0xf4);
+    // defaults, 200 samples/s for smoother movement, then start sending
+    // packets
+    let mouse =
+        mouse_command(0xf6) && mouse_command(0xf3) && mouse_command(200) && mouse_command(0xf4);
     flush();
     mouse
 }
