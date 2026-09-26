@@ -31,7 +31,10 @@ mod icons;
 mod login;
 mod notepad;
 mod paint;
+mod personalize;
+mod picture;
 mod popup;
+mod power;
 mod search;
 mod settings;
 mod start;
@@ -40,6 +43,7 @@ mod terminal;
 mod text;
 mod theme;
 mod tray;
+mod wallpaper;
 #[rustfmt::skip]
 pub mod webfont;
 mod widgets;
@@ -91,6 +95,8 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static REQUESTS: ByteQueue = ByteQueue::new();
 const CLOSE: u8 = 0x80;
 const LOCK: u8 = 0x40;
+const RESTART: u8 = 0x41;
+const SHUT_DOWN: u8 = 0x42;
 
 const TASKBAR_H: i32 = 48;
 const TITLE_H: i32 = 32;
@@ -240,6 +246,41 @@ pub fn request_lock() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
 
+/// Ask the desktop to restart or shut down, with the animation.
+pub fn request_power(restart: bool) -> bool {
+    REQUESTS.push(if restart { RESTART } else { SHUT_DOWN });
+    ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Switch between the light and the dark look (the shell's `theme`).
+pub fn set_theme(dark: bool) {
+    personalize::update(|p| p.dark = dark);
+}
+
+/// Use a picture as the desktop background (the shell's `wallpaper`).
+/// Returns false if it can't be read as a picture.
+pub fn set_wallpaper(path: &str) -> bool {
+    let ok = fs::read(path)
+        .ok()
+        .is_some_and(|data| picture::decode(&data).is_some());
+    if ok {
+        personalize::set_wallpaper(path);
+    }
+    ok
+}
+
+/// The next built-in background.
+pub fn next_wallpaper() {
+    personalize::update(|p| {
+        p.background = match p.background {
+            personalize::Background::Builtin(i) => {
+                personalize::Background::Builtin((i + 1) % wallpaper::BUILTIN.len())
+            }
+            _ => personalize::Background::Builtin(0),
+        }
+    });
+}
+
 /// Ask the desktop to close an app's window.
 pub fn request_close(app: App) -> bool {
     REQUESTS.push(CLOSE | app.index() as u8);
@@ -344,6 +385,10 @@ fn shadow_bounds(r: Rect) -> Rect {
 /// What the screen shows.
 #[derive(Clone, Copy)]
 enum Phase {
+    /// The boot screen, since this tick.
+    Boot(u64),
+    /// Restarting or shutting down, since this tick.
+    Power(power::Power, u64),
     /// The lock screen or the sign-in panel.
     Login,
     /// The sign-in screen (in SNAPSHOT) fading into the desktop.
@@ -497,20 +542,12 @@ impl<'a> Desktop<'a> {
             mine
         });
         let wallpaper = WALLPAPER.take();
-        draw_wallpaper(&mut Canvas::new(wallpaper, width as usize, height as usize));
+        // the look the lock screen had before the restart
+        personalize::load_boot();
+        wallpaper::render(&personalize::get(), wallpaper, width, height);
         let login = Login::new(wallpaper, BACKDROP.take(), width, height);
         let mut wall_thumb = alloc::vec![0u32; (desktops::TILE_W * desktops::TILE_H) as usize];
-        Canvas::new(
-            &mut wall_thumb,
-            desktops::TILE_W as usize,
-            desktops::TILE_H as usize,
-        )
-        .blit_smooth(
-            Rect::new(0, 0, desktops::TILE_W, desktops::TILE_H),
-            wallpaper,
-            width,
-            height,
-        );
+        shrink_wallpaper(&mut wall_thumb, wallpaper, width, height);
         Self {
             fb,
             back: BACK_BUFFER.take(),
@@ -542,7 +579,7 @@ impl<'a> Desktop<'a> {
             slider: None,
             toggle_layout: false,
             present_all: false,
-            phase: Phase::Login,
+            phase: Phase::Boot(interrupts::ticks()),
             login,
             session_user: None,
             ps2_buttons: (false, false),
@@ -682,6 +719,7 @@ impl<'a> Desktop<'a> {
     /// Move every animation on by the time that has passed and mark
     /// what it changes.
     fn tick(&mut self) {
+        self.tick_power();
         match self.phase {
             Phase::Unlocking(t) | Phase::Locking(t) if t.done() => {
                 self.phase = match self.phase {
@@ -742,6 +780,41 @@ impl<'a> Desktop<'a> {
         self.tick_tip();
     }
 
+    // ---- personalization -------------------------------------------------
+
+    /// The colours or the background changed (Settings, File Explorer or
+    /// Paint): draw everything again, the background too when
+    /// `background` is set, fading from the old look on the desktop.
+    fn apply_look(&mut self, background: bool) {
+        if matches!(self.phase, Phase::Desktop) && self.slide.is_none() {
+            self.start_crossfade();
+            if let Some(t) = &mut self.crossfade {
+                *t = Tween::new(0, ONE, anim::ms(350));
+            }
+        }
+        if background {
+            let prefs = personalize::get();
+            if !wallpaper::render(&prefs, self.wallpaper, self.width, self.height) {
+                serial::write_str("wallpaper: could not read the picture\n");
+            }
+            self.login.set_wallpaper(self.wallpaper);
+            shrink_wallpaper(
+                &mut self.wall_thumb,
+                self.wallpaper,
+                self.width,
+                self.height,
+            );
+            serial::write_str("wallpaper: changed\n");
+        }
+        serial::write_str(if theme::dark() {
+            "look: dark\n"
+        } else {
+            "look: light\n"
+        });
+        self.stale = [true; APPS.len()];
+        self.damage(self.screen());
+    }
+
     // ---- signing in and out -----------------------------------------------
 
     /// Keep what the screen shows now, without the pointer, to fade from.
@@ -763,6 +836,11 @@ impl<'a> Desktop<'a> {
         let user = users::current();
         if let Some(name) = users::current_name() {
             fs::ensure_home(name.as_str());
+        }
+        // the user's own colours and background, before the desktop shows
+        personalize::load_user();
+        if let Some(background) = personalize::take_changed() {
+            self.apply_look(background);
         }
         if self.session_user != user {
             // someone else: start a fresh session
@@ -832,8 +910,8 @@ impl<'a> Desktop<'a> {
         match outcome {
             login::Outcome::None => {}
             login::Outcome::SignedIn => self.signed_in(),
-            login::Outcome::Restart => restart(),
-            login::Outcome::ShutDown => shut_down(),
+            login::Outcome::Restart => self.power(power::Power::Restart),
+            login::Outcome::ShutDown => self.power(power::Power::ShutDown),
         }
     }
 
@@ -898,8 +976,20 @@ impl<'a> Desktop<'a> {
         self.app_changed(App::Explorer);
     }
 
-    /// Open a file in Notepad.
+    fn open_settings(&mut self, page: settings::Page) {
+        self.settings.show_page(page);
+        self.open(App::Settings);
+        self.damage_client(App::Settings);
+    }
+
+    /// Open a file: pictures in Paint, everything else in Notepad.
     fn open_file(&mut self, path: &str) {
+        if picture::is_picture(path) {
+            self.open(App::Paint);
+            self.paint.open_file(path);
+            self.damage_client(App::Paint);
+            return;
+        }
         self.open(App::Notepad);
         self.notepad.open_file(path);
         self.app_changed(App::Notepad);
@@ -1039,12 +1129,20 @@ impl<'a> Desktop<'a> {
                 self.desk_icons.forget();
                 self.refresh_icons();
             }
+            Cmd::Personalize => self.open_settings(settings::Page::Personalization),
+            Cmd::DisplaySettings => self.open_settings(settings::Page::System),
+            Cmd::NextBackground => next_wallpaper(),
+            Cmd::SetBackground(i) => {
+                if let Some(path) = self.icon_path(i) {
+                    personalize::set_wallpaper(&path);
+                }
+            }
             Cmd::NewFolder => self.new_on_desktop(true),
             Cmd::NewFile => self.new_on_desktop(false),
             Cmd::Lock => self.lock(false),
             Cmd::SignOut => self.lock(true),
-            Cmd::Restart => restart(),
-            Cmd::ShutDown => shut_down(),
+            Cmd::Restart => self.power(power::Power::Restart),
+            Cmd::ShutDown => self.power(power::Power::ShutDown),
         }
     }
 
@@ -1126,7 +1224,7 @@ impl<'a> Desktop<'a> {
                 self.login_outcome(outcome);
                 return;
             }
-            Phase::Locking(_) => return,
+            Phase::Locking(_) | Phase::Boot(_) | Phase::Power(..) => return,
             // typing can start while the desktop fades in
             Phase::Unlocking(_) | Phase::Desktop => {}
         }
@@ -1223,7 +1321,9 @@ impl<'a> Desktop<'a> {
             App::Browser => self.browser.on_key(key),
             App::Notepad => self.notepad.on_key(key),
             App::Explorer => self.explorer.on_key(key),
-            App::Paint | App::Demo | App::Settings | App::About => false,
+            App::Settings => self.settings.on_key(key),
+            App::Paint => self.paint.on_key(key),
+            App::Demo | App::About => false,
         };
         if changed {
             self.cursor_on = true;
@@ -1299,6 +1399,8 @@ impl<'a> Desktop<'a> {
                 Some(App::Browser) => self.browser.on_wheel(ev.wheel),
                 Some(App::Notepad) => self.notepad.on_wheel(ev.wheel),
                 Some(App::Explorer) => self.explorer.on_wheel(ev.wheel),
+                Some(App::Settings) => self.settings.on_wheel(ev.wheel),
+                Some(App::Paint) => self.paint.on_wheel(ev.wheel),
                 _ => false,
             };
             if let Some(app) = app.filter(|_| changed) {
@@ -1332,7 +1434,7 @@ impl<'a> Desktop<'a> {
                 }
                 return;
             }
-            Phase::Unlocking(_) | Phase::Locking(_) => return,
+            Phase::Unlocking(_) | Phase::Locking(_) | Phase::Boot(_) | Phase::Power(..) => return,
         }
 
         if self.left && !was_left {
@@ -1798,8 +1900,14 @@ impl<'a> Desktop<'a> {
                 self.close_menu();
                 self.open(app);
             }
-            start::Action::Restart => restart(),
-            start::Action::ShutDown => shut_down(),
+            start::Action::Restart => {
+                self.close_menu();
+                self.power(power::Power::Restart);
+            }
+            start::Action::ShutDown => {
+                self.close_menu();
+                self.power(power::Power::ShutDown);
+            }
             start::Action::Lock => self.lock(false),
             start::Action::SignOut => self.lock(true),
         }
@@ -1836,7 +1944,9 @@ impl<'a> Desktop<'a> {
             let mut c = Canvas::new(back, self.width as usize, self.height as usize);
             c.clip_to(*r);
             self.draw_scene(&mut c, scratch);
-            self.pointer_image.draw(&mut c, self.mouse_x, self.mouse_y);
+            if !matches!(self.phase, Phase::Boot(_) | Phase::Power(..)) {
+                self.pointer_image.draw(&mut c, self.mouse_x, self.mouse_y);
+            }
         }
         core::mem::swap(&mut self.back, &mut back);
         core::mem::swap(&mut self.scratch, &mut scratch);
@@ -1900,6 +2010,11 @@ impl<'a> Desktop<'a> {
 
     /// Draw everything but the pointer inside the canvas's clip.
     fn draw_scene(&self, c: &mut Canvas, scratch: &mut [u32]) {
+        match self.phase {
+            Phase::Boot(since) => return self.draw_boot(c, since),
+            Phase::Power(what, since) => return self.draw_power(c, what, since),
+            _ => {}
+        }
         if matches!(self.phase, Phase::Login | Phase::Locking(_)) {
             self.login.draw(c, self.wallpaper);
             return;
@@ -2021,11 +2136,7 @@ impl<'a> Desktop<'a> {
         let w = self.windows[app.index()];
         let focused = self.focused == Some(app);
         let strength = if focused { 120 } else { 70 };
-        let border = if focused {
-            rgb(0x8c, 0x90, 0x9c)
-        } else {
-            rgb(0xb4, 0xb4, 0xb8)
-        };
+        let border = theme::window_border(focused);
         let r = w.rect;
         let size = (r.w * r.h) as usize;
         let Some((frame, alpha)) = self.anim_frame(app).filter(|_| size <= scratch.len()) else {
@@ -2068,17 +2179,17 @@ impl<'a> Desktop<'a> {
     fn draw_window_body(&self, win: &mut Canvas, app: App, r: Rect) {
         let focused = self.focused == Some(app);
         let title_face = if focused {
-            rgb(0xee, 0xf1, 0xf8)
+            theme::title_active()
         } else {
-            theme::FACE
+            theme::face()
         };
         let title_bar = Rect::new(r.x, r.y, r.w, TITLE_H);
         win.fill(title_bar, title_face);
         self.icons.draw_small(win, app, r.x + 12, r.y + 8);
         let text = if focused {
-            theme::TEXT
+            theme::text()
         } else {
-            theme::TEXT_DIM
+            theme::text_dim()
         };
         let title = self.window_title(app);
         win.draw_text(r.x + 38, r.y + 8, &title, text);
@@ -2088,7 +2199,7 @@ impl<'a> Desktop<'a> {
         let min = close.offset(-46, 0);
         let lit = self.hover.level(Hover::Minimize(app)) as u32;
         if lit > 0 {
-            win.fill(min, mix(title_face, theme::TEXT, 25 * lit / 256));
+            win.fill(min, mix(title_face, theme::text(), 25 * lit / 256));
         }
         let (mx, my) = (min.x + 18, min.y + 16);
         win.fill_rect(mx, my, 10, 1, text);
@@ -2152,7 +2263,7 @@ impl<'a> Desktop<'a> {
             }
         });
         if shown {
-            c.outline_round(r, 8, rgb(0xc8, 0xca, 0xd2));
+            c.outline_round(r, 8, theme::frame());
         }
     }
 
@@ -2188,7 +2299,7 @@ impl<'a> Desktop<'a> {
             inner.clip_round(frame, 8);
             inner.blit_scaled(frame, scratch, panel.w, panel.h, p);
         }
-        m.outline_round_alpha(frame, 8, rgb(0xc8, 0xca, 0xd2), p);
+        m.outline_round_alpha(frame, 8, theme::frame(), p);
     }
 }
 
@@ -2295,6 +2406,16 @@ fn put_pixel(fb: &Framebuffer, x: usize, y: usize, p: u32) {
     fb.put_raw(x, y, fb.encode(color));
 }
 
+/// A copy of the wallpaper the size of a Task View desktop picture.
+fn shrink_wallpaper(thumb: &mut [u32], wallpaper: &[u32], width: i32, height: i32) {
+    Canvas::new(thumb, desktops::TILE_W as usize, desktops::TILE_H as usize).blit_smooth(
+        Rect::new(0, 0, desktops::TILE_W, desktops::TILE_H),
+        wallpaper,
+        width,
+        height,
+    );
+}
+
 /// Deep blue with a soft flower of light in the middle.
 fn draw_wallpaper(c: &mut Canvas) {
     let (w, h) = (c.width, c.height);
@@ -2334,6 +2455,11 @@ fn draw_wallpaper(c: &mut Canvas) {
 
 /// The start button: four rounded squares.
 pub(crate) fn draw_start_logo(c: &mut Canvas, x: i32, y: i32) {
+    draw_start_logo_at(c, x, y, 1, 256);
+}
+
+/// The logo `scale` times bigger, faded in from black by `fade` (0 to 256).
+fn draw_start_logo_at(c: &mut Canvas, x: i32, y: i32, scale: i32, fade: u32) {
     for (i, color) in [
         rgb(0x2a, 0x9c, 0xf4),
         rgb(0x18, 0x84, 0xe8),
@@ -2344,7 +2470,23 @@ pub(crate) fn draw_start_logo(c: &mut Canvas, x: i32, y: i32) {
     .enumerate()
     {
         let (col, row) = ((i % 2) as i32, (i / 2) as i32);
-        c.fill_round(Rect::new(x + col * 12, y + row * 12, 11, 11), 2, color);
+        let r = Rect::new(
+            x + col * 12 * scale,
+            y + row * 12 * scale,
+            11 * scale,
+            11 * scale,
+        );
+        c.fill_round(r, 2 * scale, mix(0, color, fade));
+    }
+}
+
+/// Paint the whole screen black at once, so the boot messages go away
+/// while the desktop gets ready.
+fn clear_screen(fb: &Framebuffer) {
+    for y in 0..fb.height {
+        for x in 0..fb.width {
+            fb.put_raw(x, y, 0);
+        }
     }
 }
 
@@ -2368,14 +2510,17 @@ fn shut_down() {
 
 /// Run the desktop forever.
 pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
+    clear_screen(&fb);
     let mut desk = Desktop::new(fb, boot);
+    // the boot animation starts once everything is ready to draw
+    desk.phase = Phase::Boot(interrupts::ticks());
     // the shell now prints into the terminal window
     CONSOLE.lock().detach(terminal::COLS, terminal::ROWS);
     ACTIVE.store(true, Ordering::Relaxed);
     crate::print_banner();
     desk.terminal.start();
-    // the lock screen first; the terminal opens after signing in
-    desk.login.lock();
+    // the boot screen, then the lock screen; the terminal opens after
+    // signing in
     desk.damage(desk.screen());
 
     let mut keyboard = Keyboard::new();
@@ -2411,6 +2556,14 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
             let app = APPS[(request & !CLOSE) as usize % APPS.len()];
             if request == LOCK {
                 desk.lock(false);
+            } else if request == RESTART || request == SHUT_DOWN {
+                if !matches!(desk.phase, Phase::Boot(_)) {
+                    desk.power(if request == RESTART {
+                        power::Power::Restart
+                    } else {
+                        power::Power::ShutDown
+                    });
+                }
             } else if request & CLOSE != 0 {
                 desk.close(app);
             } else {
@@ -2424,6 +2577,9 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
         }
         desk.layout = keyboard.layout();
         desk.poll_apps();
+        if let Some(background) = personalize::take_changed() {
+            desk.apply_look(background);
+        }
         if matches!(desk.phase, Phase::Desktop) {
             desk.refresh_icons();
         }

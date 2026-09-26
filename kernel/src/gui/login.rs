@@ -126,6 +126,16 @@ impl Login {
         login
     }
 
+    /// The wallpaper changed: blur the new one.
+    pub fn set_wallpaper(&mut self, wallpaper: &[u32]) {
+        make_backdrop(
+            wallpaper,
+            self.backdrop,
+            self.width as usize,
+            self.height as usize,
+        );
+    }
+
     fn screen(&self) -> Rect {
         Rect::new(0, 0, self.width, self.height)
     }
@@ -551,12 +561,12 @@ impl Login {
     fn draw_field(&self, c: &mut Canvas) {
         let f = self.field_rect();
         c.fill_round_alpha(f, 4, rgb(0xfb, 0xfb, 0xfd), 240);
-        c.fill_rect(f.x + 2, f.bottom() - 2, f.w - 4, 2, theme::ACCENT);
+        c.fill_rect(f.x + 2, f.bottom() - 2, f.w - 4, 2, theme::accent());
         let ty = f.y + (f.h - UI.line_height) / 2;
         let text_x = f.x + 12;
         let mut end = text_x;
         if self.password.len() == 0 {
-            c.draw_text(text_x, ty, "Password", theme::TEXT_DIM);
+            c.draw_text(text_x, ty, "Password", theme::text_dim());
         } else {
             // a dot per character
             for i in 0..self.password.as_str().chars().count() as i32 {
@@ -564,12 +574,12 @@ impl Login {
                 if x + 8 > f.right() - 40 {
                     break;
                 }
-                c.fill_round(Rect::new(x, f.y + f.h / 2 - 4, 8, 8), 4, theme::TEXT);
+                c.fill_round(Rect::new(x, f.y + f.h / 2 - 4, 8, 8), 4, theme::text());
                 end = x + 10;
             }
         }
         if self.caret_on && self.panel_shown() {
-            c.fill_rect(end.max(text_x) + 1, ty, 1, UI.line_height, theme::TEXT);
+            c.fill_rect(end.max(text_x) + 1, ty, 1, UI.line_height, theme::text());
         }
         // the arrow button
         let s = self.submit_rect();
@@ -577,9 +587,13 @@ impl Login {
         c.fill_round(
             s,
             4,
-            mix(rgb(0xe8, 0xea, 0xf0), theme::ACCENT, lit as u32 * 255 / 256),
+            mix(
+                rgb(0xe8, 0xea, 0xf0),
+                theme::accent(),
+                lit as u32 * 255 / 256,
+            ),
         );
-        let arrow = mix(theme::TEXT, WHITE, lit as u32 * 255 / 256);
+        let arrow = mix(theme::text(), WHITE, lit as u32 * 255 / 256);
         let (cx, cy) = (s.x + s.w / 2, s.y + s.h / 2);
         c.fill_rect(cx - 7, cy - 1, 13, 2, arrow);
         for i in 0..6 {
@@ -592,20 +606,24 @@ impl Login {
         let f = self.flyout_rect();
         c.shadow(f, 8, 10, 2, 90);
         c.fill_round(f, 8, rgb(0xfb, 0xfb, 0xfd));
-        c.outline_round(f, 8, theme::STROKE);
+        c.outline_round(f, 8, theme::stroke());
         for t in [Target::Restart, Target::ShutDown] {
             let r = self.target_rect(t);
             let lit = self.hover.level(t) as u32;
-            let bg = mix(rgb(0xfb, 0xfb, 0xfd), theme::ACCENT_LIGHT, lit * 255 / 256);
+            let bg = mix(
+                rgb(0xfb, 0xfb, 0xfd),
+                theme::accent_light(),
+                lit * 255 / 256,
+            );
             if lit > 0 {
                 c.fill_round(r, 5, bg);
             }
             if t == Target::Restart {
-                restart_symbol(c, r.x + 20, r.y + 19, theme::TEXT, bg);
-                c.draw_text(r.x + 40, r.y + 10, "Restart", theme::TEXT);
+                restart_symbol(c, r.x + 20, r.y + 19, theme::text(), bg);
+                c.draw_text(r.x + 40, r.y + 10, "Restart", theme::text());
             } else {
-                power_symbol(c, r.x + 20, r.y + 19, theme::TEXT, bg);
-                c.draw_text(r.x + 40, r.y + 10, "Shut down", theme::TEXT);
+                power_symbol(c, r.x + 20, r.y + 19, theme::text(), bg);
+                c.draw_text(r.x + 40, r.y + 10, "Shut down", theme::text());
             }
         }
     }

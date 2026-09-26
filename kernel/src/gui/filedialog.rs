@@ -76,7 +76,7 @@ fn places() -> Vec<(&'static str, String)> {
     let home = fs::home(users::current_name().unwrap_or_default().as_str());
     let mut out = Vec::new();
     out.push(("Home", home.clone()));
-    for lib in ["Desktop", "Documents", "Downloads"] {
+    for lib in ["Desktop", "Documents", "Downloads", "Pictures"] {
         out.push((lib, fs::join(&home, lib)));
     }
     out.push(("Local Disk (C:)", String::from("/")));
@@ -284,39 +284,39 @@ impl FileDialog {
         let l = layout(area);
         let p = l.panel;
         c.shadow(p, 8, 16, 4, 120);
-        c.fill_round(p, 8, theme::FACE);
-        c.outline_round(p, 8, rgb(0xc8, 0xca, 0xd2));
+        c.fill_round(p, 8, theme::face());
+        c.outline_round(p, 8, theme::frame());
         let title = match self.mode {
             Mode::Open => "Open",
             Mode::Save => "Save as",
         };
-        c.draw_text_in(&TITLE, p.x + 20, p.y + 16, title, theme::TEXT);
+        c.draw_text_in(&TITLE, p.x + 20, p.y + 16, title, theme::text());
 
         theme::button(c, l.up, "", false);
         // an arrow pointing up
         let (ax, ay) = (l.up.x + l.up.w / 2, l.up.y + 9);
-        c.line(ax, ay, ax, ay + 14, theme::TEXT);
-        c.line(ax - 5, ay + 5, ax, ay, theme::TEXT);
-        c.line(ax + 5, ay + 5, ax, ay, theme::TEXT);
-        c.fill_round(l.path, 4, theme::LIGHT);
-        c.outline_round(l.path, 4, theme::STROKE);
+        c.line(ax, ay, ax, ay + 14, theme::text());
+        c.line(ax - 5, ay + 5, ax, ay, theme::text());
+        c.line(ax + 5, ay + 5, ax, ay, theme::text());
+        c.fill_round(l.path, 4, theme::light());
+        c.outline_round(l.path, 4, theme::stroke());
         widgets::folder_icon(c, l.path.x + 8, l.path.y + 8, 16);
         let shown = fs::display(&self.dir);
-        c.draw_text(l.path.x + 32, l.path.y + 7, &shown, theme::TEXT);
+        c.draw_text(l.path.x + 32, l.path.y + 7, &shown, theme::text());
 
         // places
         for (i, (label, path)) in places().iter().enumerate() {
             let r = Rect::new(l.places.x, l.places.y + i as i32 * ROW, l.places.w, ROW - 2);
             if fs::same_name(path, &self.dir) {
-                c.fill_round(r, 4, rgb(0xe0, 0xe6, 0xf0));
+                c.fill_round(r, 4, theme::accent_light());
             }
             widgets::folder_icon(c, r.x + 6, r.y + 5, 16);
-            c.draw_text(r.x + 30, r.y + 4, label, theme::TEXT);
+            c.draw_text(r.x + 30, r.y + 4, label, theme::text());
         }
 
         // the folder's contents
-        c.fill_round(l.list, 4, theme::LIGHT);
-        c.outline_round(l.list, 4, theme::STROKE);
+        c.fill_round(l.list, 4, theme::light());
+        c.outline_round(l.list, 4, theme::stroke());
         {
             let mut lc = c.sub(Rect::new(0, 0, c.width, c.height));
             lc.clip_to(l.list.inset(1));
@@ -329,25 +329,25 @@ impl FileDialog {
                     ROW,
                 );
                 if self.selected == Some(k) {
-                    lc.fill_round(r, 3, widgets::SELECTION);
+                    lc.fill_round(r, 3, theme::selection());
                 }
                 if item.dir {
                     widgets::folder_icon(&mut lc, r.x + 6, r.y + 5, 16);
                 } else {
                     widgets::file_icon(&mut lc, r.x + 6, r.y + 5, 16);
                 }
-                lc.draw_text(r.x + 30, r.y + 4, &item.name, theme::TEXT);
+                lc.draw_text(r.x + 30, r.y + 4, &item.name, theme::text());
             }
             if self.items.is_empty() {
                 let r = Rect::new(l.list.x, l.list.y + 20, l.list.w, 20);
-                lc.text_centered(r, "This folder is empty.", theme::TEXT_DIM);
+                lc.text_centered(r, "This folder is empty.", theme::text_dim());
             }
         }
 
-        c.draw_text(p.x + 20, l.name.y + 7, "File name:", theme::TEXT);
+        c.draw_text(p.x + 20, l.name.y + 7, "File name:", theme::text());
         self.name.draw(c, l.name, true, caret);
         if let Some(e) = self.error {
-            c.draw_text(p.x + 20, l.ok.y + 7, e, rgb(0xc4, 0x2b, 0x1c));
+            c.draw_text(p.x + 20, l.ok.y + 7, e, theme::error());
         }
         let ok = match self.mode {
             Mode::Open => "Open",

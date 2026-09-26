@@ -2,7 +2,7 @@
 
 use core::fmt::Write;
 
-use super::canvas::{rgb, Canvas, Rect};
+use super::canvas::{Canvas, Rect};
 use super::text;
 use super::theme;
 use super::{MouseEvent, MouseKind};
@@ -229,18 +229,18 @@ impl Calc {
     }
 
     pub fn draw(&self, c: &mut Canvas) {
-        c.fill_rect(0, 0, CLIENT_W, CLIENT_H, theme::FACE);
+        c.fill_rect(0, 0, CLIENT_W, CLIENT_H, theme::face());
 
         // Windows 11 shows the number straight on the window, no box
         let display = Rect::new(MARGIN, MARGIN, CLIENT_W - 2 * MARGIN, DISPLAY_H);
-        let dark = theme::TEXT;
+        let dark = theme::text();
         let mut pending = StackString::<32>::new();
         if let Some(op) = self.op {
             let mut acc = StackString::<24>::new();
             format_number(&mut acc, self.acc);
             let _ = write!(pending, "{} {}", acc.as_str(), op);
         }
-        let small = theme::TEXT_DIM;
+        let small = theme::text_dim();
         let w = super::canvas::text_width(pending.as_str());
         c.draw_text(
             display.right() - 6 - w,
@@ -263,9 +263,9 @@ impl Calc {
             match *label {
                 "=" => theme::accent_button(c, r, label, pressed),
                 "C" | "DEL" | "+" | "-" | "×" | "÷" | "%" => {
-                    theme::colored_button(c, r, label, rgb(0xf6, 0xf6, 0xf6), pressed)
+                    theme::colored_button(c, r, label, theme::control(), pressed)
                 }
-                _ => theme::colored_button(c, r, label, rgb(0xff, 0xff, 0xff), pressed),
+                _ => theme::colored_button(c, r, label, theme::control_lit(), pressed),
             }
         }
     }

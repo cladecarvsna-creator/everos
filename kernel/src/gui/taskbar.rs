@@ -12,7 +12,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::anim::ONE;
-use super::canvas::{rgb, Canvas, Rect};
+use super::canvas::{Canvas, Rect};
 use super::icons::{Pic, MEDIUM};
 use super::popup::{Builder, Cmd};
 use super::search::{self, Search};
@@ -463,9 +463,9 @@ impl Desktop<'_> {
             return;
         }
         c.shadow(r, 5, 8, 2, 70);
-        c.fill_round(r, 5, rgb(0xfa, 0xfa, 0xfc));
-        c.outline_round(r, 5, rgb(0xd0, 0xd2, 0xd8));
-        c.text_centered(r, text, theme::TEXT);
+        c.fill_round(r, 5, theme::menu());
+        c.outline_round(r, 5, theme::frame());
+        c.text_centered(r, text, theme::text());
     }
 
     // ---- drawing -----------------------------------------------------------
@@ -477,8 +477,8 @@ impl Desktop<'_> {
             return;
         }
         // see-through, like acrylic
-        c.fill_round_alpha(bar, 0, rgb(0xf0, 0xf2, 0xf8), 220);
-        c.fill_rect(0, top, self.width, 1, rgb(0xd0, 0xd4, 0xdc));
+        c.fill_round_alpha(bar, 0, theme::taskbar(), 220);
+        c.fill_rect(0, top, self.width, 1, theme::frame());
 
         for (item, r) in self.task_layout() {
             if !c.visible(r) {
@@ -496,10 +496,10 @@ impl Desktop<'_> {
                 continue;
             }
             if active {
-                c.fill_round_alpha(r, 5, 0xffffff, 200);
-                c.outline_round(r, 5, rgb(0xe0, 0xe2, 0xe8));
+                c.fill_round_alpha(r, 5, theme::glass(), 200);
+                c.outline_round(r, 5, theme::stroke());
             } else if lit > 0 {
-                c.fill_round_alpha(r, 5, 0xffffff, 140 * lit / ONE);
+                c.fill_round_alpha(r, 5, theme::glass(), 140 * lit / ONE);
             }
             match item {
                 TaskItem::Start => draw_start_logo(c, r.x + 10, r.y + 8),
@@ -510,9 +510,9 @@ impl Desktop<'_> {
                     if w.open && !w.away {
                         // a pill under open apps, longer for the active one
                         let (len, color) = if active {
-                            (16, theme::ACCENT)
+                            (16, theme::accent())
                         } else {
-                            (6, rgb(0x8a, 0x8a, 0x92))
+                            (6, theme::thumb())
                         };
                         let pill = Rect::new(r.x + (r.w - len) / 2, r.bottom() - 4, len, 3);
                         c.fill_round(pill, 1, color);
@@ -537,7 +537,7 @@ impl Desktop<'_> {
                 self.hover.level(Hover::Tray(i))
             };
             if lit > 0 {
-                c.fill_round_alpha(r, 5, 0xffffff, 170 * lit / ONE);
+                c.fill_round_alpha(r, 5, theme::glass(), 170 * lit / ONE);
             }
         }
         let chevron = self.tray_rect(3);
@@ -545,48 +545,52 @@ impl Desktop<'_> {
         let up = self.panel != Some(Panel::Hidden);
         for k in 0..2 {
             let (dy, ey) = if up { (3, -2) } else { (-2, 3) };
-            c.line(cx - 5, cy + dy + k, cx, cy + ey + k, theme::TEXT);
-            c.line(cx, cy + ey + k, cx + 5, cy + dy + k, theme::TEXT);
+            c.line(cx - 5, cy + dy + k, cx, cy + ey + k, theme::text());
+            c.line(cx, cy + ey + k, cx + 5, cy + dy + k, theme::text());
         }
         let layout = self.tray_rect(0);
-        c.text_centered(layout, tray::layout_label(self.layout), theme::TEXT);
+        c.text_centered(layout, tray::layout_label(self.layout), theme::text());
         let quick = self.tray_rect(1);
-        let bg = rgb(0xf0, 0xf2, 0xf8);
+        let bg = theme::taskbar();
         let y = quick.y + 12;
-        tray::network_icon(c, quick.x + 14, y, self.tray.net, theme::TEXT, bg);
-        tray::volume_icon(c, quick.x + 42, y, self.tray.volume, theme::TEXT);
+        tray::network_icon(c, quick.x + 14, y, self.tray.net, theme::text(), bg);
+        tray::volume_icon(c, quick.x + 42, y, self.tray.volume, theme::text());
         let clock = self.tray_rect(2);
         let line = |i: i32| Rect::new(clock.x, clock.y + 2 + i * 18, clock.w, 18);
-        c.text_centered(line(0), self.clock.as_str(), theme::TEXT);
-        c.text_centered(line(1), self.date.as_str(), theme::TEXT);
+        c.text_centered(line(0), self.clock.as_str(), theme::text());
+        c.text_centered(line(1), self.date.as_str(), theme::text());
 
         let sd = self.show_desktop_rect();
-        c.fill_rect(sd.x, sd.y + 12, 1, sd.h - 24, rgb(0xb8, 0xbc, 0xc6));
+        c.fill_rect(sd.x, sd.y + 12, 1, sd.h - 24, theme::thumb());
         let lit = self.hover.level(Hover::ShowDesktop);
         if lit > 0 {
-            c.fill_round_alpha(sd.offset(1, 0), 0, 0xffffff, 160 * lit / ONE);
+            c.fill_round_alpha(sd.offset(1, 0), 0, theme::glass(), 160 * lit / ONE);
         }
     }
 
     fn draw_search_box(&self, c: &mut Canvas, r: Rect, lit: i32) {
         let open = self.search.open;
         let face = if open {
-            0xffffff
+            theme::control_lit()
         } else {
-            super::canvas::mix(rgb(0xfa, 0xfb, 0xfd), 0xffffff, (lit * 255 / ONE) as u32)
+            super::canvas::mix(
+                theme::control(),
+                theme::control_lit(),
+                (lit * 255 / ONE) as u32,
+            )
         };
         c.fill_round(r, r.h / 2, face);
-        c.outline_round(r, r.h / 2, rgb(0xd4, 0xd6, 0xde));
+        c.outline_round(r, r.h / 2, theme::frame());
         if open {
-            c.fill_rect(r.x + 16, r.bottom() - 2, r.w - 32, 2, theme::ACCENT);
+            c.fill_rect(r.x + 16, r.bottom() - 2, r.w - 32, 2, theme::accent());
         }
-        search::magnifier(c, r.x + 21, r.y + 15, 1, theme::TEXT);
+        search::magnifier(c, r.x + 21, r.y + 15, 1, theme::text());
         let ty = r.y + (r.h - UI.line_height) / 2;
         let q = self.search.query.as_str();
         if q.is_empty() {
-            c.draw_text(r.x + 40, ty, "Search", theme::TEXT_DIM);
+            c.draw_text(r.x + 40, ty, "Search", theme::text_dim());
             if open && self.cursor_on {
-                c.fill_rect(r.x + 40, ty, 1, UI.line_height, theme::TEXT);
+                c.fill_rect(r.x + 40, ty, 1, UI.line_height, theme::text());
             }
         } else {
             // the end of the text when it is too long
@@ -596,22 +600,22 @@ impl Desktop<'_> {
                 it.next();
                 shown = it.as_str();
             }
-            let w = c.draw_text(r.x + 40, ty, shown, theme::TEXT);
+            let w = c.draw_text(r.x + 40, ty, shown, theme::text());
             if open && self.cursor_on {
-                c.fill_rect(r.x + 41 + w, ty, 1, UI.line_height, theme::TEXT);
+                c.fill_rect(r.x + 41 + w, ty, 1, UI.line_height, theme::text());
             }
         }
     }
 
     /// The ^ flyout: small icons that don't fit in the tray.
     pub(super) fn draw_hidden_icons(&self, c: &mut Canvas, p: Rect) {
-        c.fill(p, rgb(0xf5, 0xf6, 0xfa));
+        c.fill(p, theme::panel());
         for i in 0..tray::HIDDEN_ICONS {
             let r = tray::hidden_icon_rect(p, i);
             let lit = self.hover.level(Hover::Hidden(i as usize));
             if lit > 0 {
-                c.fill_round_alpha(r.inset(2), 5, 0xffffff, 230 * lit / ONE);
-                c.outline_round_alpha(r.inset(2), 5, theme::STROKE, lit);
+                c.fill_round_alpha(r.inset(2), 5, theme::glass(), 230 * lit / ONE);
+                c.outline_round_alpha(r.inset(2), 5, theme::stroke(), lit);
             }
             let (x, y) = (r.x + 8, r.y + 8);
             match i {
@@ -634,10 +638,10 @@ impl Desktop<'_> {
 
 /// Two overlapping windows, for the Task View button.
 fn task_view_icon(c: &mut Canvas, x: i32, y: i32) {
-    c.outline_round(Rect::new(x, y, 14, 14), 2, theme::TEXT);
-    c.fill_round(Rect::new(x + 7, y + 6, 15, 14), 2, rgb(0xf0, 0xf2, 0xf8));
-    c.fill_round(Rect::new(x + 8, y + 7, 14, 13), 2, rgb(0x5a, 0x5e, 0x6a));
-    c.fill_round(Rect::new(x + 10, y + 9, 10, 9), 1, rgb(0xe8, 0xec, 0xf4));
+    c.outline_round(Rect::new(x, y, 14, 14), 2, theme::text());
+    c.fill_round(Rect::new(x + 7, y + 6, 15, 14), 2, theme::taskbar());
+    c.fill_round(Rect::new(x + 8, y + 7, 14, 13), 2, theme::text());
+    c.fill_round(Rect::new(x + 10, y + 9, 10, 9), 1, theme::taskbar());
 }
 
 fn itoa(n: i32) -> crate::StackString<12> {

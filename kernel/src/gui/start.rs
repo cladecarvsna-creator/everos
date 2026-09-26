@@ -5,7 +5,7 @@
 //! best match.
 
 use super::anim::{self, Fader, ONE};
-use super::canvas::{mix, rgb, Canvas, Color, Rect};
+use super::canvas::{mix, Canvas, Color, Rect};
 use super::icons::Icons;
 use super::text::{UI, UI_BOLD};
 use super::theme;
@@ -329,7 +329,7 @@ impl StartMenu {
         {
             let mut m = c.sub(Rect::new(0, 0, c.width, c.height));
             m.clip_round(p, RADIUS);
-            m.fill_round_alpha(p, 0, rgb(0xf5, 0xf6, 0xfa), 250);
+            m.fill_round_alpha(p, 0, theme::panel(), 250);
             self.draw_search(&mut m, p, blink);
             if !self.search.as_str().is_empty() {
                 self.draw_results(&mut m, p, icons);
@@ -341,20 +341,20 @@ impl StartMenu {
             }
             self.draw_footer(&mut m, p);
         }
-        c.outline_round(p, RADIUS, rgb(0xc8, 0xca, 0xd2));
+        c.outline_round(p, RADIUS, theme::frame());
     }
 
     fn highlight(&self, c: &mut Canvas, target: Target, r: Rect) {
         let level = self.hover.level(target);
         if level > 0 {
-            c.fill_round_alpha(r, 6, 0xffffff, level);
-            c.outline_round_alpha(r, 6, theme::STROKE, level);
+            c.fill_round_alpha(r, 6, theme::control_lit(), level);
+            c.outline_round_alpha(r, 6, theme::stroke(), level);
         }
     }
 
     /// A button face that lights up to white under the mouse.
     fn face(&self, target: Target, base: Color) -> Color {
-        mix(base, 0xffffff, self.lit(target))
+        mix(base, theme::control_lit(), self.lit(target))
     }
 
     /// Hover level of a target as a `mix` amount.
@@ -364,32 +364,38 @@ impl StartMenu {
 
     fn draw_search(&self, c: &mut Canvas, p: Rect, blink: bool) {
         let r = Self::search_box(p);
-        c.fill_round(r, r.h / 2, 0xffffff);
-        c.outline_round(r, r.h / 2, rgb(0xd0, 0xd2, 0xda));
-        c.fill_rect(r.x + 18, r.bottom() - 1, r.w - 36, 1, theme::ACCENT);
+        c.fill_round(r, r.h / 2, theme::light());
+        c.outline_round(r, r.h / 2, theme::frame());
+        c.fill_rect(r.x + 18, r.bottom() - 1, r.w - 36, 1, theme::accent());
         // magnifying glass
         let lens = Rect::new(r.x + 16, r.y + 10, 12, 12);
-        c.outline_round(lens, 6, theme::TEXT);
-        c.outline_round(lens.inset(1), 5, theme::TEXT);
+        c.outline_round(lens, 6, theme::text());
+        c.outline_round(lens.inset(1), 5, theme::text());
         for i in 0..2 {
-            c.line(r.x + 26 + i, r.y + 21, r.x + 30 + i, r.y + 25, theme::TEXT);
+            c.line(
+                r.x + 26 + i,
+                r.y + 21,
+                r.x + 30 + i,
+                r.y + 25,
+                theme::text(),
+            );
         }
         let ty = r.y + (r.h - UI.line_height) / 2;
         if self.search.as_str().is_empty() {
-            c.draw_text(r.x + 40, ty, "Type here to search apps", theme::TEXT_DIM);
+            c.draw_text(r.x + 40, ty, "Type here to search apps", theme::text_dim());
             if blink {
-                c.fill_rect(r.x + 40, ty, 1, UI.line_height, theme::TEXT);
+                c.fill_rect(r.x + 40, ty, 1, UI.line_height, theme::text());
             }
         } else {
-            let w = c.draw_text(r.x + 40, ty, self.search.as_str(), theme::TEXT);
+            let w = c.draw_text(r.x + 40, ty, self.search.as_str(), theme::text());
             if blink {
-                c.fill_rect(r.x + 41 + w, ty, 1, UI.line_height, theme::TEXT);
+                c.fill_rect(r.x + 41 + w, ty, 1, UI.line_height, theme::text());
             }
         }
     }
 
     fn draw_results(&self, c: &mut Canvas, p: Rect, icons: &Icons) {
-        c.draw_text_in(&UI_BOLD, p.x + 40, p.y + 84, "Best match", theme::TEXT);
+        c.draw_text_in(&UI_BOLD, p.x + 40, p.y + 84, "Best match", theme::text());
         let (targets, n) = self.targets(p);
         let mut first = true;
         for &(t, r) in &targets[..n] {
@@ -398,71 +404,75 @@ impl StartMenu {
             };
             if first {
                 // Enter opens this one
-                c.fill_round(r, 6, theme::ACCENT_LIGHT);
+                c.fill_round(r, 6, theme::accent_light());
                 first = false;
             }
             self.highlight(c, t, r);
             icons.draw_medium(c, app, r.x + 12, r.y + 12);
-            c.draw_text(r.x + 48, r.y + 6, app.title(), theme::TEXT);
-            c.draw_text(r.x + 48, r.y + 25, "App", theme::TEXT_DIM);
+            c.draw_text(r.x + 48, r.y + 6, app.title(), theme::text());
+            c.draw_text(r.x + 48, r.y + 25, "App", theme::text_dim());
         }
         if first {
             let text = "No apps match your search";
-            c.draw_text(p.x + 40, p.y + 120, text, theme::TEXT_DIM);
+            c.draw_text(p.x + 40, p.y + 120, text, theme::text_dim());
         }
     }
 
     fn draw_pinned(&self, c: &mut Canvas, p: Rect, icons: &Icons) {
-        c.draw_text_in(&UI_BOLD, p.x + 56, p.y + 86, "Pinned", theme::TEXT);
+        c.draw_text_in(&UI_BOLD, p.x + 56, p.y + 86, "Pinned", theme::text());
         let rec_y = p.y + RECOMMENDED_Y;
-        c.draw_text_in(&UI_BOLD, p.x + 56, rec_y, "Recommended", theme::TEXT);
+        c.draw_text_in(&UI_BOLD, p.x + 56, rec_y, "Recommended", theme::text());
         let (targets, n) = self.targets(p);
         let mut recent = 0;
         for &(t, r) in &targets[..n] {
             match t {
                 Target::AllApps => {
-                    let face = self.face(t, rgb(0xfb, 0xfb, 0xfd));
+                    let face = self.face(t, theme::control());
                     c.fill_round(r, 4, face);
-                    c.outline_round(r, 4, theme::STROKE);
-                    c.text_centered(r, "All apps  ›", theme::TEXT);
+                    c.outline_round(r, 4, theme::stroke());
+                    c.text_centered(r, "All apps  ›", theme::text());
                 }
                 // pinned apps are in the grid, recent ones below it
                 Target::App(app) if r.y < rec_y => {
                     self.highlight(c, t, r);
                     icons.draw_large(c, app, r.x + 24, r.y + 8);
-                    c.text_centered(Rect::new(r.x, r.y + 60, r.w, 20), app.title(), theme::TEXT);
+                    c.text_centered(
+                        Rect::new(r.x, r.y + 60, r.w, 20),
+                        app.title(),
+                        theme::text(),
+                    );
                 }
                 Target::App(app) => {
                     recent += 1;
                     self.highlight(c, t, r);
                     icons.draw_medium(c, app, r.x + 12, r.y + 14);
-                    c.draw_text(r.x + 48, r.y + 7, app.title(), theme::TEXT);
-                    c.draw_text(r.x + 48, r.y + 26, "Recently opened", theme::TEXT_DIM);
+                    c.draw_text(r.x + 48, r.y + 7, app.title(), theme::text());
+                    c.draw_text(r.x + 48, r.y + 26, "Recently opened", theme::text_dim());
                 }
                 _ => {}
             }
         }
         if recent == 0 {
             let text = "Apps you open will show up here.";
-            c.draw_text(p.x + 56, rec_y + 36, text, theme::TEXT_DIM);
+            c.draw_text(p.x + 56, rec_y + 36, text, theme::text_dim());
         }
     }
 
     fn draw_all_apps(&self, c: &mut Canvas, p: Rect, icons: &Icons) {
-        c.draw_text_in(&UI_BOLD, p.x + 56, p.y + 86, "All apps", theme::TEXT);
+        c.draw_text_in(&UI_BOLD, p.x + 56, p.y + 86, "All apps", theme::text());
         let (targets, n) = self.targets(p);
         for &(t, r) in &targets[..n] {
             match t {
                 Target::Back => {
-                    let face = self.face(t, rgb(0xfb, 0xfb, 0xfd));
+                    let face = self.face(t, theme::control());
                     c.fill_round(r, 4, face);
-                    c.outline_round(r, 4, theme::STROKE);
-                    c.text_centered(r, "‹  Back", theme::TEXT);
+                    c.outline_round(r, 4, theme::stroke());
+                    c.text_centered(r, "‹  Back", theme::text());
                 }
                 Target::App(app) => {
                     self.highlight(c, t, r);
                     icons.draw_medium(c, app, r.x + 12, r.y + 10);
-                    c.draw_text(r.x + 48, r.y + 13, app.title(), theme::TEXT);
+                    c.draw_text(r.x + 48, r.y + 13, app.title(), theme::text());
                 }
                 _ => {}
             }
@@ -471,8 +481,8 @@ impl StartMenu {
 
     fn draw_footer(&self, c: &mut Canvas, p: Rect) {
         let f = Self::footer(p);
-        c.fill(f, rgb(0xec, 0xee, 0xf4));
-        c.fill_rect(f.x, f.y, f.w, 1, theme::STROKE);
+        c.fill(f, theme::footer());
+        c.fill_rect(f.x, f.y, f.w, 1, theme::stroke());
         let (targets, n) = self.targets(p);
         for &(t, r) in &targets[..n] {
             match t {
@@ -483,26 +493,26 @@ impl StartMenu {
                         self.user_open
                     };
                     let lit = if open { 255 } else { self.lit(t) };
-                    let bg = mix(rgb(0xec, 0xee, 0xf4), 0xffffff, lit);
+                    let bg = mix(theme::footer(), theme::control_lit(), lit);
                     if lit > 0 {
                         c.fill_round(r, 6, bg);
                     }
                     if t == Target::Power {
-                        power_symbol(c, r.x + 20, r.y + 20, theme::TEXT, bg);
+                        power_symbol(c, r.x + 20, r.y + 20, theme::text(), bg);
                     }
                 }
                 Target::SignOutButton => {
-                    let bg = mix(rgb(0xec, 0xee, 0xf4), 0xffffff, self.lit(t));
+                    let bg = mix(theme::footer(), theme::control_lit(), self.lit(t));
                     c.fill_round(r, 6, bg);
-                    c.outline_round(r, 6, theme::STROKE);
+                    c.outline_round(r, 6, theme::stroke());
                     sign_out_symbol(c, r.x + 22, r.y + 20);
-                    c.draw_text(r.x + 40, r.y + 11, "Sign out", theme::TEXT);
+                    c.draw_text(r.x + 40, r.y + 11, "Sign out", theme::text());
                 }
                 _ => {}
             }
         }
         let avatar = Rect::new(f.x + 44, f.y + 16, 32, 32);
-        c.fill_round(avatar, 16, theme::ACCENT);
+        c.fill_round(avatar, 16, theme::accent());
         let name = users::current_name().unwrap_or_default();
         let mut initial = [0u8; 4];
         let initial = name
@@ -513,7 +523,7 @@ impl StartMenu {
             .to_ascii_uppercase()
             .encode_utf8(&mut initial);
         c.text_centered_in(&UI_BOLD, avatar, initial, 0xffffff);
-        c.draw_text(f.x + 88, f.y + 23, name.as_str(), theme::TEXT);
+        c.draw_text(f.x + 88, f.y + 23, name.as_str(), theme::text());
 
         for (open, fl) in [
             (self.power_open, Self::power_flyout(p)),
@@ -523,8 +533,8 @@ impl StartMenu {
                 continue;
             }
             c.shadow(fl, 8, 10, 2, 90);
-            c.fill_round(fl, 8, 0xfbfbfd);
-            c.outline_round(fl, 8, theme::STROKE);
+            c.fill_round(fl, 8, theme::menu());
+            c.outline_round(fl, 8, theme::stroke());
             for &(t, r) in &targets[..n] {
                 let label = match t {
                     Target::Restart => "Restart",
@@ -533,18 +543,17 @@ impl StartMenu {
                     Target::SignOut => "Sign out",
                     _ => continue,
                 };
-                let lit_face = mix(theme::ACCENT_LIGHT, 0xffffff, 60);
-                let bg = mix(0xfbfbfd, lit_face, self.lit(t));
+                let bg = mix(theme::menu(), theme::hover(), self.lit(t));
                 if self.lit(t) > 0 {
                     c.fill_round(r, 5, bg);
                 }
                 match t {
-                    Target::Restart => restart_symbol(c, r.x + 20, r.y + 19, theme::TEXT, bg),
-                    Target::ShutDown => power_symbol(c, r.x + 20, r.y + 19, theme::TEXT, bg),
+                    Target::Restart => restart_symbol(c, r.x + 20, r.y + 19, theme::text(), bg),
+                    Target::ShutDown => power_symbol(c, r.x + 20, r.y + 19, theme::text(), bg),
                     Target::Lock => lock_symbol(c, r.x + 20, r.y + 19, bg),
                     _ => sign_out_symbol(c, r.x + 20, r.y + 19),
                 }
-                c.draw_text(r.x + 40, r.y + 10, label, theme::TEXT);
+                c.draw_text(r.x + 40, r.y + 10, label, theme::text());
             }
         }
     }
@@ -571,22 +580,22 @@ pub fn restart_symbol(c: &mut Canvas, x: i32, y: i32, fg: Color, bg: Color) {
 /// A padlock centred at (x, y).
 fn lock_symbol(c: &mut Canvas, x: i32, y: i32, bg: Color) {
     let shackle = Rect::new(x - 5, y - 9, 10, 12);
-    c.outline_round(shackle, 5, theme::TEXT);
-    c.outline_round(shackle.inset(1), 4, theme::TEXT);
+    c.outline_round(shackle, 5, theme::text());
+    c.outline_round(shackle.inset(1), 4, theme::text());
     c.fill_rect(x - 3, y - 4, 6, 4, bg);
-    c.fill_round(Rect::new(x - 8, y - 2, 16, 11), 2, theme::TEXT);
+    c.fill_round(Rect::new(x - 8, y - 2, 16, 11), 2, theme::text());
     c.fill_rect(x - 1, y + 2, 2, 3, bg);
 }
 
 /// An arrow leaving a door, centred at (x, y).
 fn sign_out_symbol(c: &mut Canvas, x: i32, y: i32) {
-    c.fill_rect(x - 8, y - 8, 2, 16, theme::TEXT);
-    c.fill_rect(x - 8, y - 8, 8, 2, theme::TEXT);
-    c.fill_rect(x - 8, y + 6, 8, 2, theme::TEXT);
-    c.fill_rect(x - 3, y - 1, 12, 2, theme::TEXT);
+    c.fill_rect(x - 8, y - 8, 2, 16, theme::text());
+    c.fill_rect(x - 8, y - 8, 8, 2, theme::text());
+    c.fill_rect(x - 8, y + 6, 8, 2, theme::text());
+    c.fill_rect(x - 3, y - 1, 12, 2, theme::text());
     for i in 0..4 {
-        c.fill_rect(x + 5 - i, y - 4 + i, 2, 1, theme::TEXT);
-        c.fill_rect(x + 5 - i, y + 3 - i, 2, 1, theme::TEXT);
+        c.fill_rect(x + 5 - i, y - 4 + i, 2, 1, theme::text());
+        c.fill_rect(x + 5 - i, y + 3 - i, 2, 1, theme::text());
     }
 }
 

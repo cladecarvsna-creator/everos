@@ -648,7 +648,7 @@ impl Desktop<'_> {
                     let current = d == self.current_desk;
                     if current || lit || d == self.tv.shown {
                         let color = if current {
-                            theme::ACCENT_LIGHT
+                            theme::accent_light()
                         } else {
                             0xffffff
                         };

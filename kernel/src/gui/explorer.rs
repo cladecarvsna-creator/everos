@@ -5,12 +5,13 @@
 //! Deleted items go to the Recycle Bin, which it shows like a folder
 //! with Restore and Empty Recycle Bin.
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
-use super::canvas::{mix, rgb, Canvas, Rect};
+use super::canvas::{mix, Canvas, Rect};
 use super::icons::{self, Pic, SMALL};
 use super::text::UI;
 use super::theme;
@@ -63,32 +64,39 @@ enum Cmd {
     Icons,
     Restore,
     Empty,
+    SelectAll,
+    /// Make the chosen picture the desktop background.
+    SetBackground,
 }
 
-const ITEM_MENU: [Option<Cmd>; 4] = [Some(Cmd::Open), None, Some(Cmd::Rename), Some(Cmd::Delete)];
-const BIN_ITEM_MENU: [Option<Cmd>; 3] = [Some(Cmd::Restore), None, Some(Cmd::Delete)];
-const BIN_BACK_MENU: [Option<Cmd>; 5] = [
-    Some(Cmd::Empty),
-    None,
-    Some(Cmd::Details),
-    Some(Cmd::Icons),
-    Some(Cmd::Refresh),
-];
-const BACK_MENU: [Option<Cmd>; 6] = [
-    Some(Cmd::NewFolder),
-    Some(Cmd::NewFile),
-    None,
-    Some(Cmd::Details),
-    Some(Cmd::Icons),
-    Some(Cmd::Refresh),
-];
+/// A menu entry: label, shortcut, and what it does (None is a separator
+/// or, with a label, an item that can't be used now).
+type Entry = (&'static str, &'static str, Option<Cmd>);
 
 enum Dialog {
-    /// Delete this item for good?
-    Delete(usize),
+    /// Delete these items for good?
+    Delete(Vec<usize>),
     /// Delete everything in the Recycle Bin for good?
     Empty,
     Message(&'static str),
+}
+
+/// Dragging a rectangle over the files to choose them, like Windows.
+struct Band {
+    /// Where the drag started and where the mouse is now, in content
+    /// coordinates (scrolling included).
+    from: (i32, i32),
+    to: (i32, i32),
+    /// Chosen before the drag (kept with Ctrl held).
+    before: Vec<usize>,
+}
+
+impl Band {
+    fn rect(&self) -> Rect {
+        let (x0, x1) = (self.from.0.min(self.to.0), self.from.0.max(self.to.0));
+        let (y0, y1) = (self.from.1.min(self.to.1), self.from.1.max(self.to.1));
+        Rect::new(x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+    }
 }
 
 /// What has the keyboard.
@@ -120,7 +128,14 @@ pub struct Explorer {
     /// Everything in the folder, and what the search leaves of it.
     all: Vec<Info>,
     items: Vec<Info>,
+    /// The item with the focus: clicked last, moved to with the keys.
     selected: Option<usize>,
+    /// Other chosen items, picked with Ctrl, Shift or the rectangle.
+    marked: Vec<usize>,
+    /// Where Shift+click selects from.
+    anchor: Option<usize>,
+    /// The selection rectangle being dragged.
+    band: Option<Band>,
     /// How far the files are scrolled, in pixels.
     scroll: i32,
     view: View,
@@ -325,6 +340,9 @@ impl Explorer {
             all: Vec::new(),
             items: Vec::new(),
             selected: None,
+            marked: Vec::new(),
+            anchor: None,
+            band: None,
             scroll: 0,
             view: View::Details,
             back: Vec::new(),
@@ -424,7 +442,7 @@ impl Explorer {
                 self.path = String::from(path);
                 self.all = items;
                 self.filter();
-                self.selected = None;
+                self.select_one(None);
                 self.scroll = 0;
                 self.renaming = None;
                 self.focus = Focus::List;
@@ -499,13 +517,69 @@ impl Explorer {
     }
 
     fn select_name(&mut self, name: &str) {
-        self.selected = self.items.iter().position(|i| i.name == name);
+        let i = self.items.iter().position(|i| i.name == name);
+        self.select_one(i);
         self.scroll_to_selected();
     }
 
+    /// Choose one item, or none.
+    fn select_one(&mut self, i: Option<usize>) {
+        self.selected = i;
+        self.anchor = i;
+        self.marked.clear();
+    }
+
+    /// Everything chosen, in order.
+    fn chosen(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self
+            .marked
+            .iter()
+            .copied()
+            .chain(self.selected)
+            .filter(|&i| i < self.items.len())
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    fn is_chosen(&self, i: usize) -> bool {
+        self.selected == Some(i) || self.marked.contains(&i)
+    }
+
+    /// Choose the items from the anchor to `i`, as Shift does.
+    fn select_range(&mut self, i: usize) {
+        let a = self.anchor.unwrap_or(i);
+        self.marked = (a.min(i)..=a.max(i)).collect();
+        self.selected = Some(i);
+    }
+
+    fn select_all(&mut self) {
+        self.marked = (0..self.items.len()).collect();
+        if self.selected.is_none() && !self.items.is_empty() {
+            self.selected = Some(0);
+        }
+    }
+
+    /// The single chosen item, when exactly one is.
+    fn single(&self) -> Option<usize> {
+        match self.chosen()[..] {
+            [i] => Some(i),
+            _ => None,
+        }
+    }
+
     fn selected_path(&self) -> Option<String> {
-        self.selected
+        self.single()
             .map(|i| fs::join(&self.path, &self.items[i].name))
+    }
+
+    /// The chosen picture file, for "Set as desktop background".
+    fn chosen_picture(&self) -> Option<String> {
+        let i = self.single()?;
+        let item = &self.items[i];
+        (!item.dir && super::picture::is_picture(&item.name) && !self.in_bin())
+            .then(|| fs::join(&self.path, &item.name))
     }
 
     // ---- commands --------------------------------------------------------------
@@ -525,32 +599,46 @@ impl Explorer {
         self.commit_rename();
         match cmd {
             Cmd::Open => {
-                if let Some(i) = self.selected {
+                // files open one by one; a folder is gone into
+                let chosen = self.chosen();
+                if let Some(&i) = chosen.iter().find(|&&i| self.items[i].dir) {
+                    self.open(i);
+                } else if let Some(&i) = chosen.first() {
                     self.open(i);
                 }
             }
             Cmd::Rename => {
-                if let Some(i) = self.selected {
+                if let Some(i) = self.single() {
                     self.start_rename(i);
                 }
             }
             Cmd::Delete => {
-                if let Some(i) = self.selected {
+                let chosen = self.chosen();
+                if !chosen.is_empty() {
                     if self.in_bin() {
-                        self.dialog = Some(Dialog::Delete(i));
+                        self.dialog = Some(Dialog::Delete(chosen));
                     } else {
                         // to the Recycle Bin, without asking, like Windows
-                        self.recycle(i);
+                        self.recycle(&chosen);
                     }
                 }
             }
             Cmd::Restore => {
-                if let Some(i) = self.selected.filter(|_| self.at_bin()) {
-                    let name = self.items[i].name.clone();
-                    if let Err(e) = recycle::restore(&user(), &name) {
-                        self.dialog = Some(Dialog::Message(e.message()));
+                let chosen = self.chosen();
+                if self.at_bin() && !chosen.is_empty() {
+                    for &i in &chosen {
+                        let name = self.items[i].name.clone();
+                        if let Err(e) = recycle::restore(&user(), &name) {
+                            self.dialog = Some(Dialog::Message(e.message()));
+                        }
                     }
-                    self.reload_near(i);
+                    self.reload_near(chosen[0]);
+                }
+            }
+            Cmd::SelectAll => self.select_all(),
+            Cmd::SetBackground => {
+                if let Some(path) = self.chosen_picture() {
+                    super::personalize::set_wallpaper(&path);
                 }
             }
             Cmd::Empty => {
@@ -627,32 +715,37 @@ impl Explorer {
         }
     }
 
-    /// Delete an item for good (in the Recycle Bin).
-    fn delete(&mut self, i: usize) {
-        let Some(item) = self.items.get(i) else {
-            return;
-        };
-        let result = if self.at_bin() {
-            recycle::purge(&user(), &item.name)
-        } else {
-            fs::remove(&fs::join(&self.path, &item.name))
-        };
-        if let Err(e) = result {
-            self.dialog = Some(Dialog::Message(e.message()));
+    /// Delete items for good (in the Recycle Bin).
+    fn delete(&mut self, items: &[usize]) {
+        let names: Vec<String> = items
+            .iter()
+            .filter_map(|&i| self.items.get(i).map(|it| it.name.clone()))
+            .collect();
+        for name in &names {
+            let result = if self.at_bin() {
+                recycle::purge(&user(), name)
+            } else {
+                fs::remove(&fs::join(&self.path, name))
+            };
+            if let Err(e) = result {
+                self.dialog = Some(Dialog::Message(e.message()));
+            }
         }
-        self.reload_near(i);
+        self.reload_near(items.first().copied().unwrap_or(0));
     }
 
-    /// Move an item to the Recycle Bin.
-    fn recycle(&mut self, i: usize) {
-        let Some(item) = self.items.get(i) else {
-            return;
-        };
-        let path = fs::join(&self.path, &item.name);
-        if let Err(e) = recycle::recycle(&user(), &path) {
-            self.dialog = Some(Dialog::Message(e.message()));
+    /// Move items to the Recycle Bin.
+    fn recycle(&mut self, items: &[usize]) {
+        let paths: Vec<String> = items
+            .iter()
+            .filter_map(|&i| self.items.get(i).map(|it| fs::join(&self.path, &it.name)))
+            .collect();
+        for path in &paths {
+            if let Err(e) = recycle::recycle(&user(), path) {
+                self.dialog = Some(Dialog::Message(e.message()));
+            }
         }
-        self.reload_near(i);
+        self.reload_near(items.first().copied().unwrap_or(0));
     }
 
     fn empty_bin(&mut self) {
@@ -668,7 +761,7 @@ impl Explorer {
         let path = self.path.clone();
         self.load(&path);
         if !self.items.is_empty() {
-            self.selected = Some(i.min(self.items.len() - 1));
+            self.select_one(Some(i.min(self.items.len() - 1)));
         }
     }
 
@@ -777,10 +870,11 @@ impl Explorer {
     pub fn on_key(&mut self, key: Key) -> bool {
         if let Some(d) = &self.dialog {
             match key {
-                Key::Enter => match *d {
-                    Dialog::Delete(i) => {
+                Key::Enter => match d {
+                    Dialog::Delete(items) => {
+                        let items = items.clone();
                         self.dialog = None;
-                        self.delete(i);
+                        self.delete(&items);
                     }
                     Dialog::Empty => {
                         self.dialog = None;
@@ -823,7 +917,7 @@ impl Explorer {
                 match self.search.on_key(key) {
                     FieldEvent::Changed => {
                         self.filter();
-                        self.selected = None;
+                        self.select_one(None);
                         self.scroll = 0;
                     }
                     FieldEvent::Escape => {
@@ -834,7 +928,7 @@ impl Explorer {
                     FieldEvent::Enter => {
                         self.focus = Focus::List;
                         if !self.items.is_empty() {
-                            self.selected = Some(0);
+                            self.select_one(Some(0));
                         }
                     }
                     FieldEvent::None => return false,
@@ -860,9 +954,15 @@ impl Explorer {
             View::Details => 1,
             View::Icons => self.columns() as usize,
         };
+        // Shift with the arrows chooses everything on the way
         let move_to = |s: &mut Self, i: usize| {
             if n > 0 {
-                s.selected = Some(i.min(n - 1));
+                let i = i.min(n - 1);
+                if keyboard::shift_held() {
+                    s.select_range(i);
+                } else {
+                    s.select_one(Some(i));
+                }
                 s.scroll_to_selected();
             }
         };
@@ -901,7 +1001,8 @@ impl Explorer {
                     self.go_back();
                 }
             }
-            Key::Escape => self.selected = None,
+            Key::Escape => self.select_one(None),
+            Key::Ctrl('a') => self.select_all(),
             Key::Ctrl('n') if keyboard::shift_held() => self.run(Cmd::NewFolder),
             Key::Ctrl('f') | Key::Ctrl('e') => self.focus = Focus::Search,
             Key::Ctrl('l') => self.edit_address(),
@@ -964,60 +1065,65 @@ impl Explorer {
                     self.clamp_scroll();
                     true
                 }
-                None => false,
+                None => self.drag_band(ev.x, ev.y),
             },
             MouseKind::Up => {
                 self.thumb_grab = None;
-                false
+                self.band.take().is_some()
             }
         }
     }
 
-    fn menu_cmds(&self, on_item: bool) -> &'static [Option<Cmd>] {
-        match (self.at_bin(), on_item) {
-            (true, true) => &BIN_ITEM_MENU,
-            (true, false) => &BIN_BACK_MENU,
-            (false, true) => &ITEM_MENU,
-            (false, false) => &BACK_MENU,
-        }
-    }
-
-    fn menu_items(&self, on_item: bool) -> Vec<Item<'static>> {
+    /// The right-click menu, on the chosen items or on the empty space.
+    fn menu_entries(&self, on_item: bool) -> Vec<Entry> {
+        const SEP: Entry = ("", "", None);
+        let any = !self.items.is_empty();
+        let maybe = |on: bool, cmd: Cmd| on.then_some(cmd);
         if self.at_bin() {
             return if on_item {
                 vec![
-                    ("Restore", "", true),
-                    ("", "", false),
-                    ("Delete", "Del", true),
+                    ("Restore", "", Some(Cmd::Restore)),
+                    SEP,
+                    ("Delete", "Del", Some(Cmd::Delete)),
                 ]
             } else {
-                let any = !self.items.is_empty();
                 vec![
-                    ("Empty Recycle Bin", "", any),
-                    ("", "", false),
-                    ("Details", "", true),
-                    ("Large icons", "", true),
-                    ("Refresh", "F5", true),
+                    ("Empty Recycle Bin", "", maybe(any, Cmd::Empty)),
+                    SEP,
+                    ("Select all", "Ctrl+A", maybe(any, Cmd::SelectAll)),
+                    ("Details", "", Some(Cmd::Details)),
+                    ("Large icons", "", Some(Cmd::Icons)),
+                    ("Refresh", "F5", Some(Cmd::Refresh)),
                 ]
             };
         }
         if on_item {
-            vec![
-                ("Open", "Enter", true),
-                ("", "", false),
-                ("Rename", "F2", true),
-                ("Delete", "Del", true),
-            ]
+            let mut v = vec![("Open", "Enter", Some(Cmd::Open))];
+            if self.chosen_picture().is_some() {
+                v.push(("Set as desktop background", "", Some(Cmd::SetBackground)));
+            }
+            v.push(SEP);
+            v.push(("Rename", "F2", maybe(self.single().is_some(), Cmd::Rename)));
+            v.push(("Delete", "Del", Some(Cmd::Delete)));
+            v
         } else {
             vec![
-                ("New folder", "Ctrl+Shift+N", true),
-                ("New text document", "", true),
-                ("", "", false),
-                ("Details", "", true),
-                ("Large icons", "", true),
-                ("Refresh", "F5", true),
+                ("New folder", "Ctrl+Shift+N", Some(Cmd::NewFolder)),
+                ("New text document", "", Some(Cmd::NewFile)),
+                SEP,
+                ("Select all", "Ctrl+A", maybe(any, Cmd::SelectAll)),
+                ("Details", "", Some(Cmd::Details)),
+                ("Large icons", "", Some(Cmd::Icons)),
+                ("Refresh", "F5", Some(Cmd::Refresh)),
             ]
         }
+    }
+
+    fn menu_items(&self, on_item: bool) -> Vec<Item<'static>> {
+        self.menu_entries(on_item)
+            .into_iter()
+            .map(|(label, key, cmd)| (label, key, cmd.is_some()))
+            .collect()
     }
 
     fn press(&mut self, x: i32, y: i32, right: bool) -> bool {
@@ -1031,7 +1137,7 @@ impl Explorer {
             let rects = widgets::message_buttons(r, buttons.len());
             match rects.iter().position(|b| b.contains(x, y)) {
                 Some(0) => match self.dialog.take() {
-                    Some(Dialog::Delete(i)) => self.delete(i),
+                    Some(Dialog::Delete(items)) => self.delete(&items),
                     Some(Dialog::Empty) => self.empty_bin(),
                     _ => {}
                 },
@@ -1043,7 +1149,7 @@ impl Explorer {
         if let Some((on_item, r)) = self.menu.take() {
             let items = self.menu_items(on_item);
             if let Some(i) = widgets::menu_item_at(r, &items, x, y) {
-                if let Some(cmd) = self.menu_cmds(on_item)[i] {
+                if let Some(cmd) = self.menu_entries(on_item)[i].2 {
                     self.run(cmd);
                 }
                 return true;
@@ -1134,7 +1240,11 @@ impl Explorer {
         }
         let hit = self.item_at(x, y);
         if right {
-            self.selected = hit;
+            // a right-click on a chosen item keeps the whole selection
+            match hit {
+                Some(i) if self.is_chosen(i) => self.selected = Some(i),
+                _ => self.select_one(hit),
+            }
             let items = self.menu_items(hit.is_some());
             let mut r = widgets::menu_rect(x, y, &items);
             r.x = r.x.min(CLIENT_W - r.w - 4);
@@ -1145,8 +1255,46 @@ impl Explorer {
             self.menu_hover = None;
             return true;
         }
-        self.selected = hit;
-        if let Some(i) = hit {
+        let (ctrl, shift) = (keyboard::ctrl_held(), keyboard::shift_held());
+        let Some(i) = hit else {
+            // empty space: start the selection rectangle
+            let at = (x, y + self.scroll);
+            let before = if ctrl { self.chosen() } else { Vec::new() };
+            if !ctrl {
+                self.select_one(None);
+            }
+            self.band = Some(Band {
+                from: at,
+                to: at,
+                before,
+            });
+            return true;
+        };
+        if ctrl {
+            if self.is_chosen(i) {
+                self.marked = self.chosen();
+                self.marked.retain(|&k| k != i);
+                self.selected = self.marked.last().copied();
+            } else {
+                self.marked = self.chosen();
+                self.selected = Some(i);
+            }
+            self.anchor = Some(i);
+            return true;
+        }
+        if shift {
+            self.select_range(i);
+            return true;
+        }
+        // a plain click on one of several chosen items keeps them for a
+        // double-click; otherwise it chooses just this one
+        if !self.is_chosen(i) || self.chosen().len() == 1 {
+            self.select_one(Some(i));
+        } else {
+            self.selected = Some(i);
+            self.anchor = Some(i);
+        }
+        {
             let now = interrupts::ticks();
             if self.last_click.1 == i && now - self.last_click.0 <= DOUBLE_CLICK {
                 self.last_click = (0, usize::MAX);
@@ -1158,10 +1306,54 @@ impl Explorer {
         true
     }
 
+    /// Stretch the selection rectangle to the mouse and choose what it
+    /// touches, scrolling when the mouse goes past the top or bottom.
+    fn drag_band(&mut self, x: i32, y: i32) -> bool {
+        if self.band.is_none() {
+            return false;
+        }
+        let area = content();
+        let top = if self.view == View::Details {
+            area.y + HEADER_H
+        } else {
+            area.y
+        };
+        if y < top {
+            self.scroll -= ROW / 2;
+        } else if y > area.bottom() {
+            self.scroll += ROW / 2;
+        }
+        self.clamp_scroll();
+        let x = x.clamp(area.x, area.right() - 1);
+        let y = y.clamp(top, area.bottom() - 1) + self.scroll;
+        let Some(band) = &mut self.band else {
+            return false;
+        };
+        band.to = (x, y);
+        let r = band.rect();
+        let mut chosen = band.before.clone();
+        for i in 0..self.items.len() {
+            if !self.item_rect(i).intersect(&r).is_empty() && !chosen.contains(&i) {
+                chosen.push(i);
+            }
+        }
+        self.selected = chosen.last().copied();
+        self.anchor = self.selected;
+        self.marked = chosen;
+        true
+    }
+
     fn dialog_text(&self, d: &Dialog) -> (Vec<String>, &'static [&'static str]) {
         match d {
-            Dialog::Delete(i) => {
-                let item = &self.items[*i];
+            Dialog::Delete(items) if items.len() > 1 => (
+                vec![format!(
+                    "Are you sure you want to permanently delete these {} items?",
+                    items.len()
+                )],
+                &["Yes", "No"],
+            ),
+            Dialog::Delete(items) => {
+                let item = &self.items[items[0]];
                 let first = if item.dir {
                     "Are you sure you want to permanently delete this folder"
                 } else {
@@ -1206,7 +1398,7 @@ impl Explorer {
     // ---- drawing ---------------------------------------------------------------
 
     pub fn draw(&mut self, c: &mut Canvas, caret: bool) {
-        c.fill(client(), theme::LIGHT);
+        c.fill(client(), theme::light());
         self.draw_nav(c, caret);
         self.draw_commands(c);
         self.draw_side(c);
@@ -1229,7 +1421,7 @@ impl Explorer {
     }
 
     fn draw_nav(&mut self, c: &mut Canvas, caret: bool) {
-        c.fill(Rect::new(0, 0, CLIENT_W, NAV_H), theme::FACE);
+        c.fill(Rect::new(0, 0, CLIENT_W, NAV_H), theme::face());
         let enabled = [
             !self.back.is_empty(),
             !self.forward.is_empty(),
@@ -1239,9 +1431,9 @@ impl Explorer {
         for (i, on) in enabled.into_iter().enumerate() {
             let r = nav_button(i as i32);
             let color = if on {
-                theme::TEXT
+                theme::text()
             } else {
-                rgb(0xb8, 0xb8, 0xbc)
+                mix(theme::text_dim(), theme::face(), 120)
             };
             let (cx, cy) = (r.x + r.w / 2, r.y + r.h / 2);
             match i {
@@ -1259,7 +1451,7 @@ impl Explorer {
                 _ => {
                     // a circle with an arrowhead
                     c.outline_round(Rect::new(cx - 7, cy - 7, 15, 15), 7, color);
-                    c.fill(Rect::new(cx + 2, cy - 9, 7, 7), theme::FACE);
+                    c.fill(Rect::new(cx + 2, cy - 9, 7, 7), theme::face());
                     c.line(cx + 1, cy - 7, cx + 6, cy - 7, color);
                     c.line(cx + 6, cy - 7, cx + 6, cy - 2, color);
                 }
@@ -1269,8 +1461,8 @@ impl Explorer {
         if self.focus == Focus::Address {
             self.address.draw(c, a, true, caret);
         } else {
-            c.fill_round(a, 4, theme::LIGHT);
-            c.outline_round(a, 4, theme::STROKE);
+            c.fill_round(a, 4, theme::light());
+            c.outline_round(a, 4, theme::stroke());
             let crumbs = self.crumbs();
             let icon_y = a.y + 8;
             if self.at_bin() {
@@ -1281,11 +1473,11 @@ impl Explorer {
                 drive_icon(c, a.x + 8, icon_y);
             }
             for (k, (label, _, r)) in crumbs.iter().enumerate() {
-                c.draw_text(r.x + 6, a.y + 7, label, theme::TEXT);
+                c.draw_text(r.x + 6, a.y + 7, label, theme::text());
                 if k + 1 < crumbs.len() {
                     let (sx, sy) = (r.right() + 8, a.y + 12);
-                    c.line(sx, sy, sx + 4, sy + 4, theme::TEXT_DIM);
-                    c.line(sx + 4, sy + 4, sx, sy + 8, theme::TEXT_DIM);
+                    c.line(sx, sy, sx + 4, sy + 4, theme::text_dim());
+                    c.line(sx + 4, sy + 4, sx, sy + 8, theme::text_dim());
                 }
             }
         }
@@ -1302,23 +1494,24 @@ impl Explorer {
                 name
             });
             let label = fit(&label, s.w - 40);
-            c.draw_text(s.x + 10, s.y + 7, &label, theme::TEXT_DIM);
+            c.draw_text(s.x + 10, s.y + 7, &label, theme::text_dim());
         }
         // magnifying glass
         let (gx, gy) = (s.right() - 26, s.y + 9);
-        c.outline_round(Rect::new(gx, gy, 11, 11), 5, theme::TEXT_DIM);
-        c.line(gx + 9, gy + 9, gx + 13, gy + 13, theme::TEXT_DIM);
+        c.outline_round(Rect::new(gx, gy, 11, 11), 5, theme::text_dim());
+        c.line(gx + 9, gy + 9, gx + 13, gy + 13, theme::text_dim());
     }
 
     fn draw_commands(&self, c: &mut Canvas) {
         let bar = Rect::new(0, NAV_H, CLIENT_W, CMD_H);
-        c.fill(bar, theme::FACE);
-        c.fill_rect(0, TOP - 1, CLIENT_W, 1, theme::STROKE);
-        let has_sel = self.selected.is_some();
+        c.fill(bar, theme::face());
+        c.fill_rect(0, TOP - 1, CLIENT_W, 1, theme::stroke());
+        let has_sel = !self.chosen().is_empty();
         let bin = self.at_bin();
         for (cmd, label, r) in commands(bin) {
             let enabled = match cmd {
-                Cmd::Rename | Cmd::Delete => has_sel,
+                Cmd::Rename => self.single().is_some(),
+                Cmd::Delete => has_sel,
                 Cmd::Restore => has_sel && bin,
                 Cmd::Empty => !self.items.is_empty(),
                 _ => true,
@@ -1326,12 +1519,12 @@ impl Explorer {
             let on = (cmd == Cmd::Details && self.view == View::Details)
                 || (cmd == Cmd::Icons && self.view == View::Icons);
             if on {
-                c.fill_round(r, 4, rgb(0xe0, 0xe6, 0xf0));
+                c.fill_round(r, 4, theme::accent_light());
             }
             let color = if enabled {
-                theme::TEXT
+                theme::text()
             } else {
-                rgb(0xa8, 0xa8, 0xac)
+                mix(theme::text_dim(), theme::face(), 100)
             };
             let (ix, iy) = (r.x + 10, r.y + 8);
             match cmd {
@@ -1343,11 +1536,7 @@ impl Explorer {
                     c.fill_rect(ix + 11, iy, 1, 16, color);
                 }
                 Cmd::Delete => {
-                    let red = if enabled {
-                        rgb(0xc4, 0x2b, 0x1c)
-                    } else {
-                        color
-                    };
+                    let red = if enabled { theme::error() } else { color };
                     c.fill_rect(ix + 1, iy + 2, 14, 2, red);
                     c.fill_rect(ix + 5, iy, 6, 2, red);
                     c.outline_round(Rect::new(ix + 3, iy + 4, 10, 12), 2, red);
@@ -1361,7 +1550,7 @@ impl Explorer {
                 Cmd::Restore | Cmd::Refresh => {
                     // an arrow going back up
                     let color = if cmd == Cmd::Restore && enabled {
-                        theme::ACCENT
+                        theme::accent()
                     } else {
                         color
                     };
@@ -1381,22 +1570,22 @@ impl Explorer {
         }
         // a separator between creating and changing
         let r = commands(bin)[1].2;
-        c.fill_rect(r.right() + 10, bar.y + 12, 1, 20, theme::STROKE);
+        c.fill_rect(r.right() + 10, bar.y + 12, 1, 20, theme::stroke());
     }
 
     fn draw_side(&self, c: &mut Canvas) {
         let side = Rect::new(0, TOP, SIDE_W, CLIENT_H - TOP - STATUS_H);
-        c.fill(side, rgb(0xf7, 0xf8, 0xfa));
-        c.fill_rect(SIDE_W, TOP, 1, side.h, theme::STROKE);
+        c.fill(side, theme::raised());
+        c.fill_rect(SIDE_W, TOP, 1, side.h, theme::stroke());
         let places = places();
         let n = places.len();
         for (i, p) in places.iter().enumerate() {
             let r = place_rect(i, n);
             if fs::same_name(&p.path, &self.path) {
-                c.fill_round(r, 4, rgb(0xdd, 0xe6, 0xf2));
-                c.fill_round(Rect::new(r.x, r.y + 8, 3, r.h - 16), 1, theme::ACCENT);
+                c.fill_round(r, 4, theme::accent_light());
+                c.fill_round(Rect::new(r.x, r.y + 8, 3, r.h - 16), 1, theme::accent());
             } else if self.side_hover == Some(i) {
-                c.fill_round(r, 4, rgb(0xea, 0xee, 0xf4));
+                c.fill_round(r, 4, theme::hover());
             }
             match p.kind {
                 PlaceKind::Drive => drive_icon(c, r.x + 12, r.y + 8),
@@ -1411,13 +1600,13 @@ impl Explorer {
                     icons::get().draw_pic(c, pic, SMALL, r.x + 12, r.y + 7);
                 }
             }
-            c.draw_text(r.x + 38, r.y + 7, p.label, theme::TEXT);
+            c.draw_text(r.x + 38, r.y + 7, p.label, theme::text());
         }
         // "This PC" above the disk
         let disk = place_rect(n - 2, n);
-        c.fill_rect(12, disk.y - 42, SIDE_W - 24, 1, theme::STROKE);
+        c.fill_rect(12, disk.y - 42, SIDE_W - 24, 1, theme::stroke());
         icons::get().draw_pic(c, Pic::Computer, SMALL, 12, disk.y - 30);
-        c.draw_text(38, disk.y - 30, "This PC", theme::TEXT_DIM);
+        c.draw_text(38, disk.y - 30, "This PC", theme::text_dim());
     }
 
     fn draw_files(&mut self, c: &mut Canvas, caret: bool) {
@@ -1430,11 +1619,11 @@ impl Explorer {
             let h = Rect::new(area.x, area.y, area.w, HEADER_H);
             for (k, (x, title)) in COLUMNS.into_iter().enumerate() {
                 if k > 0 {
-                    f.fill_rect(area.x + x - 8, h.y + 6, 1, HEADER_H - 12, theme::STROKE);
+                    f.fill_rect(area.x + x - 8, h.y + 6, 1, HEADER_H - 12, theme::stroke());
                 }
-                f.draw_text(area.x + x + 6, h.y + 7, title, theme::TEXT_DIM);
+                f.draw_text(area.x + x + 6, h.y + 7, title, theme::text_dim());
             }
-            f.fill_rect(area.x + 6, h.bottom() - 1, area.w - 12, 1, theme::STROKE);
+            f.fill_rect(area.x + 6, h.bottom() - 1, area.w - 12, 1, theme::stroke());
             f.clip_to(Rect::new(
                 area.x,
                 area.y + HEADER_H,
@@ -1448,10 +1637,13 @@ impl Explorer {
                 continue;
             }
             let item = &self.items[i];
-            if self.selected == Some(i) {
-                f.fill_round(r, 4, widgets::SELECTION);
+            if self.is_chosen(i) {
+                f.fill_round(r, 4, theme::selection());
+                if self.selected == Some(i) && self.chosen().len() > 1 {
+                    f.outline_round(r, 4, theme::selection_edge());
+                }
             } else if self.hover == Some(i) {
-                f.fill_round(r, 4, widgets::HOVER);
+                f.fill_round(r, 4, theme::row_hover());
             }
             let renaming = self.renaming == Some(i);
             match self.view {
@@ -1465,12 +1657,12 @@ impl Explorer {
                     let base = area.x;
                     if !renaming {
                         let name = fit(&item.name, COLUMNS[1].0 - COLUMNS[0].0 - 40);
-                        f.draw_text(r.x + 36, ty, &name, theme::TEXT);
+                        f.draw_text(r.x + 36, ty, &name, theme::text());
                     }
                     let (y, mo, d, h, mi) = item.modified;
                     let mut s = String::new();
                     let _ = write!(s, "{:02}.{:02}.{} {:02}:{:02}", d, mo, y, h, mi);
-                    let dim = mix(theme::TEXT_DIM, theme::TEXT, 80);
+                    let dim = mix(theme::text_dim(), theme::text(), 80);
                     f.draw_text(base + COLUMNS[1].0 + 6, ty, &s, dim);
                     f.draw_text(base + COLUMNS[2].0 + 6, ty, &type_name(item), dim);
                     if !item.dir {
@@ -1488,7 +1680,7 @@ impl Explorer {
                     }
                     if !renaming {
                         let name = fit(&item.name, r.w - 8);
-                        f.text_centered(Rect::new(r.x, r.y + 68, r.w, 20), &name, theme::TEXT);
+                        f.text_centered(Rect::new(r.x, r.y + 68, r.w, 20), &name, theme::text());
                     }
                 }
             }
@@ -1505,7 +1697,12 @@ impl Explorer {
                 0
             };
             let r = Rect::new(area.x, area.y + top + 30, area.w, 20);
-            f.text_centered(r, msg, theme::TEXT_DIM);
+            f.text_centered(r, msg, theme::text_dim());
+        }
+        if let Some(band) = &self.band {
+            let r = band.rect().offset(0, -scroll);
+            f.fill_round_alpha(r, 0, theme::accent_base(), 60);
+            f.outline_round(r, 0, theme::selection_edge());
         }
         if let Some(i) = self.renaming {
             let r = self.rename_rect(i);
@@ -1519,13 +1716,24 @@ impl Explorer {
 
     fn draw_status(&self, c: &mut Canvas) {
         let r = Rect::new(0, CLIENT_H - STATUS_H, CLIENT_W, STATUS_H);
-        c.fill(r, theme::FACE);
-        c.fill_rect(0, r.y, CLIENT_W, 1, theme::STROKE);
+        c.fill(r, theme::face());
+        c.fill_rect(0, r.y, CLIENT_W, 1, theme::stroke());
         let ty = r.y + (STATUS_H - UI.line_height) / 2;
         let mut s = String::new();
         let n = self.items.len();
         let _ = write!(s, "{} item{}", n, if n == 1 { "" } else { "s" });
-        if let Some(i) = self.selected {
+        let chosen = self.chosen();
+        if chosen.len() > 1 {
+            let _ = write!(s, "      {} items selected", chosen.len());
+            let bytes: u64 = chosen
+                .iter()
+                .filter(|&&i| !self.items[i].dir)
+                .map(|&i| self.items[i].size as u64)
+                .sum();
+            if bytes > 0 {
+                let _ = write!(s, "  {}", size_text(bytes.min(u32::MAX as u64) as u32));
+            }
+        } else if let Some(i) = self.single() {
             let _ = write!(s, "      1 item selected");
             if !self.items[i].dir {
                 let _ = write!(s, "  {}", size_text(self.items[i].size));
@@ -1536,7 +1744,7 @@ impl Explorer {
                 }
             }
         }
-        c.draw_text(12, ty, &s, theme::TEXT);
+        c.draw_text(12, ty, &s, theme::text());
         s.clear();
         match fs::storage() {
             fs::Storage::Disk => {
@@ -1546,12 +1754,12 @@ impl Explorer {
                     fs::capacity() / (1024 * 1024)
                 );
                 let w = UI.width(&s);
-                c.draw_text(r.right() - 14 - w, ty, &s, theme::TEXT_DIM);
+                c.draw_text(r.right() - 14 - w, ty, &s, theme::text_dim());
             }
             _ => {
                 let s = "No disk: files are kept in memory until restart";
                 let w = UI.width(s);
-                c.draw_text(r.right() - 14 - w, ty, s, rgb(0xb0, 0x5a, 0x00));
+                c.draw_text(r.right() - 14 - w, ty, s, theme::warning());
             }
         }
         let _ = self.selected_path();
@@ -1565,8 +1773,8 @@ fn drive_icon(c: &mut Canvas, x: i32, y: i32) {
 
 /// A small house for Home.
 fn home_icon(c: &mut Canvas, x: i32, y: i32) {
-    let color = theme::ACCENT;
+    let color = theme::accent();
     c.fill_polygon(&[(x, y + 8), (x + 8, y), (x + 16, y + 8)], color);
     c.fill_round(Rect::new(x + 2, y + 7, 12, 9), 1, color);
-    c.fill(Rect::new(x + 6, y + 10, 4, 6), theme::LIGHT);
+    c.fill(Rect::new(x + 6, y + 10, 4, 6), theme::raised());
 }
