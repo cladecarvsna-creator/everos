@@ -14,6 +14,11 @@ impl Rgb {
         Self { r, g, b }
     }
 
+    /// The colour as `0x00RRGGBB`.
+    pub fn raw(self) -> u32 {
+        (self.r as u32) << 16 | (self.g as u32) << 8 | self.b as u32
+    }
+
     /// Mix two colours; `t` goes from 0 (all `self`) to 255 (all `other`).
     pub fn mix(self, other: Rgb, t: u8) -> Rgb {
         let lerp = |a: u8, b: u8| ((a as u32 * (255 - t as u32) + b as u32 * t as u32) / 255) as u8;
@@ -101,24 +106,12 @@ impl Framebuffer {
         }
     }
 
-    pub fn put_pixel(&self, x: usize, y: usize, color: Rgb) {
-        self.put_raw(x, y, self.encode(color));
-    }
-
     pub fn fill_rect(&self, x: usize, y: usize, w: usize, h: usize, color: Rgb) {
         let value = self.encode(color);
         for py in y..(y + h).min(self.height) {
             for px in x..(x + w).min(self.width) {
                 self.put_raw(px, py, value);
             }
-        }
-    }
-
-    /// Fill a rectangle with a gradient from `top` to `bottom`.
-    pub fn vertical_gradient(&self, x: usize, y: usize, w: usize, h: usize, top: Rgb, bottom: Rgb) {
-        for row in 0..h {
-            let t = (row * 255 / h.max(1)) as u8;
-            self.fill_rect(x, y + row, w, 1, top.mix(bottom, t));
         }
     }
 
@@ -135,31 +128,6 @@ impl Framebuffer {
         for col in 0..w {
             let t = (col * 255 / w.max(1)) as u8;
             self.fill_rect(x + col, y, 1, h, left.mix(right, t));
-        }
-    }
-
-    /// Bresenham line between two points.
-    pub fn line(&self, x0: isize, y0: isize, x1: isize, y1: isize, color: Rgb) {
-        let value = self.encode(color);
-        let (dx, dy) = ((x1 - x0).abs(), -(y1 - y0).abs());
-        let (sx, sy) = (if x0 < x1 { 1 } else { -1 }, if y0 < y1 { 1 } else { -1 });
-        let (mut x, mut y, mut err) = (x0, y0, dx + dy);
-        loop {
-            if x >= 0 && y >= 0 {
-                self.put_raw(x as usize, y as usize, value);
-            }
-            if x == x1 && y == y1 {
-                break;
-            }
-            let e2 = 2 * err;
-            if e2 >= dy {
-                err += dy;
-                x += sx;
-            }
-            if e2 <= dx {
-                err += dx;
-                y += sy;
-            }
         }
     }
 

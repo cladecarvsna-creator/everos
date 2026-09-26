@@ -6,12 +6,13 @@
 mod console;
 mod font;
 mod framebuffer;
-mod gfx;
+mod gui;
 mod interrupts;
 mod keyboard;
 mod multiboot;
 mod port;
 mod ps2;
+mod rtc;
 mod serial;
 mod shell;
 mod sync;
@@ -52,10 +53,21 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     println!("Type 'help' for a list of commands.");
     println!();
 
-    run(&boot)
+    match boot.framebuffer {
+        Some(fb) => gui::run(fb, &boot),
+        None => run(&boot),
+    }
 }
 
-/// The main loop: handle keys, mouse movement and the cursor blink,
+/// The greeting at the top of the terminal.
+fn print_banner() {
+    console::print_colored(Color::LightCyan, format_args!("EverOS"));
+    println!(" - a hobby operating system in ASM and Rust");
+    println!("Type 'help' for a list of commands, 'paint' or 'calc' to open an app.");
+    println!();
+}
+
+/// The main loop in VGA text mode: handle keys, mouse movement and the cursor blink,
 /// sleeping in between.
 fn run(boot: &multiboot::BootInfo) -> ! {
     let mut keyboard = keyboard::Keyboard::new();
@@ -130,6 +142,25 @@ impl<const N: usize> StackString<N> {
     fn as_str(&self) -> &str {
         core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
     }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn push_str(&mut self, s: &str) {
+        let _ = self.write_str(s);
+    }
+
+    /// Remove the last character.
+    fn pop(&mut self) {
+        if let Some(c) = self.as_str().chars().next_back() {
+            self.len -= c.len_utf8();
+        }
+    }
 }
 
 impl<const N: usize> Write for StackString<N> {
@@ -154,6 +185,7 @@ fn panic(info: &PanicInfo) -> ! {
     // Whoever held the console will never run again.
     unsafe { CONSOLE.force_unlock() };
     let mut con = CONSOLE.lock();
+    con.reattach();
     // start a fresh line before switching colours, so a scroll does not
     // fill the new line with the panic background
     con.set_color(Color::LightRed, Color::Black);

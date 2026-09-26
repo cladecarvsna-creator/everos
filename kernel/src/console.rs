@@ -76,6 +76,9 @@ enum Surface {
     None,
     Text,
     Graphics(Framebuffer),
+    /// The desktop draws the text in a window; the console only keeps
+    /// the cells. The framebuffer is kept for the panic screen.
+    Offscreen(Framebuffer),
 }
 
 /// Height of the status bar at the top of the screen in graphics mode.
@@ -133,8 +136,8 @@ pub struct Console {
     mouse: Mouse,
     status: [char; 64],
     status_len: usize,
-    /// A full screen picture covers the text; don't draw over it.
-    fullscreen: bool,
+    /// The text changed since `take_changed` was last called.
+    changed: bool,
 }
 
 pub static CONSOLE: IrqMutex<Console> = IrqMutex::new(Console::new());
@@ -164,7 +167,7 @@ impl Console {
             },
             status: ['\0'; 64],
             status_len: 0,
-            fullscreen: false,
+            changed: false,
         }
     }
 
@@ -199,11 +202,44 @@ impl Console {
         self.show_mouse();
     }
 
-    pub fn framebuffer(&self) -> Option<Framebuffer> {
-        match self.surface {
-            Surface::Graphics(fb) => Some(fb),
-            _ => None,
+    /// Stop drawing on the screen and keep a `cols` x `rows` text area in
+    /// memory instead, for the desktop's terminal window.
+    pub fn detach(&mut self, cols: usize, rows: usize) {
+        if let Surface::Graphics(fb) = self.surface {
+            self.hide_mouse();
+            self.surface = Surface::Offscreen(fb);
+            self.cols = cols.min(MAX_COLS);
+            self.rows = rows.min(MAX_ROWS);
+            self.clear();
         }
+    }
+
+    /// Take the screen back from the desktop, for the panic screen.
+    pub fn reattach(&mut self) {
+        if let Surface::Offscreen(fb) = self.surface {
+            self.init(Some(fb));
+        }
+    }
+
+    pub fn take_changed(&mut self) -> bool {
+        core::mem::replace(&mut self.changed, false)
+    }
+
+    /// Character and colours of a cell; empty cells are spaces.
+    pub fn cell(&self, row: usize, col: usize) -> (char, Color, Color) {
+        let cell = self.cells[row * self.cols + col];
+        let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
+        (ch, cell.fg, cell.bg)
+    }
+
+    /// Text cursor as (row, column).
+    pub fn cursor(&self) -> (usize, usize) {
+        (self.row, self.col)
+    }
+
+    /// Current text colour.
+    pub fn color(&self) -> Color {
+        self.fg
     }
 
     /// Text area size in characters.
@@ -251,7 +287,7 @@ impl Console {
 
     /// Flip the blinking text cursor. Called by the main loop on a timer.
     pub fn blink(&mut self) {
-        if self.cols == 0 || self.fullscreen {
+        if self.cols == 0 {
             return;
         }
         self.hide_mouse();
@@ -265,7 +301,7 @@ impl Console {
         let (w, h) = match &self.surface {
             Surface::Graphics(fb) => (fb.width, fb.height),
             Surface::Text => (vga::WIDTH * font::WIDTH, vga::HEIGHT * font::HEIGHT),
-            Surface::None => return (0, 0),
+            Surface::None | Surface::Offscreen(_) => return (0, 0),
         };
         self.hide_mouse();
         self.mouse.x = (self.mouse.x as i32 + dx).clamp(0, w as i32 - 1) as usize;
@@ -285,40 +321,8 @@ impl Console {
             self.status[self.status_len] = c;
             self.status_len += 1;
         }
-        if self.fullscreen {
-            return;
-        }
         self.hide_mouse();
         self.draw_status_bar();
-        self.show_mouse();
-    }
-
-    /// Redraw everything, for example after a graphics demo drew over
-    /// the text.
-    pub fn redraw(&mut self) {
-        self.hide_mouse();
-        self.fullscreen = false;
-        if let Surface::Graphics(fb) = &self.surface {
-            fb.fill_rect(0, 0, fb.width, fb.height, Color::Black.rgb());
-        }
-        self.draw_status_bar();
-        for row in 0..self.rows {
-            for col in 0..self.cols {
-                self.draw_cell(row, col);
-            }
-        }
-        self.show_mouse();
-    }
-
-    /// Let `draw` paint over the whole screen. The text, status bar and
-    /// cursor stay hidden until `redraw`; the mouse pointer stays live.
-    pub fn fullscreen(&mut self, draw: impl FnOnce(&Framebuffer)) {
-        let Surface::Graphics(fb) = self.surface else {
-            return;
-        };
-        self.hide_mouse();
-        self.fullscreen = true;
-        draw(&fb);
         self.show_mouse();
     }
 
@@ -342,6 +346,7 @@ impl Console {
         self.cursor_on = false;
         self.draw_cell(self.row, self.col);
         change(self);
+        self.changed = true;
         self.cursor_on = true;
         self.draw_cell(self.row, self.col);
         if let Surface::Text = self.surface {
@@ -413,7 +418,7 @@ impl Console {
         let cell = self.cells[row * self.cols + col];
         let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
         match &self.surface {
-            Surface::None => {}
+            Surface::None | Surface::Offscreen(_) => {}
             Surface::Text => vga::put(row, col, ch, cell.fg as u8, cell.bg as u8),
             Surface::Graphics(fb) => {
                 let (x, y) = (col * font::WIDTH, self.origin_y + row * font::HEIGHT);
@@ -452,7 +457,7 @@ impl Console {
             return;
         }
         match &self.surface {
-            Surface::None => return,
+            Surface::None | Surface::Offscreen(_) => return,
             Surface::Text => {
                 // show the pointer as an inverted character cell
                 let (row, col) = (self.mouse.y / font::HEIGHT, self.mouse.x / font::WIDTH);
@@ -487,7 +492,7 @@ impl Console {
         }
         self.mouse.shown = false;
         match &self.surface {
-            Surface::None => {}
+            Surface::None | Surface::Offscreen(_) => {}
             Surface::Text => {
                 self.draw_cell(self.mouse.y / font::HEIGHT, self.mouse.x / font::WIDTH)
             }

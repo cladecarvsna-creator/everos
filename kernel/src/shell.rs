@@ -1,10 +1,11 @@
 //! A tiny command line: reads keys, echoes them and runs commands.
 
 use crate::console::{self, Color, CONSOLE};
+use crate::gui::{self, App};
 use crate::interrupts;
 use crate::keyboard::Key;
 use crate::multiboot::BootInfo;
-use crate::{gfx, print, println};
+use crate::{print, println};
 
 const MAX_LINE: usize = 250;
 
@@ -14,8 +15,6 @@ pub struct Shell {
     /// The previous command, recalled with the Up arrow.
     last: [char; MAX_LINE],
     last_len: usize,
-    /// A graphics demo covers the screen until the next key press.
-    in_demo: bool,
 }
 
 impl Shell {
@@ -25,7 +24,6 @@ impl Shell {
             len: 0,
             last: ['\0'; MAX_LINE],
             last_len: 0,
-            in_demo: false,
         }
     }
 
@@ -35,11 +33,6 @@ impl Shell {
     }
 
     pub fn on_key(&mut self, key: Key, boot: &BootInfo) {
-        if self.in_demo {
-            self.in_demo = false;
-            CONSOLE.lock().redraw();
-            return;
-        }
         match key {
             Key::Char(c) if self.len < MAX_LINE => {
                 self.line[self.len] = c;
@@ -83,9 +76,7 @@ impl Shell {
                 self.len = 0;
                 let line = core::str::from_utf8(&buf[..used]).unwrap_or("");
                 self.run(line, boot);
-                if !self.in_demo {
-                    self.prompt();
-                }
+                self.prompt();
             }
             _ => {}
         }
@@ -110,7 +101,10 @@ impl Shell {
                 println!("  clear   clear the screen (also Ctrl+L)");
                 println!("  echo    print the arguments");
                 println!("  info    screen, memory and uptime");
+                println!("  paint   open Paint");
+                println!("  calc    open the calculator");
                 println!("  gfx     graphics demo");
+                println!("  exit    close the terminal window");
                 println!("  colors  show the text colours");
                 println!("  panic   test the kernel panic screen");
                 println!("Keys: Alt+Shift switches EN/RU, Up recalls the last command.");
@@ -119,12 +113,12 @@ impl Shell {
             "echo" => println!("{}", args),
             "info" => info(boot),
             "colors" => colors(),
-            "gfx" => {
-                if CONSOLE.lock().framebuffer().is_some() {
-                    CONSOLE.lock().fullscreen(gfx::demo);
-                    self.in_demo = true;
-                } else {
-                    println!("No graphics: GRUB started EverOS in text mode.");
+            "paint" => open(App::Paint),
+            "calc" => open(App::Calculator),
+            "gfx" => open(App::Demo),
+            "exit" => {
+                if !gui::request_close(App::Terminal) {
+                    println!("There is no desktop to go back to in text mode.");
                 }
             }
             "panic" => panic!("panic requested from the shell"),
@@ -133,6 +127,12 @@ impl Shell {
                 format_args!("unknown command: {} (try 'help')\n", command),
             ),
         }
+    }
+}
+
+fn open(app: App) {
+    if !gui::request_open(app) {
+        println!("No graphics: GRUB started EverOS in text mode.");
     }
 }
 
