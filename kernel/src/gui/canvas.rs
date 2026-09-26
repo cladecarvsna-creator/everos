@@ -132,6 +132,34 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Move the pixels inside `r` up by `dy` (down if it is negative),
+    /// for scrolling. The rows that move in keep their old pixels; the
+    /// caller draws them again.
+    pub fn shift_up(&mut self, r: Rect, dy: i32) {
+        let area = r.offset(self.ox, self.oy).intersect(&self.clip);
+        if area.is_empty() || dy == 0 || dy.abs() >= area.h {
+            return;
+        }
+        let (x, w) = (area.x as usize, area.w as usize);
+        let row = |y: i32| y as usize * self.stride + x;
+        if dy > 0 {
+            for y in area.y..area.bottom() - dy {
+                let src = row(y + dy);
+                self.pixels.copy_within(src..src + w, row(y));
+            }
+        } else {
+            for y in (area.y - dy..area.bottom()).rev() {
+                let src = row(y + dy);
+                self.pixels.copy_within(src..src + w, row(y));
+            }
+        }
+    }
+
+    /// The whole buffer's address and size, to tell buffers apart.
+    pub fn buffer_id(&self) -> (usize, usize) {
+        (self.pixels.as_ptr() as usize, self.pixels.len())
+    }
+
     /// The area that can be drawn on, in this view's coordinates.
     pub fn clip_rect(&self) -> Rect {
         self.clip.offset(-self.ox, -self.oy)

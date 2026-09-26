@@ -45,7 +45,8 @@ impl Layout {
 #[derive(Clone, Copy)]
 pub enum Key {
     Char(char),
-    /// Ctrl plus a letter, given as the lowercase Latin letter.
+    /// Ctrl plus a letter (given as the lowercase Latin letter), a digit
+    /// or Tab ('\t').
     Ctrl(char),
     Enter,
     Backspace,
@@ -248,6 +249,8 @@ impl Keyboard {
         match code {
             0x01 => return Some(Key::Escape),
             0x0e => return Some(Key::Backspace),
+            // Ctrl+Tab switches browser tabs
+            0x0f if self.ctrl => return Some(Key::Ctrl('\t')),
             0x0f => return Some(Key::Char('\t')),
             0x1c => return Some(Key::Enter),
             0x3b..=0x44 => return Some(Key::Function(code - 0x3a)),
@@ -260,7 +263,7 @@ impl Keyboard {
         }
         if self.ctrl {
             let c = self.lookup(code, Layout::Us, false)?;
-            return c.is_ascii_lowercase().then_some(Key::Ctrl(c));
+            return (c.is_ascii_lowercase() || c.is_ascii_digit()).then_some(Key::Ctrl(c));
         }
         let plain = self.lookup(code, self.layout, false)?;
         // Caps Lock only affects letters

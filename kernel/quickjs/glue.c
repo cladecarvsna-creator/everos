@@ -214,6 +214,8 @@ void ejs_run_jobs(JSContext *ctx)
 int ejs_eval(JSContext *ctx, const char *src, size_t len, const char *filename, int module, char **out,
              size_t *out_len)
 {
+    /* the stack may differ from the last call (pages load on fibers) */
+    JS_UpdateStackTop(JS_GetRuntime(ctx));
     /* QuickJS wants the source terminated */
     char *buf = malloc(len + 1);
     memcpy(buf, src, len);

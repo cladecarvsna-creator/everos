@@ -154,10 +154,22 @@ impl Dom {
         if let Some(e) = self.element_mut(id) {
             let name = name.to_ascii_lowercase();
             match e.attrs.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, v)) if v == value => return,
                 Some((_, v)) => *v = value.to_string(),
                 None => e.attrs.push((name, value.to_string())),
             }
             self.version += 1;
+        }
+    }
+
+    /// Set a form field's value. Typing does not move anything on the
+    /// page, so this does not ask for a new layout.
+    pub fn set_value(&mut self, id: NodeId, value: &str) {
+        if let Some(e) = self.element_mut(id) {
+            match e.attrs.iter_mut().find(|(n, _)| n == "value") {
+                Some((_, v)) => *v = value.to_string(),
+                None => e.attrs.push((String::from("value"), value.to_string())),
+            }
         }
     }
 
@@ -450,6 +462,8 @@ impl TreeBuilder {
                 i += 1;
                 continue;
             }
+            // big pages parse in the background, a slice at a time
+            crate::fiber::pause_if_slice_used();
             let rest = &s[i..];
             let next = bytes.get(i + 1).copied().unwrap_or(0);
             if rest.starts_with("<!--") {

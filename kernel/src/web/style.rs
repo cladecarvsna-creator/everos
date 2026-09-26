@@ -371,6 +371,7 @@ impl Styler {
         let mut out: Vec<Rc<Style>> = alloc::vec![root.clone(); dom.nodes.len()];
         let mut stack = alloc::vec![(super::dom::DOCUMENT, root)];
         while let Some((node, parent_style)) = stack.pop() {
+            crate::fiber::pause_if_slice_used();
             let style = match &dom.nodes[node].data {
                 NodeData::Element(_) => Rc::new(self.style_for(dom, node, &parent_style)),
                 _ => parent_style.clone(),

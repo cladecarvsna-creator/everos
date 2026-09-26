@@ -96,6 +96,16 @@ type_keys f e t c h spc 1 0 dot 0 dot 2 dot 2 shift-semicolon 8 1 2 3 slash ret
 wait_for 'fetch: "EverOS test page"' || fail "the network test page did not load"
 echo "network and HTTP work"
 
+# the browser loads pages on a fiber, in the background
+type_keys b r o w s e r spc 1 0 dot 0 dot 2 dot 2 shift-semicolon 8 1 2 3 slash ret
+wait_for "browser: showing page" || fail "the browser did not show the test page"
+echo "the browser loads pages in the background"
+# back to the terminal through the taskbar search
+type_keys meta_l-s
+wait_for "search: indexed" || fail "the taskbar search did not open"
+type_keys t e r m ret
+sleep 1
+
 # write a file on the disk, in root's home folder, and open it in
 # Notepad (which then has the keyboard)
 type_keys e c h o spc s a v e d minus o k spc shift-dot spc s a v e d dot t x t ret

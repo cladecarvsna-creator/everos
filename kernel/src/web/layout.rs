@@ -38,6 +38,7 @@ pub trait Metrics {
     /// Ascent and descent in pixels.
     fn ascent_descent(&self, face: Face, size: f32) -> (i32, i32);
     /// Size of a loaded image, by its `src`.
+    /// The size of a downloaded image; None if it has not arrived yet.
     fn image_size(&self, src: &str) -> Option<(i32, i32)>;
 }
 
@@ -444,6 +445,7 @@ impl Engine<'_> {
         sizing: Sizing,
         forced_h: Option<i32>,
     ) -> BoxOut {
+        crate::fiber::pause_if_slice_used();
         let s = self.style(n).clone();
         let tag = self.dom.tag(n);
         let (p, b) = Self::edges(&s, cb_w);
@@ -686,11 +688,17 @@ impl Engine<'_> {
             .map(|h| if s.border_box { h - v_extra } else { h });
         match tag {
             "img" => {
-                let natural = self
-                    .dom
-                    .attr(n, "src")
-                    .and_then(|src| self.m.image_size(src))
-                    .map(|(w, h)| (w.max(1), h.max(1)));
+                // the picture's own size, only asked for when needed: the
+                // page is laid out again when an image whose size was
+                // missing arrives
+                let natural = if spec_w.is_none() || spec_h.is_none() {
+                    self.dom
+                        .attr(n, "src")
+                        .and_then(|src| self.m.image_size(src))
+                        .map(|(w, h)| (w.max(1), h.max(1)))
+                } else {
+                    None
+                };
                 let mut max_w = s.max_width.resolve(cb_w);
                 if let Some(mw) = max_w.as_mut() {
                     *mw = (*mw - if s.border_box { h_extra } else { 0 }).max(0);

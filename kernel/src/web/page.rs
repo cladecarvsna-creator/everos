@@ -6,6 +6,7 @@ use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::cell::RefCell;
 
 use super::css::{self, Stylesheet};
 use super::dom::{self, Dom, NodeData, NodeId, DOCUMENT};
@@ -20,7 +21,9 @@ use crate::js::{self, Host, Value};
 /// At most this many external scripts and style sheets per page.
 const MAX_SCRIPTS: usize = 80;
 const MAX_SHEETS: usize = 40;
-const MAX_IMAGES: usize = 60;
+const MAX_IMAGES: usize = 120;
+/// Scripts may run this long while a page loads; the rest are skipped.
+const SCRIPTS_MS: i64 = 8000;
 
 /// State the scripts change besides the DOM.
 #[derive(Default)]
@@ -58,13 +61,24 @@ pub struct Page {
     sheets: BTreeMap<NodeId, (u64, Rc<Stylesheet>)>,
     pub images: BTreeMap<String, Image>,
     image_queue: VecDeque<String>,
+    /// Images handed out for downloading.
+    requested: BTreeSet<String>,
+    /// Images whose size the layout is waiting for.
+    size_missing: BTreeSet<String>,
     /// When the next JavaScript timer is due (ms since boot).
     next_timer: Option<i64>,
+    /// Goes up whenever the layout or the images change, so the browser
+    /// knows when to draw the page again.
+    pub generation: u64,
+    /// How long the last layout took.
+    pub layout_ms: i64,
 }
 
 /// Measurements for layout: the web fonts and this page's images.
 struct PageMetrics<'a> {
     images: &'a BTreeMap<String, Image>,
+    /// Images the layout wanted the size of but did not have.
+    missing: RefCell<BTreeSet<String>>,
 }
 
 fn face(f: Face) -> webfont::Face {
@@ -86,9 +100,14 @@ impl Metrics for PageMetrics<'_> {
     }
 
     fn image_size(&self, src: &str) -> Option<(i32, i32)> {
-        self.images
+        let size = self
+            .images
             .get(src)
-            .map(|i| (i.width as i32, i.height as i32))
+            .map(|i| (i.width as i32, i.height as i32));
+        if size.is_none() {
+            self.missing.borrow_mut().insert(src.to_string());
+        }
+        size
     }
 }
 
@@ -120,7 +139,11 @@ impl Page {
             sheets: BTreeMap::new(),
             images: BTreeMap::new(),
             image_queue: VecDeque::new(),
+            requested: BTreeSet::new(),
+            size_missing: BTreeSet::new(),
             next_timer: None,
+            generation: 0,
+            layout_ms: 0,
         }
     }
 
@@ -247,14 +270,32 @@ impl Page {
         if self.laid_out == Some(self.dom.version) {
             return false;
         }
+        let t0 = js::now_ms();
         let sheets = self.collect_sheets();
+        let t1 = js::now_ms();
         let styler = Styler::new(sheets, self.viewport);
         self.styles = styler.compute(&self.dom);
+        let t2 = js::now_ms();
         let m = PageMetrics {
             images: &self.images,
+            missing: RefCell::new(BTreeSet::new()),
         };
         self.layout = layout::layout(&self.dom, &self.styles, self.viewport, &m);
+        self.size_missing = m.missing.into_inner();
+        let t3 = js::now_ms();
+        self.layout_ms = t3 - t0;
+        if t3 - t0 > 50 {
+            log(&format!(
+                "layout of {} nodes took {} ms (sheets {}, styles {}, boxes {})",
+                self.dom.nodes.len(),
+                t3 - t0,
+                t1 - t0,
+                t2 - t1,
+                t3 - t2
+            ));
+        }
         self.laid_out = Some(self.dom.version);
+        self.generation += 1;
         self.queue_images();
         true
     }
@@ -266,6 +307,7 @@ impl Page {
         for it in &self.layout.items {
             if let layout::Item::Image { src, .. } = it {
                 if !self.images.contains_key(src)
+                    && !self.requested.contains(src)
                     && !self.image_queue.contains(src)
                     && !wanted.contains(src)
                 {
@@ -274,37 +316,44 @@ impl Page {
             }
         }
         for w in wanted {
-            if self.images.len() + self.image_queue.len() < MAX_IMAGES {
+            if self.requested.len() + self.image_queue.len() < MAX_IMAGES {
                 self.image_queue.push_back(w);
             }
         }
     }
 
-    /// Download and decode the next image. Returns true when one arrived.
-    pub fn load_next_image(&mut self) -> bool {
-        let Some(src) = self.image_queue.pop_front() else {
-            return false;
-        };
-        let img = if let Some(data) = src.strip_prefix("data:") {
-            super::image::decode_data_url(data)
-        } else {
-            self.resolve(&src)
-                .and_then(|u| http::get(&u, None).ok())
-                .filter(|r| r.status == 200)
-                .and_then(|r| super::image::decode(&r.body))
-        };
-        // remember failures too, as empty images, so they are not retried
-        let img = img.unwrap_or_else(Image::empty);
-        let changed = img.width > 0;
-        self.images.insert(src, img);
-        if changed {
-            self.laid_out = None;
-        }
-        changed
+    /// The images waiting to be downloaded, with their addresses (None
+    /// for data: URLs). They come back through [`Page::add_image`].
+    pub fn take_image_queue(&mut self) -> Vec<(String, Option<Url>)> {
+        let queue = core::mem::take(&mut self.image_queue);
+        queue
+            .into_iter()
+            .map(|src| {
+                let u = if src.starts_with("data:") {
+                    None
+                } else {
+                    self.resolve(&src)
+                };
+                self.requested.insert(src.clone());
+                (src, u)
+            })
+            .collect()
     }
 
-    pub fn images_pending(&self) -> usize {
-        self.image_queue.len()
+    /// An image arrived. Returns true if the page must be laid out again
+    /// because the layout was waiting for the image's size.
+    pub fn add_image(&mut self, src: String, img: Image) -> bool {
+        let shown = img.width > 0;
+        let relayout = shown && self.size_missing.remove(&src);
+        self.images.insert(src, img);
+        if shown {
+            // drawn from the next frame on
+            self.generation += 1;
+        }
+        if relayout {
+            self.laid_out = None;
+        }
+        relayout
     }
 
     // ---- scripts ------------------------------------------------------------------------
@@ -354,7 +403,12 @@ impl Page {
             .into_iter()
             .filter(|&n| self.dom.tag(n) == "script")
             .collect();
+        let started = js::now_ms();
         for s in scripts {
+            if js::now_ms() - started > SCRIPTS_MS {
+                log("scripts took too long; showing the page without the rest");
+                break;
+            }
             self.execute(s);
             self.run_new_scripts();
         }
@@ -553,6 +607,13 @@ impl Page {
             }
             n = self.dom.nodes[n].parent?;
         }
+    }
+
+    /// Whether clicking `node` follows a link that opens in a new tab.
+    pub fn opens_new_tab(&self, node: NodeId) -> bool {
+        self.link_of(node)
+            .and_then(|a| self.dom.attr(a, "target"))
+            .is_some_and(|t| t.eq_ignore_ascii_case("_blank"))
     }
 
     pub fn link_target(&self, a: NodeId) -> Option<String> {
@@ -817,7 +878,12 @@ impl Page {
 
     /// Set a field's text (typing in the browser) and tell the scripts.
     pub fn set_field(&mut self, n: NodeId, value: &str) {
-        self.dom.set_attr(n, "value", value);
+        if self.dom.tag(n) == "input" {
+            self.dom.set_value(n, value);
+            self.generation += 1;
+        } else {
+            self.dom.set_attr(n, "value", value);
+        }
         self.dispatch(n, "input", 0, 0);
     }
 
@@ -849,6 +915,20 @@ pub fn fetch_text(u: &Url) -> Option<String> {
             None
         }
     }
+}
+
+/// Download and decode an image; failures give an empty image, so they
+/// are not tried again.
+pub fn fetch_image(src: &str, u: Option<&Url>) -> Image {
+    let img = match (src.strip_prefix("data:"), u) {
+        (Some(data), _) => super::image::decode_data_url(data),
+        (None, Some(u)) => http::get(u, None)
+            .ok()
+            .filter(|r| r.status == 200)
+            .and_then(|r| super::image::decode(&r.body)),
+        _ => None,
+    };
+    img.unwrap_or_else(Image::empty)
 }
 
 const RUNTIME: &str = include_str!("runtime.js");
