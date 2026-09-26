@@ -50,3 +50,36 @@ pub fn time() -> (u8, u8, u8) {
     };
     (h, m, s)
 }
+
+/// Today's date as (year, month 1-12, day 1-31).
+pub fn date() -> (u16, u8, u8) {
+    let sample = || {
+        while updating() {
+            core::hint::spin_loop();
+        }
+        (read(0x09), read(0x08), read(0x07))
+    };
+    let mut now = sample();
+    loop {
+        let again = sample();
+        if again == now {
+            break;
+        }
+        now = again;
+    }
+    let (y, m, d) = now;
+    let bcd = |v: u8| (v & 0x0f) + (v >> 4) * 10;
+    let (y, m, d) = if read(0x0b) & 0x04 == 0 {
+        (bcd(y), bcd(m), bcd(d))
+    } else {
+        (y, m, d)
+    };
+    (2000 + y as u16, m.clamp(1, 12), d.clamp(1, 31))
+}
+
+/// Day of the week, 0 is Sunday (Sakamoto's method).
+pub fn weekday(year: u16, month: u8, day: u8) -> u8 {
+    const T: [u16; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let y = if month < 3 { year - 1 } else { year };
+    ((y + y / 4 - y / 100 + y / 400 + T[month as usize - 1] + day as u16) % 7) as u8
+}

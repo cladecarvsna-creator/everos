@@ -5,7 +5,7 @@ use crate::gui::{self, App};
 use crate::interrupts;
 use crate::keyboard::Key;
 use crate::multiboot::BootInfo;
-use crate::{print, println};
+use crate::{print, println, users};
 
 const MAX_LINE: usize = 250;
 
@@ -107,6 +107,10 @@ impl Shell {
                 println!("  browser open the web browser (browser <address> goes there)");
                 println!("  fetch   download a web page and show its title and links");
                 println!("  exit    close the terminal window");
+                println!("  whoami  show who is signed in; 'users' lists everyone");
+                println!("  useradd add a user: useradd <name> [password]");
+                println!("  passwd  set a password: passwd [<name>] <password>");
+                println!("  lock    show the lock screen");
                 println!("  colors  show the text colours");
                 println!("  panic   test the kernel panic screen");
                 println!("Keys: Alt+Shift switches EN/RU, Up recalls the last command.");
@@ -130,12 +134,81 @@ impl Shell {
                 }
             }
             "fetch" => fetch(args.trim()),
+            "whoami" => match users::current_name() {
+                Some(name) => println!("{}", name.as_str()),
+                None => println!("nobody"),
+            },
+            "users" => {
+                for i in 0..users::count() {
+                    let password = if users::has_password(i) {
+                        "password set"
+                    } else {
+                        "no password"
+                    };
+                    if let Some(name) = users::name(i) {
+                        println!("{:<16} {}", name.as_str(), password);
+                    }
+                }
+            }
+            "useradd" => useradd(args.trim()),
+            "passwd" => passwd(args.trim()),
+            "lock" => {
+                if !gui::request_lock() {
+                    println!("There is no lock screen in text mode.");
+                }
+            }
             "panic" => panic!("panic requested from the shell"),
             _ => console::print_colored(
                 Color::LightRed,
                 format_args!("unknown command: {} (try 'help')\n", command),
             ),
         }
+    }
+}
+
+fn error(message: &str) {
+    console::print_colored(Color::LightRed, format_args!("{}\n", message));
+}
+
+fn is_root() -> bool {
+    users::current_name().is_some_and(|name| name.as_str() == "root")
+}
+
+fn useradd(args: &str) {
+    let mut parts = args.split_whitespace();
+    let (Some(name), password) = (parts.next(), parts.next()) else {
+        println!("usage: useradd <name> [password]");
+        return;
+    };
+    if !is_root() {
+        error("only root can add users");
+        return;
+    }
+    match users::add(name, password.unwrap_or("")) {
+        Ok(()) => println!("added {}; they can sign in on the lock screen", name),
+        Err(e) => error(e.message()),
+    }
+}
+
+fn passwd(args: &str) {
+    let mut parts = args.split_whitespace();
+    let (name, password) = match (parts.next(), parts.next()) {
+        (Some(name), Some(password)) => (Some(name), password),
+        (Some(password), None) => (None, password),
+        _ => {
+            println!("usage: passwd [<name>] <password>");
+            return;
+        }
+    };
+    let me = users::current_name().unwrap_or_default();
+    let name = name.unwrap_or(me.as_str());
+    if name != me.as_str() && !is_root() {
+        error("only root can change other users' passwords");
+        return;
+    }
+    match users::set_password(name, password) {
+        Ok(()) => println!("password changed for {}", name),
+        Err(e) => error(e.message()),
     }
 }
 
