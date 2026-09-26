@@ -36,7 +36,8 @@ $(ISO): $(KERNEL) iso/boot/grub/grub.cfg
 # Boot EverOS in a QEMU window. Serial output goes to the terminal, and
 # the taskbar clock shows local time.
 run: $(ISO)
-	$(QEMU) -cdrom $(ISO) -m 256M -serial stdio -rtc base=localtime
+	$(QEMU) -cdrom $(ISO) -m 256M -serial stdio -rtc base=localtime \
+		-nic user,model=e1000
 
 # Boot headless and check that the kernel reached Rust code.
 test: $(ISO)

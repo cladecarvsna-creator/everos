@@ -28,7 +28,24 @@ EverOS — операционная система для x86_64 на ASM и Rus
     очистка; правая кнопка рисует белым;
   - *Calculator* — кнопки мышью или ввод с клавиатуры (цифры, `+ - * /`, `%`,
     Enter, Backspace, Esc);
-  - *Graphics* — демо графики.
+  - *Graphics* — демо графики;
+  - *Browser* — веб-браузер EverBrowser (подробнее ниже).
+- **Сеть**: драйвер сетевой карты Intel e1000 (её эмулирует QEMU, VirtualBox,
+  VMware), стек TCP/IP [smoltcp](https://github.com/smoltcp-rs/smoltcp),
+  DHCP и DNS. В QEMU нужен флаг `-nic user,model=e1000` (он уже есть в
+  `run-windows.bat` и `make run`): тогда EverOS выходит в интернет через
+  сеть компьютера, ничего настраивать не нужно.
+- **Браузер EverBrowser**: адресная строка (адрес или поисковый запрос для
+  DuckDuckGo), кнопки «Назад», «Обновить», «Домой», переход по ссылкам,
+  простые формы (поиск), прокрутка колёсиком, полосой и клавишами. Страницы
+  грузятся по HTTP/1.1 и HTTPS (TLS 1.3, библиотека
+  [embedded-tls](https://github.com/drogue-iot/embedded-tls)), с
+  перенаправлениями. HTML разбирается своим кодом и показывается сглаженными
+  шрифтами: заголовки, абзацы, жирный текст, ссылки, списки, код, таблицы
+  (построчно). Кодировки UTF-8 и Windows-1251. Пока нет JavaScript, CSS и
+  картинок, поэтому лучше всего открываются простые сайты: Википедия,
+  example.com, info.cern.ch, lite.cnn.com, text.npr.org, frogfind.com.
+  HTTPS шифрует соединение, но сертификаты сайтов не проверяются.
 - **Графика**: GRUB включает режим 1920x1080x32. Если GRUB не дал графику,
   ядро работает в текстовом режиме VGA 80x25 с одной оболочкой.
 - **Текст**: `print!`/`println!` с цветами, перенос строк, прокрутка, мигающий
@@ -41,7 +58,8 @@ EverOS — операционная система для x86_64 на ASM и Rus
   совпадает с курсором хоста и QEMU не нужно захватывать мышь. Иначе мышь PS/2
   с частотой 200 Гц: указатель, щелчки левой и правой кнопкой, перетаскивание.
 - **Оболочка**: команды `help`, `clear`, `echo`, `info`, `colors`, `paint`, `calc`,
-  `gfx`, `exit` (закрыть окно терминала), `panic`.
+  `gfx`, `browser [адрес]`, `fetch <адрес>` (скачать страницу и показать её
+  заголовок и ссылки), `exit` (закрыть окно терминала), `panic`.
   Стрелка вверх повторяет прошлую команду, Ctrl+L очищает экран, Ctrl+C сбрасывает строку.
 
 ## Структура
@@ -60,11 +78,16 @@ EverOS — операционная система для x86_64 на ASM и Rus
 | `kernel/src/interrupts.rs` | IDT, PIC, таймер |
 | `kernel/src/keyboard.rs`, `ps2.rs`, `vmmouse.rs` | клавиатура, мышь PS/2 и абсолютная мышь VMware |
 | `kernel/src/shell.rs` | оболочка |
+| `kernel/src/heap.rs` | куча ядра (48 МиБ) для `Vec`, `String` и сети |
+| `kernel/src/pci.rs`, `kernel/src/net/` | шина PCI, драйвер e1000 (`e1000.rs`), TCP/IP, DHCP, DNS (`mod.rs`) |
+| `kernel/src/web/` | движок браузера: адреса (`url.rs`), HTTP и HTTPS (`http.rs`), разбор HTML (`html.rs`), перенос строк (`layout.rs`) |
+| `kernel/src/gui/browser.rs` | окно браузера: панель, адресная строка, страница, прокрутка |
 | `fonts/`, `scripts/gen-font.py` | шрифт Terminus и генератор `kernel/src/font_data.rs` |
 | `scripts/gen-aa-font.py` | сглаженные шрифты DejaVu для рабочего стола, генерирует `kernel/src/gui/font_data.rs` (нужен Pillow) |
+| `scripts/gen-web-font.py` | шрифты страниц браузера, генерирует `kernel/src/gui/web_font_data.rs` |
 | `linker.ld` | скрипт линкера, ядро грузится по адресу 1 МиБ |
 | `iso/boot/grub/grub.cfg` | конфиг GRUB для загрузочного ISO |
-| `scripts/boot-test.sh` | запуск в QEMU без экрана: проверка старта ядра, рабочего стола и ввода с клавиатуры |
+| `scripts/boot-test.sh` | запуск в QEMU без экрана: проверка старта ядра, рабочего стола, ввода с клавиатуры и загрузки страницы по сети |
 
 ## Запуск на Windows (без сборки и без WSL)
 
@@ -79,7 +102,7 @@ CI собирает ISO при каждом изменении в `main` и вы
 3. Запустите в PowerShell из папки с ISO:
 
    ```powershell
-   & "C:\Program Files\qemu\qemu-system-x86_64.exe" -cdrom everos.iso -m 256M
+   & "C:\Program Files\qemu\qemu-system-x86_64.exe" -cdrom everos.iso -m 256M -nic user,model=e1000
    ```
 
    Или положите рядом с ISO [`run-windows.bat`](scripts/run-windows.bat)

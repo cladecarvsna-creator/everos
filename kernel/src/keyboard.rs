@@ -30,6 +30,11 @@ pub enum Key {
     Right,
     /// The Windows key.
     Super,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    Delete,
     /// Alt+Shift switched the layout.
     LayoutChanged,
 }
@@ -168,6 +173,11 @@ impl Keyboard {
                 0x50 => Some(Key::Down),
                 0x4b => Some(Key::Left),
                 0x4d => Some(Key::Right),
+                0x49 => Some(Key::PageUp),
+                0x51 => Some(Key::PageDown),
+                0x47 => Some(Key::Home),
+                0x4f => Some(Key::End),
+                0x53 => Some(Key::Delete),
                 0x1c => Some(Key::Enter), // keypad enter
                 0x5b | 0x5c => Some(Key::Super),
                 _ => None,

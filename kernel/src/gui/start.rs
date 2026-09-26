@@ -59,7 +59,13 @@ pub struct StartMenu {
 }
 
 /// Apps in alphabetical order, for "All apps".
-const SORTED: [App; 4] = [App::Calculator, App::Demo, App::Paint, App::Terminal];
+const SORTED: [App; 5] = [
+    App::Browser,
+    App::Calculator,
+    App::Demo,
+    App::Paint,
+    App::Terminal,
+];
 
 impl StartMenu {
     pub fn new() -> Self {

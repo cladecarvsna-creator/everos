@@ -200,6 +200,11 @@ impl<'a> Canvas<'a> {
         };
     }
 
+    /// Mix `c` into the pixel at (`x`, `y`) with coverage `a` (0 to 256).
+    pub fn blend_at(&mut self, x: i32, y: i32, c: Color, a: i32) {
+        self.blend(x + self.ox, y + self.oy, c, a);
+    }
+
     /// Whether anything inside `r` could be drawn.
     pub fn visible(&self, r: Rect) -> bool {
         !self.clip.intersect(&r.offset(self.ox, self.oy)).is_empty()
