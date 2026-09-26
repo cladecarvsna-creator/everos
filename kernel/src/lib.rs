@@ -6,6 +6,7 @@
 extern crate alloc;
 
 mod console;
+mod fiber;
 mod font;
 mod framebuffer;
 mod fs;

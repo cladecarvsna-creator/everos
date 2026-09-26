@@ -110,3 +110,9 @@ pub fn init() {
         ALLOCATOR.0.lock().big.init(start, HEAP_SIZE);
     }
 }
+
+/// Bytes the big allocator has free (blocks on the small free lists are
+/// not counted), for deciding whether there is room for more.
+pub fn free_bytes() -> usize {
+    ALLOCATOR.0.lock().big.free()
+}

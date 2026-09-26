@@ -6,6 +6,7 @@
 
 pub mod e1000;
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -159,7 +160,7 @@ impl Stack {
 }
 
 /// Run `f` on the stack after polling it, until it returns Some, the
-/// deadline passes, or `cancel` says to stop.
+/// deadline passes, or the fiber doing this is cancelled.
 fn wait<T>(
     what: &str,
     mut f: impl FnMut(&mut Stack) -> Option<Result<T, String>>,
@@ -177,9 +178,17 @@ fn wait<T>(
         if interrupts::ticks() > deadline {
             return Err(alloc::format!("timed out: {}", what));
         }
-        // let the card and QEMU catch up; interrupts wake us
-        for _ in 0..2000 {
-            core::hint::spin_loop();
+        if crate::fiber::cancelled() {
+            return Err(String::from("cancelled"));
+        }
+        if crate::fiber::inside() {
+            // a background download: let the desktop run meanwhile
+            crate::fiber::pause();
+        } else {
+            // let the card and QEMU catch up; interrupts wake us
+            for _ in 0..2000 {
+                core::hint::spin_loop();
+            }
         }
     }
 }
@@ -194,6 +203,29 @@ pub fn resolve(host: &str) -> Result<Ipv4Address, String> {
     if let Some(ip) = parse_ipv4(host) {
         return Ok(ip);
     }
+    let now = interrupts::ticks();
+    if let Some(&(ip, until)) = DNS_CACHE.lock().get(host) {
+        if now < until {
+            return Ok(ip);
+        }
+    }
+    let ip = lookup(host)?;
+    let mut cache = DNS_CACHE.lock();
+    if cache.len() > 256 {
+        cache.clear();
+    }
+    cache.insert(
+        String::from(host),
+        (ip, now + DNS_CACHE_SECS * interrupts::TIMER_HZ),
+    );
+    Ok(ip)
+}
+
+/// Addresses looked up recently, with when to forget them.
+static DNS_CACHE: IrqMutex<BTreeMap<String, (Ipv4Address, u64)>> = IrqMutex::new(BTreeMap::new());
+const DNS_CACHE_SECS: u64 = 300;
+
+fn lookup(host: &str) -> Result<Ipv4Address, String> {
     wait_configured()?;
     let query = {
         let mut guard = STACK.lock();

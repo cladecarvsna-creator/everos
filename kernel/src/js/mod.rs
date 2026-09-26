@@ -255,7 +255,29 @@ unsafe extern "C" fn everos_js_load_module(name: *const u8, len: *mut usize) -> 
 
 #[no_mangle]
 extern "C" fn everos_js_interrupt() -> c_int {
-    (interrupts::ticks() > unsafe { DEADLINE }) as c_int
+    // a page loading in the background lets the desktop run meanwhile
+    crate::fiber::pause_if_slice_used();
+    (crate::fiber::cancelled() || interrupts::ticks() > unsafe { DEADLINE }) as c_int
+}
+
+/// The running script's globals, kept while its fiber is paused.
+pub struct SavedState(Option<*mut dyn Host>, u64);
+
+pub fn save_state() -> SavedState {
+    unsafe {
+        let s = SavedState(HOST, DEADLINE);
+        HOST = None;
+        DEADLINE = u64::MAX;
+        s
+    }
+}
+
+/// Put the globals back; the time limit does not count `paused` ticks.
+pub fn restore_state(s: SavedState, paused: u64) {
+    unsafe {
+        HOST = s.0;
+        DEADLINE = s.1.saturating_add(paused);
+    }
 }
 
 /// A host for the shell's `js` command: console output only.

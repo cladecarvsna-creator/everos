@@ -1,31 +1,59 @@
-//! EverBrowser: a toolbar with Back, Reload, Home and the address bar,
-//! the page below it and a status bar. Pages come from `crate::web`.
+//! EverBrowser: tabs along the top, a toolbar with Back, Reload (Stop
+//! while loading), Home and the address bar, the page below it and a
+//! status bar. Pages come from `crate::web`.
 //!
-//! Loading blocks the desktop for a moment: a click only records where
-//! to go, the desktop draws "Loading...", and the next `tick` fetches it.
+//! Pages download, run their scripts and lay out on fibers (see
+//! `crate::fiber`), a slice at a time, so the desktop keeps running while
+//! a big page loads. Images download on up to four fibers per tab.
 
+use alloc::collections::VecDeque;
+use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::cell::{Cell, RefCell};
 
 use super::canvas::{mix, rgb, Canvas, Color, Rect};
+use super::icons;
 use super::text::UI;
 use super::theme;
 use super::webfont;
+use super::App;
 use super::{MouseEvent, MouseKind};
+use crate::fiber::Fiber;
 use crate::keyboard::Key;
 use crate::sync::IrqMutex;
 use crate::web::dom::NodeId;
+use crate::web::image::Image;
 use crate::web::layout::{self, Control, Item};
+use crate::web::url::Url;
 use crate::web::{self, Nav, Page};
 use crate::{interrupts, net};
 
 pub const CLIENT_W: i32 = 1500;
 pub const CLIENT_H: i32 = 900;
 
+const TABS_H: i32 = 40;
 const TOOLBAR_H: i32 = 48;
+/// Where the toolbar starts, and the page below it.
+const BAR_Y: i32 = TABS_H;
+const PAGE_Y: i32 = TABS_H + TOOLBAR_H;
 const STATUS_H: i32 = 26;
 const SCROLLBAR_W: i32 = 12;
 const BUTTON: i32 = 34;
+
+const MAX_TABS: usize = 12;
+/// A new tab needs at least this much free memory; big pages take tens
+/// of megabytes.
+const MIN_FREE_FOR_TAB: usize = 40 * 1024 * 1024;
+const TAB_MAX_W: i32 = 240;
+/// Image downloads running at once in one tab.
+const IMAGE_FIBERS: usize = 4;
+/// While images keep arriving, lay the page out again at most this often.
+const RELAYOUT_TICKS: u64 = interrupts::TIMER_HZ / 2;
+/// Loading animations advance this often.
+const ANIM_TICKS: u64 = interrupts::TIMER_HZ / 20;
+/// Background work gets this long per pass of the desktop loop.
+const WORK_TICKS: u64 = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -45,12 +73,43 @@ enum Pressed {
     Thumb(i32),
 }
 
-pub struct Browser {
+/// Parts of the tab strip, for pressing and hovering.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StripPart {
+    Tab(usize),
+    Close(usize),
+    New,
+}
+
+/// A page downloading in the background.
+struct Load {
+    fiber: Fiber,
+    out: Rc<RefCell<Option<Page>>>,
+    nav: Nav,
+    started: u64,
+}
+
+/// A queue of images to download, shared with the fibers doing it.
+type ImageQueue = Rc<RefCell<VecDeque<(String, Option<Url>)>>>;
+type ImagesDone = Rc<RefCell<Vec<(String, Image)>>>;
+
+struct Tab {
+    id: u32,
     page: Page,
     scroll: i32,
     history: Vec<Nav>,
     current: Option<Nav>,
+    /// Where to go next; the load starts on the next tick.
     pending: Option<Nav>,
+    load: Option<Load>,
+    image_fibers: Vec<Fiber>,
+    image_queue: ImageQueue,
+    images_done: ImagesDone,
+    /// Scripts or images changed the page, and it needs laying out again.
+    layout_due: bool,
+    /// Layouts that nobody waits for run no sooner than this, so a big
+    /// page that keeps changing does not take all the time.
+    layout_ok_at: u64,
     address: String,
     /// Cursor in the address bar or a field, in characters.
     cursor: usize,
@@ -63,7 +122,39 @@ pub struct Browser {
     status: String,
     /// Where the link under the mouse goes.
     hover: Option<String>,
+    /// A link asked for a new tab.
+    open_in_new_tab: Option<Nav>,
+    /// Stop (or Escape) was pressed while loading.
+    stop_requested: bool,
+}
+
+/// What the page area of the window shows now, so drawing can skip the
+/// page when nothing changed, or only move it when it scrolled.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Drawn {
+    buffer: (usize, usize),
+    tab: u32,
+    generation: u64,
+    scroll: i32,
+    focus: Focus,
+    field: u64,
+}
+
+pub struct Browser {
+    tabs: Vec<Tab>,
+    active: usize,
+    strip_pressed: Option<StripPart>,
+    strip_hover: Option<StripPart>,
+    /// Cancelled fibers, resumed until they finish.
+    draining: Vec<Fiber>,
+    next_id: u32,
     net_started: bool,
+    /// Loading animation frame.
+    spin: u32,
+    next_anim: u64,
+    /// Which tab gets background work first, taking turns.
+    turn: usize,
+    drawn: Cell<Option<Drawn>>,
 }
 
 /// An address typed in the shell, for the browser to open.
@@ -105,36 +196,56 @@ fn sqrt(v: f32) -> f32 {
 }
 
 fn back_rect() -> Rect {
-    Rect::new(8, 7, BUTTON, BUTTON)
+    Rect::new(8, BAR_Y + 7, BUTTON, BUTTON)
 }
 fn reload_rect() -> Rect {
-    Rect::new(8 + BUTTON + 4, 7, BUTTON, BUTTON)
+    Rect::new(8 + BUTTON + 4, BAR_Y + 7, BUTTON, BUTTON)
 }
 fn home_rect() -> Rect {
-    Rect::new(8 + 2 * (BUTTON + 4), 7, BUTTON, BUTTON)
+    Rect::new(8 + 2 * (BUTTON + 4), BAR_Y + 7, BUTTON, BUTTON)
 }
 fn address_rect() -> Rect {
     let x = 8 + 3 * (BUTTON + 4) + 6;
-    Rect::new(x, 7, CLIENT_W - x - 8 - 64 - 8, BUTTON)
+    Rect::new(x, BAR_Y + 7, CLIENT_W - x - 8 - 64 - 8, BUTTON)
 }
 fn go_rect() -> Rect {
-    Rect::new(CLIENT_W - 8 - 64, 7, 64, BUTTON)
+    Rect::new(CLIENT_W - 8 - 64, BAR_Y + 7, 64, BUTTON)
 }
 fn content_rect() -> Rect {
     Rect::new(
         0,
-        TOOLBAR_H,
+        PAGE_Y,
         CLIENT_W - SCROLLBAR_W,
-        CLIENT_H - TOOLBAR_H - STATUS_H,
+        CLIENT_H - PAGE_Y - STATUS_H,
     )
 }
 fn scrollbar_rect() -> Rect {
     Rect::new(
         CLIENT_W - SCROLLBAR_W,
-        TOOLBAR_H,
+        PAGE_Y,
         SCROLLBAR_W,
-        CLIENT_H - TOOLBAR_H - STATUS_H,
+        CLIENT_H - PAGE_Y - STATUS_H,
     )
+}
+
+/// The tabs in the strip, left to right.
+fn tab_rects(n: usize) -> Vec<Rect> {
+    let room = CLIENT_W - 16 - 44;
+    let w = (room / n.max(1) as i32).clamp(56, TAB_MAX_W);
+    (0..n)
+        .map(|i| Rect::new(8 + i as i32 * w, 6, w, TABS_H - 6))
+        .collect()
+}
+
+/// A tab's close button.
+fn close_rect(tab: Rect) -> Rect {
+    Rect::new(tab.right() - 30, tab.y + (tab.h - 22) / 2, 22, 22)
+}
+
+/// The "+" button after the last tab.
+fn new_tab_rect(n: usize) -> Rect {
+    let x = tab_rects(n).last().map_or(8, |r| r.right()) + 4;
+    Rect::new(x, 9, 30, 28)
 }
 
 /// The page's viewport: the content area.
@@ -148,14 +259,417 @@ fn web_color(c: u32) -> (Color, i32) {
     (c & 0xff_ffff, if a >= 255 { 256 } else { a })
 }
 
+fn hash_text(s: &str, extra: u64) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ extra;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
 impl Browser {
     pub fn new() -> Self {
         Browser {
+            tabs: alloc::vec![Tab::new(1, None)],
+            active: 0,
+            strip_pressed: None,
+            strip_hover: None,
+            draining: Vec::new(),
+            next_id: 2,
+            net_started: false,
+            spin: 0,
+            next_anim: 0,
+            turn: 0,
+            drawn: Cell::new(None),
+        }
+    }
+
+    /// Start the network card when the browser first opens.
+    pub fn start(&mut self) {
+        if !self.net_started {
+            self.net_started = true;
+            let status =
+                match net::init() {
+                    Some(mac) => alloc::format!(
+                    "Network card {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, getting an address...",
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                ),
+                    None => {
+                        String::from("No network card found. Start QEMU with -nic user,model=e1000")
+                    }
+                };
+            self.tabs[self.active].status = status;
+        }
+    }
+
+    /// Whether pages are loading: the desktop should not sleep then.
+    pub fn busy(&self) -> bool {
+        !self.draining.is_empty()
+            || self
+                .tabs
+                .iter()
+                .any(|t| t.load.is_some() || t.pending.is_some() || !t.image_fibers.is_empty())
+    }
+
+    fn tab(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active]
+    }
+
+    /// Open a tab after the current one and switch to it.
+    fn new_tab(&mut self, nav: Option<Nav>) {
+        if self.tabs.len() >= MAX_TABS || crate::heap::free_bytes() < MIN_FREE_FOR_TAB {
+            self.tab().status = String::from("No room for another tab: close one first");
+            // no room: go there in this tab instead
+            if let Some(nav) = nav {
+                self.tab().navigate(nav);
+            }
+            return;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        let focus_address = nav.is_none();
+        let mut tab = Tab::new(id, nav);
+        if focus_address {
+            tab.focus_address();
+        }
+        self.active += 1;
+        self.tabs.insert(self.active, tab);
+        crate::serial::write_str("\nbrowser: new tab\n");
+    }
+
+    fn close_tab(&mut self, i: usize) {
+        if i >= self.tabs.len() {
+            return;
+        }
+        let mut tab = self.tabs.remove(i);
+        tab.stop(&mut self.draining);
+        tab.reset_images(&mut self.draining);
+        if self.tabs.is_empty() {
+            // the last tab closed: start over with the home page
+            let id = self.next_id;
+            self.next_id += 1;
+            self.tabs.push(Tab::new(id, None));
+        }
+        if self.active > i || self.active >= self.tabs.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+        crate::serial::write_str("\nbrowser: closed a tab\n");
+    }
+
+    fn switch_to(&mut self, i: usize) {
+        if i < self.tabs.len() {
+            self.active = i;
+        }
+    }
+
+    /// Called every pass of the desktop loop. Returns true to redraw.
+    pub fn tick(&mut self) -> bool {
+        net::poll();
+        let mut redraw = false;
+        if let Some(address) = REQUESTED.lock().take() {
+            if let Some(u) = web::address_to_url(&address) {
+                self.tab().navigate(Nav::Get(u));
+                redraw = true;
+            }
+        }
+        let deadline = interrupts::ticks() + WORK_TICKS;
+        // stopped work first: it ends quickly and frees its memory
+        self.draining.retain_mut(|f| !f.resume());
+        let n = self.tabs.len();
+        self.turn = (self.turn + 1) % n;
+        for k in 0..n {
+            let i = (self.turn + k) % n;
+            let changed = self.tabs[i].tick(deadline, &mut self.draining);
+            redraw |= changed && i == self.active;
+            if let Some(nav) = self.tabs[i].open_in_new_tab.take() {
+                self.active = i;
+                self.new_tab(Some(nav));
+                redraw = true;
+            }
+        }
+        // the spinning loading icons
+        let now = interrupts::ticks();
+        if now >= self.next_anim && self.tabs.iter().any(|t| t.loading()) {
+            self.next_anim = now + ANIM_TICKS;
+            self.spin = self.spin.wrapping_add(1);
+            redraw = true;
+        }
+        let tab = self.tab();
+        if tab.status.starts_with("Network card") && net::configured() {
+            tab.status = alloc::format!("Online, address {}", net::address().unwrap_or_default());
+            redraw = true;
+        }
+        redraw
+    }
+
+    pub fn on_key(&mut self, key: Key) -> bool {
+        match key {
+            Key::Ctrl('t') => {
+                self.new_tab(None);
+                true
+            }
+            Key::Ctrl('w') => {
+                self.close_tab(self.active);
+                true
+            }
+            Key::Ctrl('\t') => {
+                let n = self.tabs.len();
+                let next = if crate::keyboard::shift_held() {
+                    (self.active + n - 1) % n
+                } else {
+                    (self.active + 1) % n
+                };
+                self.switch_to(next);
+                true
+            }
+            Key::Ctrl(d @ '1'..='9') => {
+                let i = if d == '9' {
+                    self.tabs.len() - 1
+                } else {
+                    d as usize - '1' as usize
+                };
+                self.switch_to(i);
+                true
+            }
+            _ => {
+                let r = self.tab().on_key(key);
+                self.take_new_tab();
+                r
+            }
+        }
+    }
+
+    fn take_new_tab(&mut self) {
+        if let Some(nav) = self.tab().open_in_new_tab.take() {
+            self.new_tab(Some(nav));
+        }
+    }
+
+    pub fn on_wheel(&mut self, clicks: i32) -> bool {
+        self.tab().scroll_by(clicks * 60)
+    }
+
+    fn strip_at(&self, x: i32, y: i32) -> Option<StripPart> {
+        if y >= TABS_H {
+            return None;
+        }
+        let rects = tab_rects(self.tabs.len());
+        for (i, r) in rects.iter().enumerate() {
+            if r.contains(x, y) {
+                let closable = r.w >= 100 || i == self.active;
+                if closable && close_rect(*r).contains(x, y) {
+                    return Some(StripPart::Close(i));
+                }
+                return Some(StripPart::Tab(i));
+            }
+        }
+        if self.tabs.len() < MAX_TABS && new_tab_rect(self.tabs.len()).contains(x, y) {
+            return Some(StripPart::New);
+        }
+        None
+    }
+
+    pub fn on_mouse(&mut self, ev: MouseEvent) -> bool {
+        match ev.kind {
+            MouseKind::Down { right: false } if ev.y < TABS_H => {
+                let part = self.strip_at(ev.x, ev.y);
+                if let Some(StripPart::Tab(i)) = part {
+                    self.switch_to(i);
+                }
+                self.strip_pressed = part;
+                true
+            }
+            MouseKind::Up if self.strip_pressed.is_some() => {
+                let pressed = self.strip_pressed.take();
+                if pressed == self.strip_at(ev.x, ev.y) {
+                    match pressed {
+                        Some(StripPart::Close(i)) => self.close_tab(i),
+                        Some(StripPart::New) => self.new_tab(None),
+                        _ => {}
+                    }
+                }
+                true
+            }
+            _ => {
+                let r = self.tab().on_mouse(ev);
+                self.take_new_tab();
+                r
+            }
+        }
+    }
+
+    /// The mouse moved over the window without a button held.
+    pub fn on_hover(&mut self, x: i32, y: i32) -> bool {
+        let part = self.strip_at(x, y);
+        let strip = part != self.strip_hover;
+        self.strip_hover = part;
+        self.tab().on_hover(x, y) | strip
+    }
+
+    // ---- drawing -----------------------------------------------------------
+
+    pub fn draw(&self, c: &mut Canvas) {
+        let tab = &self.tabs[self.active];
+        self.draw_tabs(c);
+        tab.draw_toolbar(c, self.spin);
+        self.draw_page_area(c, tab);
+        tab.draw_scrollbar(c);
+        tab.draw_status(c);
+    }
+
+    /// Draw the page, or only what scrolling uncovered, or nothing when
+    /// it looks the same as last time.
+    fn draw_page_area(&self, c: &mut Canvas, tab: &Tab) {
+        let area = content_rect();
+        let now = Drawn {
+            buffer: c.buffer_id(),
+            tab: tab.id,
+            generation: tab.page.generation,
+            scroll: tab.scroll,
+            focus: tab.focus,
+            field: if matches!(tab.focus, Focus::Field(_)) {
+                hash_text(&tab.field_text, tab.cursor as u64)
+            } else {
+                0
+            },
+        };
+        let before = self.drawn.replace(Some(now));
+        let view = Rect::new(0, 0, area.w, area.h);
+        let band = match before {
+            Some(b) if b == now => return,
+            Some(b)
+                if Drawn {
+                    scroll: now.scroll,
+                    ..b
+                } == now
+                    && (now.scroll - b.scroll).abs() < area.h / 2 =>
+            {
+                let dy = now.scroll - b.scroll;
+                c.sub(area).shift_up(view, dy);
+                if dy > 0 {
+                    Rect::new(0, area.h - dy, area.w, dy)
+                } else {
+                    Rect::new(0, 0, area.w, -dy)
+                }
+            }
+            _ => view,
+        };
+        tab.draw_page(c, band);
+    }
+
+    fn draw_tabs(&self, c: &mut Canvas) {
+        let strip = mix(theme::FACE, theme::SHADOW, 70);
+        c.fill(Rect::new(0, 0, CLIENT_W, TABS_H), strip);
+        let rects = tab_rects(self.tabs.len());
+        for (i, r) in rects.iter().enumerate() {
+            let tab = &self.tabs[i];
+            let active = i == self.active;
+            let hover =
+                matches!(self.strip_hover, Some(StripPart::Tab(h) | StripPart::Close(h)) if h == i);
+            if active {
+                // joined to the toolbar below, rounded on top
+                c.fill_round(Rect::new(r.x, r.y, r.w, r.h + 10), 8, theme::FACE);
+            } else {
+                if hover {
+                    c.fill_round(r.inset(2), 7, mix(strip, theme::FACE, 150));
+                }
+                // a thin line between tabs that are not next to the active one
+                if i + 1 < rects.len() && i + 1 != self.active {
+                    c.fill_rect(r.right() - 1, r.y + 9, 1, r.h - 16, theme::SHADOW);
+                }
+            }
+            // icon: spinning while loading
+            let (ix, iy) = (r.x + 12, r.y + (r.h - 16) / 2);
+            if tab.loading() {
+                draw_spinner(
+                    c,
+                    ix as f32 + 8.0,
+                    iy as f32 + 8.0,
+                    self.spin,
+                    theme::ACCENT,
+                );
+            } else {
+                icons::get().draw_small(c, App::Browser, ix, iy);
+            }
+            let closable = r.w >= 100 || active;
+            let text_right = if closable {
+                close_rect(*r).x - 4
+            } else {
+                r.right() - 8
+            };
+            let title = tab.title();
+            let ty = r.y + (r.h - UI.line_height) / 2;
+            let mut t = c.sub(Rect::new(ix + 22, r.y, (text_right - ix - 22).max(0), r.h));
+            let color = if active {
+                theme::TEXT
+            } else {
+                mix(theme::TEXT, theme::TEXT_DIM, 140)
+            };
+            t.draw_text(0, ty - r.y, &title, color);
+            if closable {
+                let cr = close_rect(*r);
+                let pressed = self.strip_pressed == Some(StripPart::Close(i));
+                if pressed || self.strip_hover == Some(StripPart::Close(i)) {
+                    c.fill_round(
+                        cr,
+                        4,
+                        mix(strip, theme::SHADOW, if pressed { 200 } else { 110 }),
+                    );
+                }
+                let (cx, cy) = (cr.x as f32 + 11.0, cr.y as f32 + 11.0);
+                stroke(c, cx - 4.0, cy - 4.0, cx + 4.0, cy + 4.0, 1.4, theme::TEXT);
+                stroke(c, cx - 4.0, cy + 4.0, cx + 4.0, cy - 4.0, 1.4, theme::TEXT);
+            }
+        }
+        if self.tabs.len() < MAX_TABS {
+            let r = new_tab_rect(self.tabs.len());
+            let pressed = self.strip_pressed == Some(StripPart::New);
+            if pressed || self.strip_hover == Some(StripPart::New) {
+                c.fill_round(
+                    r,
+                    6,
+                    mix(strip, theme::SHADOW, if pressed { 200 } else { 110 }),
+                );
+            }
+            let (cx, cy) = (r.x as f32 + 15.0, r.y as f32 + 14.0);
+            stroke(c, cx - 6.0, cy, cx + 6.0, cy, 1.6, theme::TEXT);
+            stroke(c, cx, cy - 6.0, cx, cy + 6.0, 1.6, theme::TEXT);
+        }
+    }
+}
+
+/// A turning arc, the loading sign.
+fn draw_spinner(c: &mut Canvas, cx: f32, cy: f32, frame: u32, color: Color) {
+    let start = frame as f32 * 0.45;
+    let steps = 10;
+    let mut prev = None;
+    for i in 0..=steps {
+        let a = start + 4.2 * i as f32 / steps as f32;
+        let p = (cx + 6.0 * cos(a), cy + 6.0 * sin(a));
+        if let Some((px, py)) = prev {
+            stroke(c, px, py, p.0, p.1, 2.0, color);
+        }
+        prev = Some(p);
+    }
+}
+
+impl Tab {
+    /// A tab going to `nav`, or showing the home page.
+    fn new(id: u32, nav: Option<Nav>) -> Tab {
+        let mut tab = Tab {
+            id,
             page: web::home(viewport()),
             scroll: 0,
             history: Vec::new(),
             current: Some(Nav::Home),
             pending: None,
+            load: None,
+            image_fibers: Vec::new(),
+            image_queue: Rc::new(RefCell::new(VecDeque::new())),
+            images_done: Rc::new(RefCell::new(Vec::new())),
+            layout_due: false,
+            layout_ok_at: 0,
             address: String::new(),
             cursor: 0,
             select_all: false,
@@ -164,78 +678,217 @@ impl Browser {
             pressed: Pressed::None,
             status: String::new(),
             hover: None,
-            net_started: false,
+            open_in_new_tab: None,
+            stop_requested: false,
+        };
+        if let Some(nav) = nav {
+            tab.navigate(nav);
+        }
+        tab
+    }
+
+    fn loading(&self) -> bool {
+        self.load.is_some() || self.pending.is_some()
+    }
+
+    fn title(&self) -> String {
+        if self.loading() {
+            return String::from("Loading...");
+        }
+        let t = self.page.title();
+        let t = t.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+        match &self.page.url {
+            Some(u) => u.host.clone(),
+            None => String::from("New tab"),
         }
     }
 
-    /// Start the network card when the browser first opens.
-    pub fn start(&mut self) {
-        if !self.net_started {
-            self.net_started = true;
-            match net::init() {
-                Some(mac) => {
-                    self.status = alloc::format!(
-                        "Network card {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, getting an address...",
-                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-                    );
-                }
-                None => {
-                    self.status = String::from(
-                        "No network card found. Start QEMU with -nic user,model=e1000",
-                    );
-                }
-            }
-        }
-    }
-
-    /// Called every pass of the desktop loop. Returns true to redraw.
-    pub fn tick(&mut self) -> bool {
-        net::poll();
-        if let Some(address) = REQUESTED.lock().take() {
-            if let Some(u) = web::address_to_url(&address) {
-                self.navigate(Nav::Get(u));
-                return true; // draw "Loading" first
-            }
+    /// Background work for this tab. Returns true if the page changed.
+    fn tick(&mut self, deadline: u64, draining: &mut Vec<Fiber>) -> bool {
+        let mut changed = false;
+        if core::mem::take(&mut self.stop_requested) {
+            self.stop(draining);
+            self.status = String::from("Stopped");
+            self.address = self
+                .page
+                .url
+                .as_ref()
+                .map(|u| u.to_string())
+                .unwrap_or_default();
+            changed = true;
         }
         if let Some(nav) = self.pending.take() {
-            self.load(nav);
-            return true;
+            self.start_load(nav, draining);
+            changed = true;
         }
-        let mut redraw = false;
-        if self.page.run_timers(false) {
-            self.after_script();
-            redraw |= self.page.update();
-        }
-        if self.pending.is_none() && self.page.images_pending() > 0 {
-            self.page.load_next_image();
-            if self.page.images_pending() == 0 || self.page.images.len().is_multiple_of(4) {
-                redraw |= self.page.update();
-                self.scroll = self.scroll.clamp(0, self.max_scroll());
+        if interrupts::ticks() < deadline {
+            if let Some(load) = &mut self.load {
+                if load.fiber.resume() {
+                    let load = self.load.take().unwrap();
+                    let page = load.out.borrow_mut().take();
+                    if let Some(page) = page {
+                        self.finish_load(load.nav, page, load.started, draining);
+                    }
+                    changed = true;
+                }
             }
         }
-        if self.status.starts_with("Network card") && net::configured() {
-            self.status = alloc::format!("Online, address {}", net::address().unwrap_or_default());
-            return true;
+        if self.page.run_timers(false) {
+            // what timers change shows at the next layout
+            self.script_actions();
+            self.layout_due = true;
         }
-        redraw
+        changed |= self.pump_images(deadline);
+        if self.layout_due && interrupts::ticks() >= self.layout_ok_at {
+            changed |= self.relayout();
+        }
+        changed
+    }
+
+    /// Lay the page out again if it changed. Returns true if it did.
+    fn relayout(&mut self) -> bool {
+        self.layout_due = false;
+        if !self.page.update() {
+            return false;
+        }
+        // wait four times as long as it took before the next one
+        let cost = self.page.layout_ms.max(0) as u64 * interrupts::TIMER_HZ / 1000;
+        self.layout_ok_at = interrupts::ticks() + (4 * cost).max(RELAYOUT_TICKS);
+        self.scroll = self.scroll.clamp(0, self.max_scroll());
+        true
+    }
+
+    fn start_load(&mut self, nav: Nav, draining: &mut Vec<Fiber>) {
+        self.stop(draining);
+        let out: Rc<RefCell<Option<Page>>> = Rc::new(RefCell::new(None));
+        let (o, n) = (out.clone(), nav.clone());
+        let vp = viewport();
+        let fiber = Fiber::new(move || {
+            let page = match &n {
+                Nav::Home => web::home(vp),
+                Nav::Get(u) => web::load(u, None, vp, true),
+                Nav::Post(u, body) => web::load(u, Some(body), vp, true),
+            };
+            *o.borrow_mut() = Some(page);
+        });
+        self.load = Some(Load {
+            fiber,
+            out,
+            nav,
+            started: interrupts::ticks(),
+        });
+    }
+
+    /// Stop loading, keeping the page that is showing.
+    fn stop(&mut self, draining: &mut Vec<Fiber>) {
+        if let Some(mut load) = self.load.take() {
+            load.fiber.cancel();
+            draining.push(load.fiber);
+        }
+        self.pending = None;
+    }
+
+    /// Forget the images of the page that is going away.
+    fn reset_images(&mut self, draining: &mut Vec<Fiber>) {
+        for mut f in self.image_fibers.drain(..) {
+            f.cancel();
+            draining.push(f);
+        }
+        self.image_queue.borrow_mut().clear();
+        self.image_queue = Rc::new(RefCell::new(VecDeque::new()));
+        self.images_done = Rc::new(RefCell::new(Vec::new()));
+        self.layout_due = false;
+    }
+
+    fn finish_load(&mut self, nav: Nav, page: Page, started: u64, draining: &mut Vec<Fiber>) {
+        if let Some(prev) = self.current.take() {
+            if self.history.len() >= 64 {
+                self.history.remove(0);
+            }
+            self.history.push(prev);
+        }
+        // a redirect or a POST leaves us at a plain address
+        self.current = Some(match (&nav, &page.url) {
+            (Nav::Home, _) => Nav::Home,
+            (_, Some(u)) => Nav::Get(u.clone()),
+            _ => nav.clone(),
+        });
+        self.reset_images(draining);
+        self.set_page(page);
+        let secs = (interrupts::ticks() - started) as f32 / interrupts::TIMER_HZ as f32;
+        self.status = alloc::format!("Done in {}.{} s", secs as u32, (secs * 10.0) as u32 % 10);
+        let mut line = crate::StackString::<64>::new();
+        let _ = core::fmt::write(
+            &mut line,
+            format_args!(
+                "\nbrowser: showing page, {} MiB free\n",
+                crate::heap::free_bytes() >> 20
+            ),
+        );
+        crate::serial::write_str(line.as_str());
+        // a script may have moved on straight away
+        self.after_script();
+    }
+
+    /// Hand new images to the download fibers and take in what arrived.
+    fn pump_images(&mut self, deadline: u64) -> bool {
+        if self.load.is_none() {
+            let new = self.page.take_image_queue();
+            if !new.is_empty() {
+                self.image_queue.borrow_mut().extend(new);
+            }
+        }
+        let waiting = self.image_queue.borrow().len();
+        while self.image_fibers.len() < IMAGE_FIBERS && self.image_fibers.len() < waiting {
+            let (queue, done) = (self.image_queue.clone(), self.images_done.clone());
+            self.image_fibers.push(Fiber::new(move || loop {
+                let next = queue.borrow_mut().pop_front();
+                let Some((src, url)) = next else {
+                    break;
+                };
+                let img = web::page::fetch_image(&src, url.as_ref());
+                done.borrow_mut().push((src, img));
+            }));
+        }
+        for f in self.image_fibers.iter_mut() {
+            if interrupts::ticks() >= deadline {
+                break;
+            }
+            f.resume();
+        }
+        self.image_fibers.retain(|f| !f.done());
+        let arrived = core::mem::take(&mut *self.images_done.borrow_mut());
+        let changed = !arrived.is_empty();
+        for (src, img) in arrived {
+            self.layout_due |= self.page.add_image(src, img);
+        }
+        changed
+    }
+
+    /// Act on what a script asked for, and show what it changed.
+    fn after_script(&mut self) {
+        self.script_actions();
+        self.relayout();
     }
 
     /// Act on what a script asked for: going somewhere, back, scrolling.
-    fn after_script(&mut self) {
+    fn script_actions(&mut self) {
         if let Some(nav) = self.page.st.nav.take() {
             self.navigate(nav);
         }
         if core::mem::take(&mut self.page.st.back) {
             self.back();
         }
-        self.page.update();
         if let Some(n) = self.page.st.scroll_to.take() {
             if let Some(y) = self.page.element_top(n) {
                 self.scroll = y.clamp(0, self.max_scroll());
             }
         }
         // the address follows history.pushState
-        if self.focus != Focus::Address && self.pending.is_none() {
+        if self.focus != Focus::Address && !self.loading() {
             if let Some(u) = &self.page.url {
                 self.address = u.to_string();
             }
@@ -252,32 +905,6 @@ impl Browser {
         }
         self.pending = Some(nav);
         self.focus = Focus::Page;
-    }
-
-    fn load(&mut self, nav: Nav) {
-        let started = interrupts::ticks();
-        let page = match &nav {
-            Nav::Home => web::home(viewport()),
-            Nav::Get(u) => web::load(u, None, viewport(), true),
-            Nav::Post(u, body) => web::load(u, Some(body), viewport(), true),
-        };
-        if let Some(prev) = self.current.take() {
-            if self.history.len() >= 64 {
-                self.history.remove(0);
-            }
-            self.history.push(prev);
-        }
-        // a redirect or a POST leaves us at a plain address
-        self.current = Some(match (&nav, &page.url) {
-            (Nav::Home, _) => Nav::Home,
-            (_, Some(u)) => Nav::Get(u.clone()),
-            _ => nav.clone(),
-        });
-        self.set_page(page);
-        let secs = (interrupts::ticks() - started) as f32 / interrupts::TIMER_HZ as f32;
-        self.status = alloc::format!("Done in {}.{} s", secs as u32, (secs * 10.0) as u32 % 10);
-        // a script may have moved on straight away
-        self.after_script();
     }
 
     fn set_page(&mut self, page: Page) {
@@ -424,7 +1051,7 @@ impl Browser {
         true
     }
 
-    pub fn on_key(&mut self, key: Key) -> bool {
+    fn on_key(&mut self, key: Key) -> bool {
         if self.focus != Focus::Page {
             return self.edit_key(key);
         }
@@ -457,8 +1084,12 @@ impl Browser {
                 self.focus_address();
                 true
             }
-            Key::Ctrl('r') => {
+            Key::Ctrl('r') | Key::Function(5) => {
                 self.reload();
+                true
+            }
+            Key::Escape if self.loading() => {
+                self.stop_requested = true;
                 true
             }
             _ => false,
@@ -479,11 +1110,7 @@ impl Browser {
         self.cursor = self.address.chars().count();
     }
 
-    pub fn on_wheel(&mut self, clicks: i32) -> bool {
-        self.scroll_by(clicks * 60)
-    }
-
-    pub fn on_mouse(&mut self, ev: MouseEvent) -> bool {
+    fn on_mouse(&mut self, ev: MouseEvent) -> bool {
         match ev.kind {
             MouseKind::Down { right: false } => self.press(ev.x, ev.y),
             MouseKind::Down { right: true } => false,
@@ -505,7 +1132,13 @@ impl Browser {
                 let inside = |r: Rect| r.contains(ev.x, ev.y);
                 match pressed {
                     Pressed::Back if inside(back_rect()) => self.back(),
-                    Pressed::Reload if inside(reload_rect()) => self.reload(),
+                    Pressed::Reload if inside(reload_rect()) => {
+                        if self.loading() {
+                            self.stop_requested = true;
+                        } else {
+                            self.reload();
+                        }
+                    }
                     Pressed::Home if inside(home_rect()) => self.navigate(Nav::Home),
                     Pressed::Go if inside(go_rect()) => {
                         self.focus = Focus::Address;
@@ -519,7 +1152,7 @@ impl Browser {
     }
 
     /// The mouse moved over the window without a button held.
-    pub fn on_hover(&mut self, x: i32, y: i32) -> bool {
+    fn on_hover(&mut self, x: i32, y: i32) -> bool {
         let area = content_rect();
         let mut hover = None;
         if area.contains(x, y) {
@@ -627,8 +1260,13 @@ impl Browser {
                 self.page.dispatch(node, "focus", px, py);
             }
             if self.page.dispatch(node, "click", px, py) {
+                let new_tab = self.page.opens_new_tab(node);
                 if let Some(nav) = self.page.default_action(node) {
-                    self.navigate(nav);
+                    if new_tab {
+                        self.open_in_new_tab = Some(nav);
+                    } else {
+                        self.navigate(nav);
+                    }
                 }
             }
             self.after_script();
@@ -639,17 +1277,10 @@ impl Browser {
 
     // ---- drawing -----------------------------------------------------------
 
-    pub fn draw(&self, c: &mut Canvas) {
-        self.draw_toolbar(c);
-        self.draw_page(c);
-        self.draw_scrollbar(c);
-        self.draw_status(c);
-    }
-
-    fn draw_toolbar(&self, c: &mut Canvas) {
-        let bar = Rect::new(0, 0, CLIENT_W, TOOLBAR_H);
+    fn draw_toolbar(&self, c: &mut Canvas, spin: u32) {
+        let bar = Rect::new(0, BAR_Y, CLIENT_W, TOOLBAR_H);
         c.fill(bar, theme::FACE);
-        c.fill_rect(0, TOOLBAR_H - 1, CLIENT_W, 1, theme::STROKE);
+        c.fill_rect(0, BAR_Y + TOOLBAR_H - 1, CLIENT_W, 1, theme::STROKE);
 
         let icon_button = |c: &mut Canvas, r: Rect, pressed: bool, enabled: bool| {
             if pressed {
@@ -679,23 +1310,29 @@ impl Browser {
         stroke(c, cx - 7.0, cy, cx - 1.0, cy - 6.0, 2.0, col);
         stroke(c, cx - 7.0, cy, cx - 1.0, cy + 6.0, 2.0, col);
 
-        // reload: an almost closed circle with an arrow head
+        // reload: an almost closed circle with an arrow head; a cross
+        // (stop) while loading
         let r = reload_rect();
         let col = icon_button(c, r, self.pressed == Pressed::Reload, true);
         let (cx, cy) = (r.x as f32 + 17.0, r.y as f32 + 17.0);
-        let steps = 20;
-        let mut prev = None;
-        for i in 0..=steps {
-            let a = 0.9 + 5.0 * i as f32 / steps as f32;
-            let p = (cx + 7.0 * cos(a), cy - 7.0 * sin(a));
-            if let Some((px, py)) = prev {
-                stroke(c, px, py, p.0, p.1, 2.0, col);
+        if self.loading() {
+            stroke(c, cx - 6.0, cy - 6.0, cx + 6.0, cy + 6.0, 2.0, col);
+            stroke(c, cx - 6.0, cy + 6.0, cx + 6.0, cy - 6.0, 2.0, col);
+        } else {
+            let steps = 20;
+            let mut prev = None;
+            for i in 0..=steps {
+                let a = 0.9 + 5.0 * i as f32 / steps as f32;
+                let p = (cx + 7.0 * cos(a), cy - 7.0 * sin(a));
+                if let Some((px, py)) = prev {
+                    stroke(c, px, py, p.0, p.1, 2.0, col);
+                }
+                prev = Some(p);
             }
-            prev = Some(p);
+            let (ax, ay) = (cx + 7.0 * cos(0.9), cy - 7.0 * sin(0.9));
+            stroke(c, ax, ay, ax - 5.0, ay - 1.0, 2.0, col);
+            stroke(c, ax, ay, ax + 1.0, ay - 5.5, 2.0, col);
         }
-        let (ax, ay) = (cx + 7.0 * cos(0.9), cy - 7.0 * sin(0.9));
-        stroke(c, ax, ay, ax - 5.0, ay - 1.0, 2.0, col);
-        stroke(c, ax, ay, ax + 1.0, ay - 5.5, 2.0, col);
 
         // home: a house
         let r = home_rect();
@@ -724,16 +1361,13 @@ impl Browser {
             c.outline_round(r.inset(1), r.h / 2 - 1, theme::ACCENT);
         }
         let https = self.page.url.as_ref().is_some_and(|u| u.https) && !focused;
-        let mut tx = r.x + 14;
         if https {
             // a small padlock
-            let (lx, ly) = (tx, r.y + 10);
+            let (lx, ly) = (r.x + 14, r.y + 10);
             c.fill_round(Rect::new(lx, ly + 6, 11, 9), 2, rgb(0x2e, 0x7d, 0x32));
             c.outline_round(Rect::new(lx + 2, ly, 7, 12), 3, rgb(0x2e, 0x7d, 0x32));
             c.outline_round(Rect::new(lx + 3, ly + 1, 5, 10), 2, rgb(0x2e, 0x7d, 0x32));
-            tx += 18;
         }
-        let _ = tx;
         draw_edit(
             c,
             self.address_text_rect(),
@@ -744,22 +1378,33 @@ impl Browser {
             self.select_all,
         );
 
-        let loading = self.pending.is_some();
+        let loading = self.loading();
         theme::accent_button(
             c,
             go_rect(),
             if loading { "..." } else { "Go" },
             self.pressed == Pressed::Go,
         );
+
+        // a strip running along the bottom of the toolbar while loading
+        if loading {
+            let track = Rect::new(0, BAR_Y + TOOLBAR_H - 3, CLIENT_W, 3);
+            let w = CLIENT_W / 4;
+            let x = (spin as i32 * 24) % (CLIENT_W + w) - w;
+            let mut s = c.sub(track);
+            s.fill(Rect::new(x, 0, w, 3), theme::ACCENT);
+        }
     }
 
-    fn draw_page(&self, c: &mut Canvas) {
+    /// Draw the part `band` of the page area (in its own coordinates).
+    fn draw_page(&self, c: &mut Canvas, band: Rect) {
         let area = content_rect();
         let mut page = c.sub(area);
+        page.clip_to(band);
         let (bg, _) = web_color(self.page.layout.canvas);
-        page.fill(Rect::new(0, 0, area.w, area.h), bg);
+        page.fill(band, bg);
         let dy = -self.scroll;
-        let view = Rect::new(0, 0, area.w, area.h);
+        let view = Rect::new(0, 0, area.w, area.h).intersect(&band);
         let mut clips: Vec<Rect> = alloc::vec![view];
         for item in &self.page.layout.items {
             let clip = *clips.last().unwrap();
@@ -804,7 +1449,7 @@ impl Browser {
             if bounds.intersect(&clip).is_empty() {
                 continue;
             }
-            let mut sub = page.sub(view);
+            let mut sub = page.sub(Rect::new(0, 0, area.w, area.h));
             sub.clip_to(clip);
             self.draw_item(&mut sub, item, dy);
         }
@@ -996,19 +1641,19 @@ impl Browser {
         c.fill(bar, theme::FACE);
         c.fill_rect(0, bar.y, CLIENT_W, 1, theme::STROKE);
         let ty = bar.y + (STATUS_H - UI.line_height) / 2;
-        let loading = self.pending.is_some();
-        let mut x = 10;
-        if loading {
-            c.fill_round(Rect::new(x, bar.y + 8, 10, 10), 5, theme::ACCENT);
-            x += 18;
-        }
+        let loading = self.loading();
+        let x = 10;
         let status = match (&self.hover, loading) {
             (Some(link), false) => link.as_str(),
             _ => self.status.as_str(),
         };
-        let title: String = self.page.title().chars().take(80).collect();
-        let right_w = UI.width(&title);
-        c.draw_text(CLIENT_W - right_w - 14, ty, &title, theme::TEXT);
+        let mut images = String::new();
+        let waiting = self.image_queue.borrow().len() + self.image_fibers.len();
+        if waiting > 0 && !loading {
+            images = alloc::format!("Loading images: {} left", waiting);
+        }
+        let right_w = UI.width(&images);
+        c.draw_text(CLIENT_W - right_w - 14, ty, &images, theme::TEXT_DIM);
         let mut left = c.sub(Rect::new(x, bar.y, CLIENT_W - x - right_w - 40, STATUS_H));
         left.draw_text(0, ty - bar.y, status, theme::TEXT_DIM);
     }

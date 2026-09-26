@@ -2485,8 +2485,10 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
         }
 
         desk.render();
+        // pages loading in the background keep the loop going
+        let busy = desk.browser.busy();
         interrupts::wait_for_interrupt(|| {
-            !KEYBOARD_BYTES.is_empty() || !MOUSE_BYTES.is_empty() || !REQUESTS.is_empty()
+            busy || !KEYBOARD_BYTES.is_empty() || !MOUSE_BYTES.is_empty() || !REQUESTS.is_empty()
         });
     }
 }
