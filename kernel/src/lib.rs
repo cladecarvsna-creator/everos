@@ -8,6 +8,7 @@ extern crate alloc;
 mod console;
 mod font;
 mod framebuffer;
+mod fs;
 mod gui;
 mod heap;
 mod interrupts;
@@ -50,6 +51,7 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     interrupts::init();
     let mouse = ps2::init();
     interrupts::enable();
+    fs::init();
 
     match &boot.framebuffer {
         Some(fb) => println!("Graphics:  {}x{} framebuffer", fb.width, fb.height),
@@ -57,6 +59,13 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     }
     println!("Keyboard:  ready (Alt+Shift switches EN/RU)");
     println!("Mouse:     {}", if mouse { "ready" } else { "not found" });
+    match fs::storage() {
+        fs::Storage::Disk => println!(
+            "Disk:      {} MiB FAT32, files are saved on it",
+            fs::capacity() / (1024 * 1024)
+        ),
+        _ => println!("Disk:      none, files are kept in memory until restart"),
+    }
     println!("Привет! Кириллица тоже работает.");
     println!();
     println!("EverOS: kernel started");

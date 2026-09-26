@@ -16,10 +16,13 @@ mod browser;
 mod calc;
 mod canvas;
 mod demo;
+mod explorer;
+mod filedialog;
 #[rustfmt::skip]
 mod font_data;
 mod icons;
 mod login;
+mod notepad;
 mod paint;
 mod start;
 mod terminal;
@@ -28,7 +31,10 @@ mod theme;
 mod tray;
 #[rustfmt::skip]
 mod web_font_data;
+mod widgets;
 
+use alloc::boxed::Box;
+use alloc::string::String;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -43,8 +49,8 @@ use crate::framebuffer::Framebuffer;
 use crate::interrupts::{self, KEYBOARD_BYTES, MOUSE_BYTES};
 use crate::keyboard::{Key, Keyboard, Layout};
 use crate::multiboot::BootInfo;
-use crate::sync::{ByteQueue, StaticBuffer};
-use crate::{console::CONSOLE, port, ps2, rtc, serial, users, vmmouse, StackString};
+use crate::sync::{ByteQueue, IrqMutex, StaticBuffer};
+use crate::{console::CONSOLE, fs, port, ps2, rtc, serial, users, vmmouse, StackString};
 
 const MAX_W: usize = 1920;
 const MAX_H: usize = 1200;
@@ -82,14 +88,18 @@ const BLINK_TICKS: u64 = interrupts::TIMER_HZ / 2;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum App {
     Terminal,
+    Explorer,
+    Notepad,
     Paint,
     Calculator,
     Demo,
     Browser,
 }
 
-const APPS: [App; 5] = [
+const APPS: [App; 7] = [
     App::Terminal,
+    App::Explorer,
+    App::Notepad,
     App::Paint,
     App::Calculator,
     App::Demo,
@@ -104,6 +114,8 @@ impl App {
     fn title(self) -> &'static str {
         match self {
             App::Terminal => "Terminal",
+            App::Explorer => "File Explorer",
+            App::Notepad => "Notepad",
             App::Paint => "Paint",
             App::Calculator => "Calculator",
             App::Demo => "Graphics",
@@ -114,6 +126,8 @@ impl App {
     fn client_size(self) -> (i32, i32) {
         match self {
             App::Terminal => (terminal::CLIENT_W, terminal::CLIENT_H),
+            App::Explorer => (explorer::CLIENT_W, explorer::CLIENT_H),
+            App::Notepad => (notepad::CLIENT_W, notepad::CLIENT_H),
             App::Paint => (paint::CLIENT_W, paint::CLIENT_H),
             App::Calculator => (calc::CLIENT_W, calc::CLIENT_H),
             App::Demo => (demo::CLIENT_W, demo::CLIENT_H),
@@ -124,6 +138,8 @@ impl App {
     fn default_position(self) -> (i32, i32) {
         match self {
             App::Terminal => (240, 70),
+            App::Explorer => (330, 110),
+            App::Notepad => (520, 170),
             App::Paint => (520, 150),
             App::Calculator => (1440, 90),
             App::Demo => (760, 330),
@@ -141,6 +157,20 @@ pub fn request_open(app: App) -> bool {
 /// Ask the browser to go to an address (the shell's `browser` command).
 pub fn request_address(address: &str) {
     browser::request_address(address);
+}
+
+/// A file for Notepad and a folder for File Explorer, from the shell.
+static FILE_REQUEST: IrqMutex<Option<String>> = IrqMutex::new(None);
+static FOLDER_REQUEST: IrqMutex<Option<String>> = IrqMutex::new(None);
+
+/// Ask Notepad to open a file (the shell's `notepad` command).
+pub fn request_file(path: &str) {
+    *FILE_REQUEST.lock() = Some(String::from(path));
+}
+
+/// Ask File Explorer to show a folder (the shell's `explorer` command).
+pub fn request_folder(path: &str) {
+    *FOLDER_REQUEST.lock() = Some(String::from(path));
 }
 
 /// Ask the desktop to show the lock screen.
@@ -335,7 +365,11 @@ pub struct Desktop<'a> {
     terminal: terminal::Terminal,
     paint: paint::Paint,
     calc: calc::Calc,
-    browser: alloc::boxed::Box<browser::Browser>,
+    browser: Box<browser::Browser>,
+    notepad: Box<notepad::Notepad>,
+    explorer: Box<explorer::Explorer>,
+    /// The window the mouse was last over, for hover highlights.
+    hover_app: Option<App>,
 }
 
 impl<'a> Desktop<'a> {
@@ -417,7 +451,10 @@ impl<'a> Desktop<'a> {
             terminal: terminal::Terminal::new(),
             paint: paint::Paint::new(),
             calc: calc::Calc::new(),
-            browser: alloc::boxed::Box::new(browser::Browser::new()),
+            browser: Box::new(browser::Browser::new()),
+            notepad: Box::new(notepad::Notepad::new()),
+            explorer: Box::new(explorer::Explorer::new()),
+            hover_app: None,
         }
     }
 
@@ -581,10 +618,15 @@ impl<'a> Desktop<'a> {
     fn signed_in(&mut self) {
         self.take_snapshot();
         let user = users::current();
+        if let Some(name) = users::current_name() {
+            fs::ensure_home(name.as_str());
+        }
         if self.session_user != user {
             // someone else: start a fresh session
             self.close_all();
             self.session_user = user;
+            *self.notepad = notepad::Notepad::new();
+            *self.explorer = explorer::Explorer::new();
         }
         self.phase = Phase::Unlocking(Tween::new(0, ONE, anim::ms(450)));
         self.damage(self.screen());
@@ -644,6 +686,58 @@ impl<'a> Desktop<'a> {
         }
     }
 
+    /// An app changed. Notepad and File Explorer show the file or folder
+    /// in the title bar, so their whole window is drawn again.
+    fn app_changed(&mut self, app: App) {
+        match app {
+            App::Notepad | App::Explorer => {
+                self.stale[app.index()] = true;
+                self.damage_window(app);
+            }
+            _ => self.damage_client(app),
+        }
+    }
+
+    /// The text in a window's title bar.
+    fn window_title(&self, app: App) -> String {
+        match app {
+            App::Notepad => self.notepad.title(),
+            App::Explorer => self.explorer.title(),
+            _ => String::from(app.title()),
+        }
+    }
+
+    /// Act on what Notepad and File Explorer ask for, and on files and
+    /// folders the shell asked for.
+    fn poll_apps(&mut self) {
+        if core::mem::take(&mut self.notepad.want_close) {
+            self.close(App::Notepad);
+        }
+        if self.windows[App::Explorer.index()].open && self.explorer.check_changes() {
+            self.app_changed(App::Explorer);
+        }
+        if let Some(path) = self.explorer.open_request.take() {
+            self.open_file(&path);
+        }
+        let file = FILE_REQUEST.lock().take();
+        if let Some(path) = file {
+            self.open_file(&path);
+        }
+        let folder = FOLDER_REQUEST.lock().take();
+        if let Some(path) = folder {
+            self.explorer.show(&path);
+            self.open(App::Explorer);
+            self.app_changed(App::Explorer);
+        }
+    }
+
+    /// Open a file in Notepad.
+    fn open_file(&mut self, path: &str) {
+        self.open(App::Notepad);
+        self.notepad.open_file(path);
+        self.app_changed(App::Notepad);
+    }
+
     // ---- window management ----------------------------------------------
 
     fn open(&mut self, app: App) {
@@ -664,12 +758,22 @@ impl<'a> Desktop<'a> {
         if app == App::Browser {
             self.browser.start();
         }
+        if app == App::Explorer {
+            self.explorer.start();
+            self.stale[app.index()] = true;
+        }
         self.focus(app);
         self.damage_taskbar();
     }
 
     fn close(&mut self, app: App) {
         if !self.windows[app.index()].open {
+            return;
+        }
+        // Notepad first asks about unsaved changes
+        if app == App::Notepad && !self.notepad.try_close() {
+            self.focus(app);
+            self.app_changed(app);
             return;
         }
         self.damage_window(app);
@@ -798,10 +902,13 @@ impl<'a> Desktop<'a> {
             }
             App::Calculator => self.calc.on_key(key),
             App::Browser => self.browser.on_key(key),
+            App::Notepad => self.notepad.on_key(key),
+            App::Explorer => self.explorer.on_key(key),
             App::Paint | App::Demo => false,
         };
         if changed {
-            self.damage_client(app);
+            self.cursor_on = true;
+            self.app_changed(app);
         }
     }
 
@@ -826,12 +933,17 @@ impl<'a> Desktop<'a> {
             y = (ev.y as u64 * self.height as u64 / 65536) as i32;
         }
         self.pointer(x, y);
-        if ev.wheel != 0
-            && matches!(self.phase, Phase::Desktop)
-            && self.window_at(self.mouse_x, self.mouse_y) == Some(App::Browser)
-            && self.browser.on_wheel(ev.wheel)
-        {
-            self.damage_client(App::Browser);
+        if ev.wheel != 0 && matches!(self.phase, Phase::Desktop) {
+            let app = self.window_at(self.mouse_x, self.mouse_y);
+            let changed = match app {
+                Some(App::Browser) => self.browser.on_wheel(ev.wheel),
+                Some(App::Notepad) => self.notepad.on_wheel(ev.wheel),
+                Some(App::Explorer) => self.explorer.on_wheel(ev.wheel),
+                _ => false,
+            };
+            if let Some(app) = app.filter(|_| changed) {
+                self.app_changed(app);
+            }
         }
     }
 
@@ -869,20 +981,41 @@ impl<'a> Desktop<'a> {
             self.press(true);
         } else if moved && (self.left || self.right) {
             self.held_move();
-        } else if moved && self.window_at(self.mouse_x, self.mouse_y) == Some(App::Browser) {
-            // the browser shows where a link goes
-            let client = self.windows[App::Browser.index()].client();
-            if self
-                .browser
-                .on_hover(self.mouse_x - client.x, self.mouse_y - client.y)
-            {
-                self.damage_client(App::Browser);
-            }
+        } else if moved {
+            self.hover_apps();
         }
         if (was_left && !self.left) || (was_right && !self.right) {
             self.release();
         }
         self.update_hover();
+    }
+
+    /// Tell the app under the mouse where it is, so it can light up what
+    /// is under it (the browser shows where a link goes).
+    fn hover_apps(&mut self) {
+        let app = self.window_at(self.mouse_x, self.mouse_y);
+        // the window the mouse left forgets its highlight
+        if let Some(old) = self.hover_app.filter(|&a| Some(a) != app) {
+            if self.app_hover(old, -1000, -1000) {
+                self.app_changed(old);
+            }
+        }
+        self.hover_app = app;
+        if let Some(app) = app {
+            let client = self.windows[app.index()].client();
+            if self.app_hover(app, self.mouse_x - client.x, self.mouse_y - client.y) {
+                self.app_changed(app);
+            }
+        }
+    }
+
+    fn app_hover(&mut self, app: App, x: i32, y: i32) -> bool {
+        match app {
+            App::Browser => self.browser.on_hover(x, y),
+            App::Notepad => self.notepad.on_hover(x, y),
+            App::Explorer => self.explorer.on_hover(x, y),
+            _ => false,
+        }
     }
 
     /// Light up whatever is under the mouse now.
@@ -1055,10 +1188,13 @@ impl<'a> Desktop<'a> {
             App::Paint => self.paint.on_mouse(ev),
             App::Calculator => self.calc.on_mouse(ev),
             App::Browser => self.browser.on_mouse(ev),
+            App::Notepad => self.notepad.on_mouse(ev),
+            App::Explorer => self.explorer.on_mouse(ev),
             App::Terminal | App::Demo => false,
         };
         if changed {
-            self.damage_client(app);
+            self.cursor_on = true;
+            self.app_changed(app);
         }
     }
 
@@ -1279,6 +1415,8 @@ impl<'a> Desktop<'a> {
                     App::Calculator => self.calc.draw(&mut c),
                     App::Demo => demo::draw(&mut c),
                     App::Browser => self.browser.draw(&mut c),
+                    App::Notepad => self.notepad.draw(&mut c, focused && self.cursor_on),
+                    App::Explorer => self.explorer.draw(&mut c, focused && self.cursor_on),
                 }
             }
         }
@@ -1457,7 +1595,8 @@ impl<'a> Desktop<'a> {
         } else {
             theme::TEXT_DIM
         };
-        win.draw_text(r.x + 38, r.y + 8, app.title(), text);
+        let title = self.window_title(app);
+        win.draw_text(r.x + 38, r.y + 8, &title, text);
 
         // caption buttons: flat until the mouse is over them
         let close = Rect::new(r.right() - 46, r.y, 46, TITLE_H);
@@ -1876,6 +2015,7 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
             desk.on_key(Key::LayoutChanged);
         }
         desk.layout = keyboard.layout();
+        desk.poll_apps();
         crate::net::poll();
         if desk.browser.tick() {
             desk.damage_client(App::Browser);
@@ -1894,8 +2034,11 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
             } else if desk.start.open {
                 // the caret in the search box
                 desk.damage(desk.menu_rect());
-            } else if desk.focused == Some(App::Terminal) {
-                desk.damage_client(App::Terminal);
+            } else if let Some(app @ (App::Terminal | App::Notepad | App::Explorer)) = desk.focused
+            {
+                // the text caret blinks
+                desk.stale[app.index()] = true;
+                desk.damage_client(app);
             }
         }
         let second = now / interrupts::TIMER_HZ;
