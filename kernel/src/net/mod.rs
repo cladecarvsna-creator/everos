@@ -82,6 +82,11 @@ pub fn configured() -> bool {
     STACK.lock().as_ref().is_some_and(|s| s.configured)
 }
 
+/// Whether there is a network card, and whether its cable is plugged in.
+pub fn link() -> Option<bool> {
+    STACK.lock().as_ref().map(|s| s.nic.link_up())
+}
+
 /// Our IP address as text, for the status bar.
 pub fn address() -> Option<String> {
     let guard = STACK.lock();

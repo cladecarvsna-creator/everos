@@ -25,6 +25,7 @@ mod start;
 mod terminal;
 mod text;
 mod theme;
+mod tray;
 #[rustfmt::skip]
 mod web_font_data;
 
@@ -36,6 +37,7 @@ use canvas::{fast_mix, mix, rgb, Canvas, Dirty, Rect};
 use icons::{draw_icon, Icons};
 use login::Login;
 use start::StartMenu;
+use tray::{Panel, Tray};
 
 use crate::framebuffer::Framebuffer;
 use crate::interrupts::{self, KEYBOARD_BYTES, MOUSE_BYTES};
@@ -261,6 +263,9 @@ enum Hover {
     Close(App),
     /// A taskbar button: 0 is Start, then the apps.
     Slot(usize),
+    /// A tray button: the layout, quick settings or the clock.
+    Tray(usize),
+    Quick(tray::Target),
 }
 
 pub struct Desktop<'a> {
@@ -292,6 +297,18 @@ pub struct Desktop<'a> {
     /// How far the start menu is open, for its slide.
     menu: Tween,
     menu_moving: bool,
+    tray: Tray,
+    /// The open tray flyout, and the one last shown for its slide.
+    panel: Option<Panel>,
+    panel_shown: Panel,
+    panel_anim: Tween,
+    panel_moving: bool,
+    /// The quick settings slider being dragged.
+    slider: Option<tray::Slider>,
+    /// Asks the main loop to switch the keyboard layout.
+    toggle_layout: bool,
+    /// Copy the whole back buffer to the screen next frame (brightness).
+    present_all: bool,
     phase: Phase,
     login: Login,
     /// Who the open windows belong to.
@@ -306,6 +323,7 @@ pub struct Desktop<'a> {
 
     layout: Layout,
     clock: StackString<16>,
+    date: StackString<16>,
     cursor_on: bool,
     dirty: Dirty,
     snapshot: &'static mut [u32],
@@ -371,6 +389,14 @@ impl<'a> Desktop<'a> {
             start: StartMenu::new(),
             menu: Tween::new(0, 0, 1),
             menu_moving: false,
+            tray: Tray::new(),
+            panel: None,
+            panel_shown: Panel::Quick,
+            panel_anim: Tween::new(0, 0, 1),
+            panel_moving: false,
+            slider: None,
+            toggle_layout: false,
+            present_all: false,
             phase: Phase::Login,
             login,
             session_user: None,
@@ -381,6 +407,7 @@ impl<'a> Desktop<'a> {
             last_click: (0, usize::MAX),
             layout: Layout::Us,
             clock: StackString::new(),
+            date: StackString::new(),
             cursor_on: true,
             dirty: Dirty::default(),
             snapshot: SNAPSHOT.take(),
@@ -481,12 +508,6 @@ impl<'a> Desktop<'a> {
         }
     }
 
-    /// The start menu panel, lower down while it slides in.
-    fn menu_frame(&self) -> (Rect, i32) {
-        let p = self.menu.value();
-        (self.menu_panel().offset(0, (ONE - p) * 48 / ONE), p)
-    }
-
     /// Move every animation on by the time that has passed and mark
     /// what it changes.
     fn tick(&mut self) {
@@ -526,6 +547,12 @@ impl<'a> Desktop<'a> {
         let menu_was_moving = core::mem::replace(&mut self.menu_moving, menu_moving);
         if menu_moving || menu_was_moving || self.start.tick() {
             let r = self.menu_rect();
+            self.damage(r.union(&r.offset(0, 48)));
+        }
+        let panel_moving = !self.panel_anim.done();
+        let panel_was_moving = core::mem::replace(&mut self.panel_moving, panel_moving);
+        if panel_moving || panel_was_moving {
+            let r = self.panel_rect(self.panel_shown).inset(-SPREAD);
             self.damage(r.union(&r.offset(0, 48)));
         }
         if self.hover.tick() {
@@ -572,6 +599,9 @@ impl<'a> Desktop<'a> {
         }
         self.start.open = false;
         self.menu = Tween::new(0, 0, 1);
+        self.panel = None;
+        self.panel_anim = Tween::new(0, 0, 1);
+        self.slider = None;
         self.drag = None;
         self.capture = None;
         self.take_snapshot();
@@ -737,7 +767,14 @@ impl<'a> Desktop<'a> {
         }
         if let Key::LayoutChanged = key {
             self.damage_taskbar();
+            self.damage_panel();
             return;
+        }
+        if self.panel.is_some() {
+            if let Key::Escape = key {
+                self.close_panel();
+                return;
+            }
         }
         if self.start.open {
             match self.start.on_key(key) {
@@ -873,7 +910,19 @@ impl<'a> Desktop<'a> {
         if self.start.open && self.menu_panel().contains(x, y) {
             return None;
         }
+        if let Some(panel) = self.panel {
+            let r = self.panel_rect(panel);
+            if r.contains(x, y) {
+                return match panel {
+                    Panel::Quick => self.tray.target_at(r, x, y).map(Hover::Quick),
+                    Panel::Calendar => None,
+                };
+            }
+        }
         if y >= self.height - TASKBAR_H {
+            if let Some(i) = (0..3).find(|&i| self.tray_rect(i).contains(x, y)) {
+                return Some(Hover::Tray(i));
+            }
             return (0..=APPS.len())
                 .find(|&i| self.slot_rect(i).contains(x, y))
                 .map(Hover::Slot);
@@ -894,6 +943,8 @@ impl<'a> Desktop<'a> {
             Hover::Minimize(app) => self.windows[app.index()].minimize_button(),
             Hover::Close(app) => self.windows[app.index()].close_button(),
             Hover::Slot(i) => self.slot_rect(i),
+            Hover::Tray(i) => self.tray_rect(i),
+            Hover::Quick(_) => self.panel_rect(Panel::Quick),
         }
     }
 
@@ -911,6 +962,21 @@ impl<'a> Desktop<'a> {
             let on_start = self.slot_rect(0).contains(x, y);
             self.close_menu();
             if on_start {
+                return;
+            }
+        }
+        if let Some(panel) = self.panel {
+            let r = self.panel_rect(panel);
+            if r.contains(x, y) {
+                if !right && panel == Panel::Quick {
+                    self.quick_click(r, x, y);
+                }
+                return;
+            }
+            // a click on the button that opened it only closes it
+            let own = self.tray_rect(if panel == Panel::Quick { 1 } else { 2 });
+            self.close_panel();
+            if own.contains(x, y) {
                 return;
             }
         }
@@ -958,7 +1024,9 @@ impl<'a> Desktop<'a> {
     }
 
     fn held_move(&mut self) {
-        if let Some((app, dx, dy)) = self.drag {
+        if let Some(s) = self.slider {
+            self.drag_slider(s);
+        } else if let Some((app, dx, dy)) = self.drag {
             self.move_window(app, self.mouse_x - dx, self.mouse_y - dy);
         } else if let Some(app) = self.capture {
             self.send_mouse(app, MouseKind::Move);
@@ -970,6 +1038,7 @@ impl<'a> Desktop<'a> {
             return;
         }
         self.drag = None;
+        self.slider = None;
         if let Some(app) = self.capture.take() {
             self.send_mouse(app, MouseKind::Up);
         }
@@ -994,6 +1063,15 @@ impl<'a> Desktop<'a> {
     }
 
     fn taskbar_click(&mut self, x: i32, y: i32) {
+        match (0..3).find(|&i| self.tray_rect(i).contains(x, y)) {
+            Some(0) => {
+                self.toggle_layout = true;
+                return;
+            }
+            Some(1) => return self.open_panel(Panel::Quick),
+            Some(_) => return self.open_panel(Panel::Calendar),
+            None => {}
+        }
         let Some(slot) = (0..=APPS.len()).find(|&i| self.slot_rect(i).contains(x, y)) else {
             return;
         };
@@ -1010,7 +1088,93 @@ impl<'a> Desktop<'a> {
         }
     }
 
+    // ---- tray ------------------------------------------------------------------
+
+    /// Tray button `i` from the left: the layout, quick settings, the clock.
+    fn tray_rect(&self, i: usize) -> Rect {
+        let top = self.height - TASKBAR_H + 4;
+        match i {
+            0 => Rect::new(self.width - 240, top, 52, 40),
+            1 => Rect::new(self.width - 184, top, 72, 40),
+            _ => Rect::new(self.width - 108, top, 100, 40),
+        }
+    }
+
+    /// Where a tray flyout sits: above the taskbar, at the right.
+    fn panel_rect(&self, panel: Panel) -> Rect {
+        let (w, h) = panel.size();
+        Rect::new(self.width - 12 - w, self.height - TASKBAR_H - 12 - h, w, h)
+    }
+
+    fn damage_panel(&mut self) {
+        if self.panel.is_some() {
+            self.damage(self.panel_rect(self.panel_shown));
+        }
+    }
+
+    fn open_panel(&mut self, panel: Panel) {
+        self.close_menu();
+        if self.panel.is_some() {
+            self.damage(self.panel_rect(self.panel_shown).inset(-SPREAD));
+        }
+        if self.panel_shown != panel {
+            // a different flyout slides in from the start
+            self.panel_anim = Tween::new(0, 0, 1);
+        }
+        self.panel = Some(panel);
+        self.panel_shown = panel;
+        if panel == Panel::Quick {
+            self.tray.update_net();
+        }
+        self.panel_anim.retarget(ONE, anim::ms(220));
+        self.damage(self.panel_rect(panel).inset(-SPREAD));
+        self.damage_taskbar();
+    }
+
+    fn close_panel(&mut self) {
+        if self.panel.take().is_some() {
+            self.slider = None;
+            self.panel_anim.retarget(0, anim::ms(160));
+            self.damage(self.panel_rect(self.panel_shown).inset(-SPREAD));
+            self.damage_taskbar();
+        }
+    }
+
+    fn quick_click(&mut self, r: Rect, x: i32, y: i32) {
+        match self.tray.target_at(r, x, y) {
+            Some(tray::Target::LayoutTile) => self.toggle_layout = true,
+            Some(tray::Target::NetworkTile) => {
+                // start the network if nothing has yet
+                crate::net::init();
+                self.tray.update_net();
+                self.damage(r);
+            }
+            Some(tray::Target::Slider(s)) => {
+                self.slider = Some(s);
+                self.drag_slider(s);
+            }
+            None => {}
+        }
+    }
+
+    fn drag_slider(&mut self, s: tray::Slider) {
+        let r = self.panel_rect(Panel::Quick);
+        if self.tray.drag(r, s, self.mouse_x) {
+            self.damage(r);
+            if s == tray::Slider::Brightness {
+                self.present_all = true;
+            } else {
+                self.damage_tray();
+            }
+        }
+    }
+
+    fn damage_tray(&mut self) {
+        self.damage(self.tray_rect(0).union(&self.tray_rect(2)));
+    }
+
     fn open_menu(&mut self) {
+        self.close_panel();
         self.start.show();
         self.start
             .set_hover(self.menu_panel(), self.mouse_x, self.mouse_y);
@@ -1072,7 +1236,7 @@ impl<'a> Desktop<'a> {
             Phase::Unlocking(t) | Phase::Locking(t) => Some(t),
             _ => None,
         };
-        if self.dirty.is_empty() && fading.is_none() {
+        if self.dirty.is_empty() && fading.is_none() && !self.present_all {
             return;
         }
         self.update_surfaces();
@@ -1090,12 +1254,14 @@ impl<'a> Desktop<'a> {
         match fading {
             // the old screen over the new one, fading out
             Some(t) => self.present_fade((ONE - t.value()) as u32),
+            None if self.present_all => self.present(self.screen()),
             None => {
                 for r in &rects[..n] {
                     self.present(*r);
                 }
             }
         }
+        self.present_all = false;
     }
 
     /// Bring stale window contents up to date.
@@ -1144,6 +1310,9 @@ impl<'a> Desktop<'a> {
         if self.start.open || self.menu.value() > 0 {
             self.draw_menu(c, scratch);
         }
+        if self.panel.is_some() || self.panel_anim.value() > 0 {
+            self.draw_panel(c, scratch);
+        }
     }
 
     /// Copy part of the back buffer to the screen.
@@ -1152,8 +1321,15 @@ impl<'a> Desktop<'a> {
         let stride = self.width as usize;
         let native = fb.bytes_per_pixel == 4
             && (fb.red.position, fb.green.position, fb.blue.position) == (16, 8, 0);
+        let dim = self.dim();
+        let mut dimmed = [0u32; MAX_W];
         for y in r.y as usize..r.bottom() as usize {
-            let row = &self.back[y * stride + r.x as usize..y * stride + r.right() as usize];
+            let mut row = &self.back[y * stride + r.x as usize..y * stride + r.right() as usize];
+            if dim > 0 {
+                let out = &mut dimmed[..row.len()];
+                fade_row(out, row, &BLACK[..row.len()], dim);
+                row = out;
+            }
             if native {
                 unsafe {
                     let dst = fb.base.add(y * fb.pitch + r.x as usize * 4) as *mut u32;
@@ -1167,6 +1343,11 @@ impl<'a> Desktop<'a> {
         }
     }
 
+    /// How much to darken the picture for the brightness setting, 0 to 256.
+    fn dim(&self) -> u32 {
+        ((100 - self.tray.brightness.clamp(tray::MIN_BRIGHTNESS, 100)) * 256 / 100) as u32
+    }
+
     /// Show the snapshot blended over the back buffer with `alpha` (0 to
     /// 256), for the fade between the sign-in screen and the desktop.
     fn present_fade(&self, alpha: u32) {
@@ -1175,9 +1356,14 @@ impl<'a> Desktop<'a> {
         let native = fb.bytes_per_pixel == 4
             && (fb.red.position, fb.green.position, fb.blue.position) == (16, 8, 0);
         let mut row = [0u32; MAX_W];
+        let dim = self.dim();
         for y in 0..h {
             let (back, snap) = (&self.back[y * w..][..w], &self.snapshot[y * w..][..w]);
             fade_row(&mut row[..w], back, snap, alpha);
+            if dim > 0 {
+                let faded = row;
+                fade_row(&mut row[..w], &faded[..w], &BLACK[..w], dim);
+            }
             if native {
                 unsafe {
                     let dst = fb.base.add(y * fb.pitch) as *mut u32;
@@ -1314,32 +1500,71 @@ impl<'a> Desktop<'a> {
 
     /// The start menu, sliding up and fading in while it opens.
     fn draw_menu(&self, c: &mut Canvas, scratch: &mut [u32]) {
-        let panel = self.menu_panel();
         let blink = self.cursor_on && self.start.open;
-        let (frame, alpha) = self.menu_frame();
-        if alpha >= ONE {
-            self.start.draw(c, panel, &self.icons, blink);
+        self.draw_sliding(c, scratch, self.menu_panel(), self.menu.value(), |c, p| {
+            self.start.draw(c, p, &self.icons, blink)
+        });
+    }
+
+    fn draw_panel(&self, c: &mut Canvas, scratch: &mut [u32]) {
+        let panel = self.panel_shown;
+        let hover = match self.hover.lit()[0] {
+            Some(Hover::Quick(t)) => Some(t),
+            _ => None,
+        };
+        let r = self.panel_rect(panel);
+        let shown = self.panel_anim.value() >= ONE;
+        if shown {
+            // in place: the shadow and frame the sliding version adds
+            c.shadow(r, 8, SPREAD, 4, 120);
+        }
+        self.draw_sliding(c, scratch, r, self.panel_anim.value(), |c, p| {
+            let mut m = c.sub(Rect::new(0, 0, c.width, c.height));
+            m.clip_round(p, 8);
+            if panel == Panel::Quick {
+                self.tray.draw_quick(&mut m, p, self.layout, hover);
+            } else {
+                Tray::draw_calendar(&mut m, p);
+            }
+        });
+        if shown {
+            c.outline_round(r, 8, rgb(0xc8, 0xca, 0xd2));
+        }
+    }
+
+    /// A flyout `panel` that is `p` of the way in (ONE is fully shown):
+    /// lower down and see-through while it slides up from the taskbar.
+    fn draw_sliding(
+        &self,
+        c: &mut Canvas,
+        scratch: &mut [u32],
+        panel: Rect,
+        p: i32,
+        draw: impl Fn(&mut Canvas, Rect),
+    ) {
+        if p >= ONE {
+            draw(c, panel);
             return;
         }
-        let r = self.menu_rect();
-        if !c.visible(r.union(&r.offset(0, 48))) || alpha <= 0 {
+        let r = panel.inset(-SPREAD);
+        if !c.visible(r.union(&r.offset(0, 48))) || p <= 0 {
             return;
         }
+        let frame = panel.offset(0, (ONE - p) * 48 / ONE);
         // it rises from behind the taskbar
         let mut m = c.sub(Rect::new(0, 0, c.width, c.height));
         m.clip_to(Rect::new(0, 0, self.width, self.height - TASKBAR_H));
-        m.shadow(frame, 8, SPREAD, 4, 120 * alpha / ONE);
+        m.shadow(frame, 8, SPREAD, 4, 120 * p / ONE);
         {
             let mut side = Canvas::new(scratch, panel.w as usize, panel.h as usize);
-            let local = Rect::new(0, 0, panel.w, panel.h);
-            self.start.draw(&mut side, local, &self.icons, blink);
+            draw(&mut side, Rect::new(0, 0, panel.w, panel.h));
         }
         {
             let mut inner = m.sub(Rect::new(0, 0, self.width, self.height));
             inner.clip_round(frame, 8);
-            inner.blit_scaled(frame, scratch, panel.w, panel.h, alpha);
+            inner.blit_scaled(frame, scratch, panel.w, panel.h, p);
         }
-        m.outline_round_alpha(frame, 8, rgb(0xc8, 0xca, 0xd2), alpha);
+        m.outline_round_alpha(frame, 8, rgb(0xc8, 0xca, 0xd2), p);
     }
 
     fn draw_taskbar(&self, c: &mut Canvas) {
@@ -1387,11 +1612,34 @@ impl<'a> Desktop<'a> {
             }
         }
 
-        // keyboard layout and clock
-        let clock = Rect::new(self.width - 84, top + 4, 76, 40);
-        c.text_centered(clock, self.clock.as_str(), theme::TEXT);
-        let layout = Rect::new(self.width - 124, top + 12, 34, 24);
-        c.text_centered(layout, self.layout.name(), theme::TEXT);
+        // the tray: layout, network and volume, clock and date
+        for i in 0..3 {
+            let r = self.tray_rect(i);
+            let open = match i {
+                1 => self.panel == Some(Panel::Quick),
+                2 => self.panel == Some(Panel::Calendar),
+                _ => false,
+            };
+            let lit = if open {
+                ONE
+            } else {
+                self.hover.level(Hover::Tray(i))
+            };
+            if lit > 0 {
+                c.fill_round_alpha(r, 5, 0xffffff, 170 * lit / ONE);
+            }
+        }
+        let layout = self.tray_rect(0);
+        c.text_centered(layout, tray::layout_label(self.layout), theme::TEXT);
+        let quick = self.tray_rect(1);
+        let bg = rgb(0xf0, 0xf2, 0xf8);
+        let y = quick.y + 12;
+        tray::network_icon(c, quick.x + 14, y, self.tray.net, theme::TEXT, bg);
+        tray::volume_icon(c, quick.x + 42, y, self.tray.volume, theme::TEXT);
+        let clock = self.tray_rect(2);
+        let line = |i: i32| Rect::new(clock.x, clock.y + 2 + i * 18, clock.w, 18);
+        c.text_centered(line(0), self.clock.as_str(), theme::TEXT);
+        c.text_centered(line(1), self.date.as_str(), theme::TEXT);
     }
 }
 
@@ -1468,6 +1716,9 @@ impl Pointer {
 fn pointer_rect(x: i32, y: i32) -> Rect {
     Rect::new(x, y, POINTER_W as i32, POINTER_H as i32)
 }
+
+/// A row of black, to dim towards.
+static BLACK: [u32; MAX_W] = [0; MAX_W];
 
 /// `out = mix(a, b, alpha)` for a row, two pixels per step: each 64-bit
 /// word holds the red and blue (or green) channels of both, so one
@@ -1588,6 +1839,8 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
     } else {
         "desktop: PS/2 mouse\n"
     });
+    // bring the network up now, so the taskbar can show it
+    crate::net::init();
     let mut next_blink = 0;
     let mut last_second = u64::MAX;
     loop {
@@ -1618,6 +1871,12 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
             }
         }
 
+        if core::mem::take(&mut desk.toggle_layout) {
+            keyboard.toggle_layout();
+            desk.on_key(Key::LayoutChanged);
+        }
+        desk.layout = keyboard.layout();
+        crate::net::poll();
         if desk.browser.tick() {
             desk.damage_client(App::Browser);
         }
@@ -1642,16 +1901,22 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
         let second = now / interrupts::TIMER_HZ;
         if second != last_second {
             last_second = second;
-            let (h, m, s) = rtc::time();
-            desk.clock.clear();
-            let _ = write!(desk.clock, "{:02}:{:02}:{:02}", h, m, s);
+            let (h, m, _) = rtc::time();
+            let (year, month, day) = rtc::date();
+            let mut clock = StackString::<16>::new();
+            let _ = write!(clock, "{:02}:{:02}", h, m);
+            let changed = clock.as_str() != desk.clock.as_str();
+            desk.clock = clock;
+            desk.date.clear();
+            let _ = write!(desk.date, "{:02}.{:02}.{}", day, month, year);
+            let net_changed = desk.tray.update_net();
             if on_desktop {
-                desk.damage(Rect::new(
-                    desk.width - 84,
-                    desk.height - TASKBAR_H,
-                    84,
-                    TASKBAR_H,
-                ));
+                if changed || net_changed {
+                    desk.damage_tray();
+                }
+                if net_changed {
+                    desk.damage_panel();
+                }
             } else {
                 desk.login.update_clock();
             }

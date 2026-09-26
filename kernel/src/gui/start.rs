@@ -52,6 +52,8 @@ enum Target {
     User,
     Lock,
     SignOut,
+    /// The Sign out button in the footer.
+    SignOutButton,
 }
 
 pub struct StartMenu {
@@ -172,6 +174,10 @@ impl StartMenu {
             Target::Power,
             Rect::new(footer.right() - 64, footer.y + 12, 40, 40),
         );
+        push(
+            Target::SignOutButton,
+            Rect::new(footer.right() - 184, footer.y + 12, 112, 40),
+        );
 
         if !self.search.as_str().is_empty() {
             for (i, app) in self.matches().enumerate() {
@@ -263,7 +269,7 @@ impl StartMenu {
             Some(Target::Restart) => Action::Restart,
             Some(Target::ShutDown) => Action::ShutDown,
             Some(Target::Lock) => Action::Lock,
-            Some(Target::SignOut) => Action::SignOut,
+            Some(Target::SignOut | Target::SignOutButton) => Action::SignOut,
             None => Action::None,
         }
     }
@@ -464,6 +470,13 @@ impl StartMenu {
                     if t == Target::Power {
                         power_symbol(c, r.x + 20, r.y + 20, theme::TEXT, bg);
                     }
+                }
+                Target::SignOutButton => {
+                    let bg = mix(rgb(0xec, 0xee, 0xf4), 0xffffff, self.lit(t));
+                    c.fill_round(r, 6, bg);
+                    c.outline_round(r, 6, theme::STROKE);
+                    sign_out_symbol(c, r.x + 22, r.y + 20);
+                    c.draw_text(r.x + 40, r.y + 11, "Sign out", theme::TEXT);
                 }
                 _ => {}
             }
