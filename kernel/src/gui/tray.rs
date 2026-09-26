@@ -54,15 +54,27 @@ impl Net {
 pub enum Panel {
     Quick,
     Calendar,
+    /// The icons behind the ^ button.
+    Hidden,
 }
+
+/// Icons behind the ^ button, in a row.
+pub const HIDDEN_ICONS: i32 = 3;
+const HIDDEN_CELL: i32 = 40;
 
 impl Panel {
     pub fn size(self) -> (i32, i32) {
         match self {
             Panel::Quick => (QUICK_W, QUICK_H),
             Panel::Calendar => (CALENDAR_W, CALENDAR_H),
+            Panel::Hidden => (HIDDEN_ICONS * HIDDEN_CELL + 16, HIDDEN_CELL + 16),
         }
     }
+}
+
+/// Where hidden icon `i` is in its flyout `p`.
+pub fn hidden_icon_rect(p: Rect, i: i32) -> Rect {
+    Rect::new(p.x + 8 + i * HIDDEN_CELL, p.y + 8, HIDDEN_CELL, HIDDEN_CELL)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

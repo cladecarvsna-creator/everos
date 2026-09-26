@@ -10,6 +10,7 @@
 
 pub mod ata;
 mod fat;
+pub mod recycle;
 
 use alloc::string::String;
 use alloc::vec;
@@ -130,8 +131,16 @@ fn with<T>(f: impl FnOnce(&mut fat::Volume) -> Result<T, Error>) -> Result<T, Er
     }
 }
 
-/// What is in a folder: folders first, then files, each by name.
+/// What is in a folder: folders first, then files, each by name. Hidden
+/// system items (see `hidden`) are left out.
 pub fn list(path: &str) -> Result<Vec<Info>, Error> {
+    let mut items = list_all(path)?;
+    items.retain(|i| !hidden(&i.name));
+    Ok(items)
+}
+
+/// Like `list`, hidden items included.
+pub fn list_all(path: &str) -> Result<Vec<Info>, Error> {
     let mut items = with(|v| v.list(path))?;
     items.sort_by(|a, b| {
         b.dir.cmp(&a.dir).then_with(|| {
@@ -164,6 +173,47 @@ pub fn remove(path: &str) -> Result<(), Error> {
 
 pub fn rename(path: &str, new_name: &str) -> Result<(), Error> {
     changed(with(|v| v.rename(path, new_name)))
+}
+
+/// Move a file or folder to a new path, which may be in another folder.
+pub fn move_path(from: &str, to: &str) -> Result<(), Error> {
+    if !exists(from) {
+        return Err(Error::NotFound);
+    }
+    if exists(to) {
+        return Err(Error::Exists);
+    }
+    let inside = to.len() > from.len()
+        && same_name(&to[..from.len()], from)
+        && to.as_bytes()[from.len()] == b'/';
+    if inside {
+        // a folder can't go into itself
+        return Err(Error::BadName);
+    }
+    if same_name(&parent(from), &parent(to)) {
+        return rename(from, file_name(to));
+    }
+    copy_tree(from, to)?;
+    remove(from)
+}
+
+fn copy_tree(from: &str, to: &str) -> Result<(), Error> {
+    if is_dir(from) {
+        create_dir(to)?;
+        for item in list_all(from)? {
+            copy_tree(&join(from, &item.name), &join(to, &item.name))?;
+        }
+        Ok(())
+    } else {
+        write(to, &read(from)?)
+    }
+}
+
+/// Items Explorer and the desktop don't show, like Windows hides them:
+/// system names starting with `$` (the Recycle Bin) and AppData, where
+/// apps keep their settings.
+pub fn hidden(name: &str) -> bool {
+    name.starts_with('$') || same_name(name, "AppData")
 }
 
 pub fn is_dir(path: &str) -> bool {
@@ -269,3 +319,27 @@ EverOS and it will still be here.\r\n\
 \r\n\
 Добро пожаловать в EverOS! Этот текст хранится на диске.\r\n\
 Раскладка переключается Alt+Shift.\r\n";
+
+/// A name in `dir` that is not taken yet: `base`, `base (2)`, ... with
+/// `ext` (like ".txt", or "") after it.
+pub fn unique_name(dir: &str, base: &str, ext: &str) -> String {
+    use core::fmt::Write;
+    for n in 1..1000 {
+        let mut name = String::from(base);
+        if n > 1 {
+            let _ = write!(name, " ({})", n);
+        }
+        name.push_str(ext);
+        if !exists(&join(dir, &name)) {
+            return name;
+        }
+    }
+    String::from(base)
+}
+
+/// Where apps keep a user's settings: `/Users/<name>/AppData`.
+pub fn app_data(user: &str) -> String {
+    let dir = join(&home(user), "AppData");
+    let _ = create_dir(&dir);
+    dir
+}
