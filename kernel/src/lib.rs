@@ -3,32 +3,168 @@
 
 #![no_std]
 
+mod console;
+mod font;
+mod framebuffer;
+mod gfx;
+mod interrupts;
+mod keyboard;
+mod multiboot;
+mod port;
+mod ps2;
 mod serial;
+mod shell;
+mod sync;
 mod vga;
 
+use core::fmt::Write;
 use core::panic::PanicInfo;
 
+use console::{Color, CONSOLE};
+use interrupts::{KEYBOARD_BYTES, MOUSE_BYTES};
+
+/// Cursor blink period in timer ticks.
+const BLINK_TICKS: u64 = interrupts::TIMER_HZ / 2;
+
 #[no_mangle]
-pub extern "C" fn kernel_main(_multiboot_info: usize) -> ! {
-    vga::clear();
-    vga::write_line(0, "EverOS", vga::Color::LightGreen);
-    vga::write_line(1, "Hello from the Rust kernel!", vga::Color::White);
-
+pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     serial::init();
-    serial::write_str("EverOS: kernel started\n");
+    let boot = unsafe { multiboot::parse(multiboot_info) };
+    CONSOLE.lock().init(boot.framebuffer);
 
-    halt()
+    console::print_colored(Color::LightCyan, format_args!("EverOS"));
+    println!(" - a hobby operating system in ASM and Rust");
+    println!();
+
+    interrupts::init();
+    let mouse = ps2::init();
+    interrupts::enable();
+
+    match &boot.framebuffer {
+        Some(fb) => println!("Graphics:  {}x{} framebuffer", fb.width, fb.height),
+        None => println!("Graphics:  none, using VGA text mode"),
+    }
+    println!("Keyboard:  ready (Alt+Shift switches EN/RU)");
+    println!("Mouse:     {}", if mouse { "ready" } else { "not found" });
+    println!("Привет! Кириллица тоже работает.");
+    println!();
+    println!("EverOS: kernel started");
+    println!("Type 'help' for a list of commands.");
+    println!();
+
+    run(&boot)
+}
+
+/// The main loop: handle keys, mouse movement and the cursor blink,
+/// sleeping in between.
+fn run(boot: &multiboot::BootInfo) -> ! {
+    let mut keyboard = keyboard::Keyboard::new();
+    let mut mouse = ps2::MouseDecoder::new();
+    let mut shell = shell::Shell::new();
+    let mut next_blink = 0;
+    let mut last_second = u64::MAX;
+    let mut pointer = CONSOLE.lock().mouse_position();
+    let mut status_dirty = true;
+
+    shell.prompt();
+    loop {
+        while let Some(scancode) = KEYBOARD_BYTES.pop() {
+            if let Some(key) = keyboard.feed(scancode) {
+                if let keyboard::Key::LayoutChanged = key {
+                    status_dirty = true;
+                }
+                shell.on_key(key, boot);
+            }
+        }
+
+        let mut moved = false;
+        while let Some(byte) = MOUSE_BYTES.pop() {
+            if let Some(packet) = mouse.feed(byte) {
+                pointer = CONSOLE.lock().move_mouse(packet.dx, packet.dy);
+                moved |= packet.left || packet.right || packet.dx != 0 || packet.dy != 0;
+            }
+        }
+        status_dirty |= moved;
+
+        let now = interrupts::ticks();
+        if now >= next_blink {
+            CONSOLE.lock().blink();
+            next_blink = now + BLINK_TICKS;
+        }
+        let second = now / interrupts::TIMER_HZ;
+        if second != last_second || status_dirty {
+            last_second = second;
+            status_dirty = false;
+            let mut text = StackString::<64>::new();
+            let _ = write!(
+                text,
+                "{}  x:{:<4} y:{:<4} {}:{:02}:{:02}",
+                keyboard.layout().name(),
+                pointer.0,
+                pointer.1,
+                second / 3600,
+                second / 60 % 60,
+                second % 60
+            );
+            CONSOLE.lock().set_status(text.as_str());
+        }
+
+        interrupts::wait_for_interrupt(|| !KEYBOARD_BYTES.is_empty() || !MOUSE_BYTES.is_empty());
+    }
+}
+
+/// Fixed-size string for formatting without a heap.
+struct StackString<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StackString<N> {
+    fn new() -> Self {
+        Self {
+            buf: [0; N],
+            len: 0,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl<const N: usize> Write for StackString<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let n = bytes.len().min(N - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+        self.len += n;
+        Ok(())
+    }
 }
 
 fn halt() -> ! {
     loop {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+        unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) };
     }
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    serial::write_str("EverOS: kernel panic\n");
-    vga::write_line(24, "KERNEL PANIC", vga::Color::LightRed);
+fn panic(info: &PanicInfo) -> ! {
+    interrupts::disable();
+    // Whoever held the console will never run again.
+    unsafe { CONSOLE.force_unlock() };
+    let mut con = CONSOLE.lock();
+    // start a fresh line before switching colours, so a scroll does not
+    // fill the new line with the panic background
+    con.set_color(Color::LightRed, Color::Black);
+    let _ = writeln!(con);
+    con.set_color(Color::White, Color::Red);
+    let _ = write!(con, " KERNEL PANIC ");
+    con.set_color(Color::LightRed, Color::Black);
+    let _ = writeln!(con, " {}", info.message());
+    if let Some(location) = info.location() {
+        let _ = writeln!(con, " at {}:{}", location.file(), location.line());
+    }
+    let _ = writeln!(con, " The system is halted.");
     halt()
 }

@@ -4,8 +4,22 @@ EverOS — операционная система для x86_64 на ASM и Rus
 
 Загрузчик GRUB (multiboot2) передаёт управление коду на ассемблере, тот
 проверяет процессор, включает страничную память и 64-битный режим (long mode)
-и вызывает ядро на Rust. Сейчас ядро выводит «EverOS» на экран и в
-последовательный порт.
+и вызывает ядро на Rust.
+
+## Что умеет
+
+- **Графика**: GRUB включает режим 1024x768x32, ядро рисует по framebuffer
+  (пиксели, прямоугольники, линии, круги, градиенты). Команда `gfx` показывает демо.
+  Если GRUB не дал графику, ядро работает в текстовом режиме VGA 80x25.
+- **Текст**: `print!`/`println!` с цветами, перенос строк, прокрутка, мигающий
+  курсор. Шрифт Terminus 8x16: латиница, кириллица, рамки. Весь вывод дублируется
+  в последовательный порт.
+- **Прерывания**: IDT, заглушки на ассемблере (`boot/interrupts.asm`), PIC 8259,
+  таймер PIT на 100 Гц. Исключения процессора выводятся как kernel panic.
+- **Клавиатура PS/2**: раскладки EN и RU (переключение Alt+Shift), Shift, Caps Lock, Ctrl.
+- **Мышь PS/2**: указатель мыши поверх текста и графики, координаты в строке состояния.
+- **Оболочка**: команды `help`, `clear`, `echo`, `info`, `colors`, `gfx`, `panic`.
+  Стрелка вверх повторяет прошлую команду, Ctrl+L очищает экран, Ctrl+C сбрасывает строку.
 
 ## Структура
 
@@ -14,10 +28,17 @@ EverOS — операционная система для x86_64 на ASM и Rus
 | `boot/multiboot_header.asm` | заголовок multiboot2 для GRUB |
 | `boot/boot.asm` | 32-битный старт: проверки CPU, таблицы страниц, переход в long mode |
 | `boot/long_mode.asm` | 64-битная точка входа, вызывает `kernel_main` |
+| `boot/interrupts.asm` | точки входа прерываний, вызывают `interrupt_dispatch` в Rust |
 | `kernel/` | ядро на Rust (`no_std`, цель `x86_64-unknown-none`) |
+| `kernel/src/console.rs` | консоль: текст, цвета, прокрутка, курсор, указатель мыши |
+| `kernel/src/framebuffer.rs` | рисование по framebuffer |
+| `kernel/src/interrupts.rs` | IDT, PIC, таймер |
+| `kernel/src/keyboard.rs`, `ps2.rs` | клавиатура и мышь PS/2 |
+| `kernel/src/shell.rs` | оболочка |
+| `fonts/`, `scripts/gen-font.py` | шрифт Terminus и генератор `kernel/src/font_data.rs` |
 | `linker.ld` | скрипт линкера, ядро грузится по адресу 1 МиБ |
 | `iso/boot/grub/grub.cfg` | конфиг GRUB для загрузочного ISO |
-| `scripts/boot-test.sh` | запуск в QEMU без экрана и проверка, что ядро стартовало |
+| `scripts/boot-test.sh` | запуск в QEMU без экрана: проверка старта ядра и ввода с клавиатуры |
 
 ## Что нужно установить
 
@@ -37,10 +58,13 @@ sudo apt install nasm build-essential grub-pc-bin grub-common xorriso mtools qem
 ```sh
 make        # собрать build/everos.iso
 make run    # запустить в окне QEMU
-make test   # загрузить без экрана и проверить вывод ядра
+make test   # загрузить без экрана, проверить старт ядра и ввод с клавиатуры
 make clean  # удалить сборку
 ```
 
+В окне QEMU щёлкните мышью, чтобы QEMU захватил указатель (Ctrl+Alt+G отпускает).
+
 ## Лицензия
 
-MIT, см. [LICENSE](LICENSE).
+MIT, см. [LICENSE](LICENSE). Шрифт Terminus Font (c) Dimitar Toshkov Zhekov,
+SIL Open Font License 1.1, см. [fonts/LICENSE.terminus](fonts/LICENSE.terminus).
