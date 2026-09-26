@@ -6,7 +6,7 @@
 
 use super::anim::{self, Fader, ONE};
 use super::canvas::{mix, rgb, Canvas, Color, Rect};
-use super::icons::{draw_icon, Icons};
+use super::icons::Icons;
 use super::text::{UI, UI_BOLD};
 use super::theme;
 use super::{App, APPS};
@@ -68,13 +68,15 @@ pub struct StartMenu {
 }
 
 /// Apps in alphabetical order, for "All apps".
-const SORTED: [App; 7] = [
+const SORTED: [App; 9] = [
+    App::About,
     App::Browser,
     App::Calculator,
     App::Explorer,
     App::Demo,
     App::Notepad,
     App::Paint,
+    App::Settings,
     App::Terminal,
 ];
 
@@ -422,7 +424,7 @@ impl StartMenu {
                 // pinned apps are in the grid, recent ones below it
                 Target::App(app) if r.y < rec_y => {
                     self.highlight(c, t, r);
-                    draw_icon(c, app, r.x + 24, r.y + 8);
+                    icons.draw_large(c, app, r.x + 24, r.y + 8);
                     c.text_centered(Rect::new(r.x, r.y + 60, r.w, 20), app.title(), theme::TEXT);
                 }
                 Target::App(app) => {

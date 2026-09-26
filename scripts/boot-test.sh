@@ -85,6 +85,8 @@ sign_in
 
 wait_for "desktop: opened Terminal" || fail "the desktop did not start"
 echo "desktop started"
+wait_for "icons: loaded 8 pictures" || fail "the BMP icons did not load"
+echo "BMP icons loaded"
 
 type_keys e c h o spc k e y b o a r d minus o k ret
 wait_for "keyboard-ok" || fail "the shell did not answer typed input"
@@ -128,4 +130,7 @@ wait_for "desktop: opened Terminal" || fail "the desktop did not start again"
 type_keys c a t spc s a v e d dot t x t ret
 wait_for "saved-ok" || fail "the file was gone after restarting"
 echo "files survive a restart"
+type_keys s e t t i n g s ret
+wait_for "desktop: opened Settings" || fail "the shell could not open Settings"
+echo "Settings opens"
 echo "boot test passed"

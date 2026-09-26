@@ -120,6 +120,7 @@ impl Shell {
                 println!("  echo    echo <text> > <file> writes a file");
                 println!("  notepad open Notepad (notepad <file> opens a file)");
                 println!("  explorer open File Explorer (explorer <folder>)");
+                println!("  settings open Settings; 'about' shows About EverOS");
                 println!("  colors  show the text colours");
                 println!("  panic   test the kernel panic screen");
                 println!("Keys: Alt+Shift switches EN/RU, Up recalls the last command.");
@@ -167,6 +168,8 @@ impl Shell {
                 }
                 open(App::Explorer);
             }
+            "settings" => open(App::Settings),
+            "about" | "winver" => open(App::About),
             "info" => info(boot),
             "colors" => colors(),
             "paint" => open(App::Paint),

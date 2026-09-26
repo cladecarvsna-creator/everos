@@ -1,67 +1,337 @@
-//! App icons: drawn at 48 pixels with smooth shapes, and shrunk with
-//! alpha to 24 and 16 pixels for the taskbar, menus and title bars.
+//! App icons. Most come from the 150x150 BMP pictures in
+//! `kernel/assets/icons/`: their white background is made transparent,
+//! they are cropped to the picture and shrunk with alpha to 48, 24 and
+//! 16 pixels. Apps without a picture are drawn with shapes at 48 pixels
+//! and shrunk the same way.
+
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::fmt::Write;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 use super::canvas::{rgb, Canvas, Rect};
 use super::{App, APPS};
+use crate::serial;
 
-/// App icons, shrunk from the 48 pixel drawings, with alpha.
+/// Pictures that are not apps, for File Explorer.
+#[derive(Clone, Copy)]
+pub enum Pic {
+    Computer,
+    Drives,
+}
+
+/// Icon sizes, in pixels.
+pub const LARGE: usize = 48;
+pub const MEDIUM: usize = 24;
+pub const SMALL: usize = 16;
+const SIZES: [usize; 3] = [LARGE, MEDIUM, SMALL];
+
+/// One picture at every size, as alpha << 24 | RGB.
+struct Set([Vec<u32>; 3]);
+
 pub struct Icons {
-    medium: [[u32; 24 * 24]; APPS.len()],
-    small: [[u32; 16 * 16]; APPS.len()],
+    apps: Vec<Set>,
+    pics: [Set; 2],
+}
+
+static ICONS: AtomicPtr<Icons> = AtomicPtr::new(core::ptr::null_mut());
+
+/// The icons, made the first time they are asked for.
+pub fn get() -> &'static Icons {
+    let p = ICONS.load(Ordering::Acquire);
+    if !p.is_null() {
+        return unsafe { &*p };
+    }
+    let p = Box::into_raw(Box::new(Icons::new()));
+    ICONS.store(p, Ordering::Release);
+    unsafe { &*p }
+}
+
+fn bmp(app: App) -> Option<&'static [u8]> {
+    Some(match app {
+        App::Terminal => include_bytes!("../../assets/icons/terminal.bmp"),
+        App::Explorer => include_bytes!("../../assets/icons/explorer.bmp"),
+        App::Notepad => include_bytes!("../../assets/icons/notepad.bmp"),
+        App::Paint => include_bytes!("../../assets/icons/paint.bmp"),
+        App::Settings => include_bytes!("../../assets/icons/settings.bmp"),
+        App::About => include_bytes!("../../assets/icons/about.bmp"),
+        App::Calculator | App::Demo | App::Browser => return None,
+    })
 }
 
 impl Icons {
-    pub fn new() -> Self {
-        let mut icons = Icons {
-            medium: [[0; 24 * 24]; APPS.len()],
-            small: [[0; 16 * 16]; APPS.len()],
+    fn new() -> Self {
+        let mut loaded = 0;
+        let apps = APPS
+            .iter()
+            .map(|&app| match bmp(app).and_then(Picture::from_bmp) {
+                Some(p) => {
+                    loaded += 1;
+                    p.set()
+                }
+                None => {
+                    // pixels left at the marker value are transparent
+                    let mut big = vec![TRANSPARENT; 48 * 48];
+                    draw_icon(&mut Canvas::new(&mut big, 48, 48), app, 0, 0);
+                    Picture::from_drawing(&big, 48).set()
+                }
+            })
+            .collect();
+        let mut pic = |data: &[u8]| match Picture::from_bmp(data) {
+            Some(p) => {
+                loaded += 1;
+                p.set()
+            }
+            None => Set::empty(),
         };
-        for app in APPS {
-            // pixels left at the marker value are transparent
-            let mut big = [TRANSPARENT; 48 * 48];
-            draw_icon(&mut Canvas::new(&mut big, 48, 48), app, 0, 0);
-            shrink(&big, 2, &mut icons.medium[app.index()]);
-            shrink(&big, 3, &mut icons.small[app.index()]);
-        }
-        icons
+        let pics = [
+            pic(include_bytes!("../../assets/icons/computer.bmp")),
+            pic(include_bytes!("../../assets/icons/drives.bmp")),
+        ];
+        // for the boot test
+        let mut line = crate::StackString::<40>::new();
+        let _ = write!(line, "\nicons: loaded {} pictures\n", loaded);
+        serial::write_str(line.as_str());
+        Icons { apps, pics }
+    }
+
+    fn app(&self, app: App, size: usize) -> &[u32] {
+        self.apps[app.index()].get(size)
+    }
+
+    /// Draw an app's icon, `size` pixels square (LARGE, MEDIUM or SMALL).
+    pub fn draw(&self, c: &mut Canvas, app: App, size: usize, x: i32, y: i32) {
+        c.blit_alpha(x, y, size as i32, size as i32, self.app(app, size));
+    }
+
+    pub fn draw_large(&self, c: &mut Canvas, app: App, x: i32, y: i32) {
+        self.draw(c, app, LARGE, x, y);
     }
 
     pub fn draw_medium(&self, c: &mut Canvas, app: App, x: i32, y: i32) {
-        c.blit_alpha(x, y, 24, 24, &self.medium[app.index()]);
+        self.draw(c, app, MEDIUM, x, y);
     }
 
     pub fn draw_small(&self, c: &mut Canvas, app: App, x: i32, y: i32) {
-        c.blit_alpha(x, y, 16, 16, &self.small[app.index()]);
+        self.draw(c, app, SMALL, x, y);
+    }
+
+    pub fn draw_pic(&self, c: &mut Canvas, pic: Pic, size: usize, x: i32, y: i32) {
+        let pixels = self.pics[pic as usize].get(size);
+        c.blit_alpha(x, y, size as i32, size as i32, pixels);
+    }
+}
+
+impl Set {
+    fn empty() -> Self {
+        Set(SIZES.map(|s| vec![0; s * s]))
+    }
+
+    fn get(&self, size: usize) -> &[u32] {
+        let i = SIZES.iter().position(|&s| s == size).unwrap_or(0);
+        &self.0[i]
     }
 }
 
 const TRANSPARENT: u32 = 0xffc8_c8c8;
 
-/// Scale a 48x48 picture down by `k`, averaging the opaque pixels of each
-/// block and turning how many there were into alpha.
-fn shrink(big: &[u32], k: usize, out: &mut [u32]) {
-    let n = 48 / k;
-    for oy in 0..n {
-        for ox in 0..n {
-            let (mut r, mut g, mut b, mut count) = (0, 0, 0, 0);
-            for y in oy * k..oy * k + k {
-                for x in ox * k..ox * k + k {
-                    let p = big[y * 48 + x];
-                    if p != TRANSPARENT {
-                        r += (p >> 16) & 0xff;
-                        g += (p >> 8) & 0xff;
-                        b += p & 0xff;
-                        count += 1;
-                    }
+/// A square picture with straight (not premultiplied) alpha.
+struct Picture {
+    size: usize,
+    /// Red, green, blue and alpha, 0 to 255.
+    pixels: Vec<[u32; 4]>,
+}
+
+impl Picture {
+    fn from_drawing(pixels: &[u32], size: usize) -> Self {
+        let pixels = pixels
+            .iter()
+            .map(|&p| {
+                if p == TRANSPARENT {
+                    [0; 4]
+                } else {
+                    [(p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff, 255]
+                }
+            })
+            .collect();
+        Picture { size, pixels }
+    }
+
+    /// Read an uncompressed 24 or 32 bit BMP. The white around the
+    /// picture becomes transparent, and the soft edge between it and the
+    /// dark outline becomes partly transparent outline.
+    fn from_bmp(data: &[u8]) -> Option<Self> {
+        let u16_at = |o: usize| Some(u16::from_le_bytes(data.get(o..o + 2)?.try_into().ok()?));
+        let u32_at = |o: usize| Some(u32::from_le_bytes(data.get(o..o + 4)?.try_into().ok()?));
+        if data.get(0..2)? != b"BM" {
+            return None;
+        }
+        let offset = u32_at(10)? as usize;
+        let w = u32_at(18)? as i32 as usize;
+        let h_raw = u32_at(22)? as i32;
+        let bpp = u16_at(28)? as usize;
+        let compression = u32_at(30)?;
+        if !(bpp == 24 || bpp == 32) || compression != 0 && compression != 3 || w == 0 {
+            return None;
+        }
+        let h = h_raw.unsigned_abs() as usize;
+        let stride = (w * bpp / 8 + 3) & !3;
+        let mut rgb = vec![[0u32; 3]; w * h];
+        for y in 0..h {
+            // rows are stored bottom up unless the height is negative
+            let row = if h_raw > 0 { h - 1 - y } else { y };
+            let line = data.get(offset + row * stride..offset + row * stride + w * bpp / 8)?;
+            for x in 0..w {
+                let p = &line[x * bpp / 8..];
+                rgb[y * w + x] = [p[2] as u32, p[1] as u32, p[0] as u32];
+            }
+        }
+
+        // flood the near-white background from the border
+        let white = |p: [u32; 3]| p.iter().all(|&c| c >= 245);
+        let mut background = vec![false; w * h];
+        let mut stack = Vec::new();
+        for x in 0..w {
+            stack.push((x, 0));
+            stack.push((x, h - 1));
+        }
+        for y in 0..h {
+            stack.push((0, y));
+            stack.push((w - 1, y));
+        }
+        while let Some((x, y)) = stack.pop() {
+            let i = y * w + x;
+            if background[i] || !white(rgb[i]) {
+                continue;
+            }
+            background[i] = true;
+            if x > 0 {
+                stack.push((x - 1, y));
+            }
+            if x + 1 < w {
+                stack.push((x + 1, y));
+            }
+            if y > 0 {
+                stack.push((x, y - 1));
+            }
+            if y + 1 < h {
+                stack.push((x, y + 1));
+            }
+        }
+
+        // how dark the outline is: the darkest pixel next to the background
+        let near = |x: usize, y: usize, reach: usize| {
+            let (x0, y0) = (x.saturating_sub(reach), y.saturating_sub(reach));
+            let (x1, y1) = ((x + reach).min(w - 1), (y + reach).min(h - 1));
+            (y0..=y1).any(|yy| (x0..=x1).any(|xx| background[yy * w + xx]))
+        };
+        let luma = |p: [u32; 3]| (p[0] * 3 + p[1] * 6 + p[2]) / 10;
+        let mut darkest = 256;
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                if !background[i] && near(x, y, 3) && luma(rgb[i]) < darkest {
+                    darkest = luma(rgb[i]);
                 }
             }
-            out[oy * n + ox] = if count == 0 {
-                0
-            } else {
-                let alpha = count * 255 / (k * k) as u32;
-                alpha << 24 | (r / count) << 16 | (g / count) << 8 | (b / count)
-            };
         }
+
+        // straight alpha; edge pixels are the outline blended with white
+        let mut pixels = vec![[0u32; 4]; w * h];
+        let (mut left, mut top, mut right, mut bottom) = (w, h, 0, 0);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                if background[i] {
+                    continue;
+                }
+                let p = rgb[i];
+                let alpha = if near(x, y, 1) && darkest < 200 {
+                    let a = (255 - luma(p)) * 255 / (255 - darkest);
+                    a.min(255)
+                } else {
+                    255
+                };
+                if alpha == 0 {
+                    continue;
+                }
+                pixels[i] = if alpha == 255 {
+                    [p[0], p[1], p[2], 255]
+                } else {
+                    // take the white back out: p = a * ink + (1 - a) * white
+                    let un = |c: u32| {
+                        let white = (255 - alpha) as i32;
+                        ((c as i32 - white) * 255 / alpha as i32).clamp(0, 255) as u32
+                    };
+                    [un(p[0]), un(p[1]), un(p[2]), alpha]
+                };
+                left = left.min(x);
+                top = top.min(y);
+                right = right.max(x + 1);
+                bottom = bottom.max(y + 1);
+            }
+        }
+        if right <= left {
+            return None;
+        }
+
+        // crop to a square around the picture, with a thin margin
+        let side = (right - left).max(bottom - top);
+        let side = side + side / 24 * 2;
+        let (cx, cy) = ((left + right) / 2, (top + bottom) / 2);
+        let (ox, oy) = (cx as i32 - side as i32 / 2, cy as i32 - side as i32 / 2);
+        let mut square = vec![[0u32; 4]; side * side];
+        for y in 0..side {
+            for x in 0..side {
+                let (sx, sy) = (ox + x as i32, oy + y as i32);
+                if sx >= 0 && sy >= 0 && (sx as usize) < w && (sy as usize) < h {
+                    square[y * side + x] = pixels[sy as usize * w + sx as usize];
+                }
+            }
+        }
+        Some(Picture {
+            size: side,
+            pixels: square,
+        })
+    }
+
+    fn set(&self) -> Set {
+        Set(SIZES.map(|s| self.shrink(s)))
+    }
+
+    /// Shrink to `n` pixels square by averaging the area each new pixel
+    /// covers, weighting colours by alpha so the edges stay clean.
+    fn shrink(&self, n: usize) -> Vec<u32> {
+        let m = self.size;
+        // in units where a source pixel is n wide and a new one m wide
+        let mut out = vec![0u32; n * n];
+        for oy in 0..n {
+            let (y0, y1) = (oy * m, oy * m + m);
+            for ox in 0..n {
+                let (x0, x1) = (ox * m, ox * m + m);
+                let mut sum = [0u64; 4];
+                for sy in y0 / n..y1.div_ceil(n) {
+                    let wy = (y1.min(sy * n + n) - y0.max(sy * n)) as u64;
+                    for sx in x0 / n..x1.div_ceil(n) {
+                        let wx = (x1.min(sx * n + n) - x0.max(sx * n)) as u64;
+                        let p = self.pixels[sy * m + sx];
+                        let wa = wx * wy * p[3] as u64;
+                        sum[0] += p[0] as u64 * wa;
+                        sum[1] += p[1] as u64 * wa;
+                        sum[2] += p[2] as u64 * wa;
+                        sum[3] += wa;
+                    }
+                }
+                if sum[3] == 0 {
+                    continue;
+                }
+                let alpha = sum[3] / (m * m) as u64;
+                let c = |k: usize| (sum[k] / sum[3]) as u32;
+                out[oy * n + ox] = (alpha as u32) << 24 | c(0) << 16 | c(1) << 8 | c(2);
+            }
+        }
+        out
     }
 }
 
@@ -179,5 +449,7 @@ pub fn draw_icon(c: &mut Canvas, app: App, x: i32, y: i32) {
             c.fill_rect(cx - 11, cy + 7, 22, 1, line);
             c.outline_round(tile, 8, rgb(0x0c, 0x40, 0xa0));
         }
+        // these have pictures, so they are never drawn
+        App::Settings | App::About => c.fill_round(tile, 8, rgb(0x80, 0x80, 0x88)),
     }
 }

@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 
 use super::canvas::{mix, rgb, Canvas, Rect};
+use super::icons::{self, Pic, SMALL};
 use super::text::UI;
 use super::theme;
 use super::widgets::{self, FieldEvent, Item, TextField};
@@ -1233,7 +1234,8 @@ impl Explorer {
         // "This PC" above the disk
         let disk = place_rect(n - 1, n);
         c.fill_rect(12, disk.y - 42, SIDE_W - 24, 1, theme::STROKE);
-        c.draw_text(12, disk.y - 30, "This PC", theme::TEXT_DIM);
+        icons::get().draw_pic(c, Pic::Computer, SMALL, 12, disk.y - 30);
+        c.draw_text(38, disk.y - 30, "This PC", theme::TEXT_DIM);
     }
 
     fn draw_files(&mut self, c: &mut Canvas, caret: bool) {
@@ -1369,11 +1371,9 @@ impl Explorer {
     }
 }
 
-/// A grey hard disk, 16 pixels wide.
+/// The disk, 16 pixels square.
 fn drive_icon(c: &mut Canvas, x: i32, y: i32) {
-    c.fill_round(Rect::new(x, y + 2, 16, 11), 2, rgb(0x9a, 0xa0, 0xac));
-    c.fill_round(Rect::new(x + 1, y + 3, 14, 5), 1, rgb(0xd4, 0xd8, 0xe0));
-    c.fill_rect(x + 11, y + 10, 2, 1, rgb(0x40, 0xd0, 0x60));
+    icons::get().draw_pic(c, Pic::Drives, SMALL, x, y);
 }
 
 /// A small house for Home.
