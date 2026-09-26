@@ -2,6 +2,8 @@
 # Boot the ISO in QEMU without a display, wait for the kernel's serial
 # message and the desktop, then type commands on the emulated PS/2
 # keyboard and check that the shell in the terminal window ran them.
+# A small web server on the host checks the network card, TCP/IP and
+# HTTP: the guest reaches the host at 10.0.2.2 through QEMU's user network.
 # Exits 0 if everything works, 1 otherwise.
 set -u
 
@@ -9,10 +11,16 @@ iso="${1:-build/everos.iso}"
 dir="$(mktemp -d)"
 log="$dir/serial.log"
 monitor="$dir/monitor.sock"
-trap 'kill "$qemu" 2> /dev/null; rm -rf "$dir"' EXIT
+trap 'kill "$qemu" "$web" 2> /dev/null; rm -rf "$dir"' EXIT
 
-timeout 60 qemu-system-x86_64 -cdrom "$iso" -display none -serial "file:$log" \
-    -monitor "unix:$monitor,server,nowait" -no-reboot 2> /dev/null &
+mkdir "$dir/www"
+echo '<html><head><title>EverOS test page</title></head><body><h1>It works</h1><a href="/x">x</a></body></html>' \
+    > "$dir/www/index.html"
+python3 -m http.server 8123 --bind 127.0.0.1 --directory "$dir/www" > /dev/null 2>&1 &
+web=$!
+
+timeout 90 qemu-system-x86_64 -cdrom "$iso" -m 256M -display none -serial "file:$log" \
+    -monitor "unix:$monitor,server,nowait" -no-reboot -nic user,model=e1000 2> /dev/null &
 qemu=$!
 
 # wait for a line starting with $1 in the serial log
@@ -53,6 +61,10 @@ echo "desktop started"
 type_keys e c h o spc k e y b o a r d minus o k ret
 wait_for "keyboard-ok" || fail "the shell did not answer typed input"
 echo "keyboard input works"
+
+type_keys f e t c h spc 1 0 dot 0 dot 2 dot 2 shift-semicolon 8 1 2 3 slash ret
+wait_for 'fetch: "EverOS test page"' || fail "the network test page did not load"
+echo "network and HTTP work"
 
 type_keys p a i n t ret
 wait_for "desktop: opened Paint" || fail "the shell could not open Paint"

@@ -59,6 +59,8 @@ pub struct Event {
     /// 0 to 65535 across the screen.
     pub x: u32,
     pub y: u32,
+    /// Wheel clicks, positive when scrolling down.
+    pub wheel: i32,
 }
 
 /// The next queued event, if any.
@@ -71,6 +73,11 @@ pub fn poll() -> Option<Event> {
     if status & 0xffff < 4 {
         return None;
     }
-    let (buttons, x, y, _wheel) = call(DATA, 4);
-    Some(Event { buttons, x, y })
+    let (buttons, x, y, wheel) = call(DATA, 4);
+    Some(Event {
+        buttons,
+        x,
+        y,
+        wheel: wheel as u8 as i8 as i32,
+    })
 }

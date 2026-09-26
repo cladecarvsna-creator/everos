@@ -123,5 +123,27 @@ pub fn draw_icon(c: &mut Canvas, app: App, x: i32, y: i32) {
             c.fill_round(Rect::new(x + 33, y + 31, 6, 6), 3, rgb(0xff, 0x70, 0x70));
             c.outline_round(tile, 8, rgb(0x10, 0x10, 0x30));
         }
+        App::Browser => {
+            // a globe on a blue tile
+            {
+                let mut s = c.sub(Rect::new(0, 0, c.width, c.height));
+                s.clip_round(tile, 8);
+                s.vertical_gradient(tile, rgb(0x3c, 0x9c, 0xff), rgb(0x10, 0x5c, 0xd8));
+            }
+            let (cx, cy) = (x + 24, y + 24);
+            c.fill_round(
+                Rect::new(cx - 14, cy - 14, 28, 28),
+                14,
+                rgb(0xf4, 0xf8, 0xff),
+            );
+            let line = rgb(0x1c, 0x6c, 0xe0);
+            c.outline_round(Rect::new(cx - 14, cy - 14, 28, 28), 14, line);
+            c.outline_round(Rect::new(cx - 6, cy - 14, 12, 28), 6, line);
+            c.fill_rect(cx, cy - 13, 1, 26, line);
+            c.fill_rect(cx - 13, cy, 26, 1, line);
+            c.fill_rect(cx - 11, cy - 7, 22, 1, line);
+            c.fill_rect(cx - 11, cy + 7, 22, 1, line);
+            c.outline_round(tile, 8, rgb(0x0c, 0x40, 0xa0));
+        }
     }
 }

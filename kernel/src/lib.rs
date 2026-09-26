@@ -3,13 +3,18 @@
 
 #![no_std]
 
+extern crate alloc;
+
 mod console;
 mod font;
 mod framebuffer;
 mod gui;
+mod heap;
 mod interrupts;
 mod keyboard;
 mod multiboot;
+mod net;
+mod pci;
 mod port;
 mod ps2;
 mod rtc;
@@ -18,6 +23,7 @@ mod shell;
 mod sync;
 mod vga;
 mod vmmouse;
+mod web;
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
@@ -31,6 +37,7 @@ const BLINK_TICKS: u64 = interrupts::TIMER_HZ / 2;
 #[no_mangle]
 pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     serial::init();
+    heap::init();
     let boot = unsafe { multiboot::parse(multiboot_info) };
     CONSOLE.lock().init(boot.framebuffer);
 

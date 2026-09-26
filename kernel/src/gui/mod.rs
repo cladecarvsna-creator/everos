@@ -6,6 +6,7 @@
 //! the screen, so nothing flickers. Only the area that changed (the
 //! "dirty" rectangle) is redrawn and copied.
 
+mod browser;
 mod calc;
 mod canvas;
 mod demo;
@@ -17,6 +18,8 @@ mod start;
 mod terminal;
 mod text;
 mod theme;
+#[rustfmt::skip]
+mod web_font_data;
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -39,7 +42,7 @@ static BACK_BUFFER: StaticBuffer<{ MAX_W * MAX_H }> = StaticBuffer::new();
 static WALLPAPER: StaticBuffer<{ MAX_W * MAX_H }> = StaticBuffer::new();
 /// Window contents. Each app draws into its own part only when its content
 /// changes, so moving a window just copies pixels.
-static SURFACES: StaticBuffer<{ 4 * 1024 * 1024 }> = StaticBuffer::new();
+static SURFACES: StaticBuffer<{ 6 * 1024 * 1024 }> = StaticBuffer::new();
 
 /// Whether the desktop is running (the shell asks before opening apps).
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -63,9 +66,16 @@ pub enum App {
     Paint,
     Calculator,
     Demo,
+    Browser,
 }
 
-const APPS: [App; 4] = [App::Terminal, App::Paint, App::Calculator, App::Demo];
+const APPS: [App; 5] = [
+    App::Terminal,
+    App::Paint,
+    App::Calculator,
+    App::Demo,
+    App::Browser,
+];
 
 impl App {
     fn index(self) -> usize {
@@ -78,6 +88,7 @@ impl App {
             App::Paint => "Paint",
             App::Calculator => "Calculator",
             App::Demo => "Graphics",
+            App::Browser => "Browser",
         }
     }
 
@@ -87,6 +98,7 @@ impl App {
             App::Paint => (paint::CLIENT_W, paint::CLIENT_H),
             App::Calculator => (calc::CLIENT_W, calc::CLIENT_H),
             App::Demo => (demo::CLIENT_W, demo::CLIENT_H),
+            App::Browser => (browser::CLIENT_W, browser::CLIENT_H),
         }
     }
 
@@ -96,6 +108,7 @@ impl App {
             App::Paint => (520, 150),
             App::Calculator => (1440, 90),
             App::Demo => (760, 330),
+            App::Browser => (200, 40),
         }
     }
 }
@@ -104,6 +117,11 @@ impl App {
 pub fn request_open(app: App) -> bool {
     REQUESTS.push(app.index() as u8);
     ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Ask the browser to go to an address (the shell's `browser` command).
+pub fn request_address(address: &str) {
+    browser::request_address(address);
 }
 
 /// Ask the desktop to close an app's window.
@@ -230,6 +248,7 @@ pub struct Desktop<'a> {
     terminal: terminal::Terminal,
     paint: paint::Paint,
     calc: calc::Calc,
+    browser: alloc::boxed::Box<browser::Browser>,
 }
 
 impl<'a> Desktop<'a> {
@@ -293,6 +312,7 @@ impl<'a> Desktop<'a> {
             terminal: terminal::Terminal::new(),
             paint: paint::Paint::new(),
             calc: calc::Calc::new(),
+            browser: alloc::boxed::Box::new(browser::Browser::new()),
         }
     }
 
@@ -335,6 +355,9 @@ impl<'a> Desktop<'a> {
             self.start.note_opened(app);
         }
         w.minimized = false;
+        if app == App::Browser {
+            self.browser.start();
+        }
         self.focus(app);
         self.damage_taskbar();
     }
@@ -449,6 +472,7 @@ impl<'a> Desktop<'a> {
                 false // the console reports its own changes
             }
             App::Calculator => self.calc.on_key(key),
+            App::Browser => self.browser.on_key(key),
             App::Paint | App::Demo => false,
         };
         if changed {
@@ -477,6 +501,12 @@ impl<'a> Desktop<'a> {
             y = (ev.y as u64 * self.height as u64 / 65536) as i32;
         }
         self.pointer(x, y);
+        if ev.wheel != 0
+            && self.window_at(self.mouse_x, self.mouse_y) == Some(App::Browser)
+            && self.browser.on_wheel(ev.wheel)
+        {
+            self.damage_client(App::Browser);
+        }
     }
 
     /// Move the pointer to a position and handle button changes.
@@ -500,6 +530,15 @@ impl<'a> Desktop<'a> {
             self.press(true);
         } else if moved && (self.left || self.right) {
             self.held_move();
+        } else if moved && self.window_at(self.mouse_x, self.mouse_y) == Some(App::Browser) {
+            // the browser shows where a link goes
+            let client = self.windows[App::Browser.index()].client();
+            if self
+                .browser
+                .on_hover(self.mouse_x - client.x, self.mouse_y - client.y)
+            {
+                self.damage_client(App::Browser);
+            }
         }
         if (was_left && !self.left) || (was_right && !self.right) {
             self.release();
@@ -651,6 +690,7 @@ impl<'a> Desktop<'a> {
         let changed = match app {
             App::Paint => self.paint.on_mouse(ev),
             App::Calculator => self.calc.on_mouse(ev),
+            App::Browser => self.browser.on_mouse(ev),
             App::Terminal | App::Demo => false,
         };
         if changed {
@@ -747,6 +787,7 @@ impl<'a> Desktop<'a> {
                     App::Paint => self.paint.draw(&mut c),
                     App::Calculator => self.calc.draw(&mut c),
                     App::Demo => demo::draw(&mut c),
+                    App::Browser => self.browser.draw(&mut c),
                 }
             }
         }
@@ -1130,6 +1171,9 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
             }
         }
 
+        if desk.browser.tick() {
+            desk.damage_client(App::Browser);
+        }
         if CONSOLE.lock().take_changed() {
             desk.damage_client(App::Terminal);
         }

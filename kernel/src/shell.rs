@@ -104,6 +104,8 @@ impl Shell {
                 println!("  paint   open Paint");
                 println!("  calc    open the calculator");
                 println!("  gfx     graphics demo");
+                println!("  browser open the web browser (browser <address> goes there)");
+                println!("  fetch   download a web page and show its title and links");
                 println!("  exit    close the terminal window");
                 println!("  colors  show the text colours");
                 println!("  panic   test the kernel panic screen");
@@ -116,11 +118,18 @@ impl Shell {
             "paint" => open(App::Paint),
             "calc" => open(App::Calculator),
             "gfx" => open(App::Demo),
+            "browser" | "web" => {
+                if !args.trim().is_empty() {
+                    gui::request_address(args.trim());
+                }
+                open(App::Browser);
+            }
             "exit" => {
                 if !gui::request_close(App::Terminal) {
                     println!("There is no desktop to go back to in text mode.");
                 }
             }
+            "fetch" => fetch(args.trim()),
             "panic" => panic!("panic requested from the shell"),
             _ => console::print_colored(
                 Color::LightRed,
@@ -197,5 +206,42 @@ fn colors() {
         if i % 4 == 3 {
             println!();
         }
+    }
+}
+
+/// Download a page in the terminal: the network test without the browser.
+fn fetch(address: &str) {
+    if address.is_empty() {
+        println!("usage: fetch <address>");
+        return;
+    }
+    if crate::net::init().is_none() {
+        println!("No network card. Start QEMU with -nic user,model=e1000");
+        return;
+    }
+    let Some(url) = crate::web::address_to_url(address) else {
+        println!("bad address: {}", address);
+        return;
+    };
+    println!("Loading {} ...", url);
+    let page = crate::web::load(&url, None);
+    let text: usize = page
+        .doc
+        .items
+        .iter()
+        .map(|i| match i {
+            crate::web::html::Item::Text(t, _) => t.chars().count(),
+            _ => 0,
+        })
+        .sum();
+    // on one line, so the boot test can find it on the serial port
+    println!(
+        "fetch: \"{}\", {} characters of text, {} links",
+        page.doc.title,
+        text,
+        page.doc.links.len()
+    );
+    for link in page.doc.links.iter().take(8) {
+        println!("  {}", link);
     }
 }
