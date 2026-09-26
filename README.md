@@ -102,7 +102,7 @@ CI собирает ISO при каждом изменении в `main` и вы
 3. Запустите в PowerShell из папки с ISO:
 
    ```powershell
-   & "C:\Program Files\qemu\qemu-system-x86_64.exe" -cdrom everos.iso -m 256M -nic user,model=e1000
+   & "C:\Program Files\qemu\qemu-system-x86_64.exe" -cdrom everos.iso -m 512M -nic user,model=e1000
    ```
 
    Или положите рядом с ISO [`run-windows.bat`](scripts/run-windows.bat)

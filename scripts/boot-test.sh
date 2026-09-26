@@ -19,7 +19,7 @@ echo '<html><head><title>EverOS test page</title></head><body><h1>It works</h1><
 python3 -m http.server 8123 --bind 127.0.0.1 --directory "$dir/www" > /dev/null 2>&1 &
 web=$!
 
-timeout 90 qemu-system-x86_64 -cdrom "$iso" -m 256M -display none -serial "file:$log" \
+timeout 90 qemu-system-x86_64 -cdrom "$iso" -m 512M -display none -serial "file:$log" \
     -monitor "unix:$monitor,server,nowait" -no-reboot -nic user,model=e1000 2> /dev/null &
 qemu=$!
 

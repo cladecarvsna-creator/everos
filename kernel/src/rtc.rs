@@ -50,3 +50,48 @@ pub fn time() -> (u8, u8, u8) {
     };
     (h, m, s)
 }
+
+/// Seconds since the Unix epoch, reading the clock as UTC.
+pub fn unix_time() -> i64 {
+    let bcd = |v: u8| ((v & 0x0f) + (v >> 4) * 10) as i64;
+    let binary = read(0x0b) & 0x04 != 0;
+    let field = |r: u8| {
+        let v = read(r);
+        if binary {
+            v as i64
+        } else {
+            bcd(v)
+        }
+    };
+    while updating() {
+        core::hint::spin_loop();
+    }
+    let (year, month, day) = (field(0x09), field(0x08), field(0x07));
+    let (h, m, s) = time();
+    let days = days_from_civil(2000 + year, month, day);
+    days * 86400 + h as i64 * 3600 + m as i64 * 60 + s as i64
+}
+
+/// Days since 1970-01-01 of a date (Howard Hinnant's algorithm).
+pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// The date (year, month 1-12, day) of a day number since 1970-01-01.
+pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 }, m, d)
+}

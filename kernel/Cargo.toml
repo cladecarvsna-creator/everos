@@ -25,3 +25,7 @@ ab_glyph = { version = "0.2.32", default-features = false, features = ["libm"] }
 zune-png = { version = "0.5.2", default-features = false }
 zune-jpeg = { version = "0.5.15", default-features = false }
 zune-core = { version = "0.5.3", default-features = false }
+libm = "0.2"
+
+[build-dependencies]
+cc = "1"
