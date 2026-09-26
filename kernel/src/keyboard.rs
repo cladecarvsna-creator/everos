@@ -1,6 +1,21 @@
 //! Turns PS/2 scancodes (set 1) into keys, with US and Russian layouts.
 //! Alt+Shift switches the layout.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether Shift and Ctrl are held now, for apps that select text with
+/// Shift+arrows or jump by words with Ctrl+arrows.
+static SHIFT: AtomicBool = AtomicBool::new(false);
+static CTRL: AtomicBool = AtomicBool::new(false);
+
+pub fn shift_held() -> bool {
+    SHIFT.load(Ordering::Relaxed)
+}
+
+pub fn ctrl_held() -> bool {
+    CTRL.load(Ordering::Relaxed)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Layout {
     Us,
@@ -35,6 +50,8 @@ pub enum Key {
     Home,
     End,
     Delete,
+    /// F1 to F12.
+    Function(u8),
     /// Alt+Shift switched the layout.
     LayoutChanged,
 }
@@ -130,6 +147,13 @@ impl Keyboard {
     }
 
     pub fn feed(&mut self, scancode: u8) -> Option<Key> {
+        let key = self.decode(scancode);
+        SHIFT.store(self.shift(), Ordering::Relaxed);
+        CTRL.store(self.ctrl, Ordering::Relaxed);
+        key
+    }
+
+    fn decode(&mut self, scancode: u8) -> Option<Key> {
         if scancode == 0xe0 {
             self.extended = true;
             return None;
@@ -193,6 +217,8 @@ impl Keyboard {
             0x0e => return Some(Key::Backspace),
             0x0f => return Some(Key::Char('\t')),
             0x1c => return Some(Key::Enter),
+            0x3b..=0x44 => return Some(Key::Function(code - 0x3a)),
+            0x57 | 0x58 => return Some(Key::Function(code - 0x57 + 11)),
             0x3a => {
                 self.caps_lock = !self.caps_lock;
                 return None;

@@ -1,11 +1,13 @@
 //! A tiny command line: reads keys, echoes them and runs commands.
 
+use alloc::string::String;
+
 use crate::console::{self, Color, CONSOLE};
 use crate::gui::{self, App};
 use crate::interrupts;
 use crate::keyboard::Key;
 use crate::multiboot::BootInfo;
-use crate::{print, println, users};
+use crate::{fs, print, println, users};
 
 const MAX_LINE: usize = 250;
 
@@ -15,6 +17,8 @@ pub struct Shell {
     /// The previous command, recalled with the Up arrow.
     last: [char; MAX_LINE],
     last_len: usize,
+    /// The current folder; empty means the user's home.
+    cwd: String,
 }
 
 impl Shell {
@@ -24,6 +28,7 @@ impl Shell {
             len: 0,
             last: ['\0'; MAX_LINE],
             last_len: 0,
+            cwd: String::new(),
         }
     }
 
@@ -111,12 +116,57 @@ impl Shell {
                 println!("  useradd add a user: useradd <name> [password]");
                 println!("  passwd  set a password: passwd [<name>] <password>");
                 println!("  lock    show the lock screen");
+                println!("  ls      list a folder; cd, pwd, mkdir, rm, cat work with files");
+                println!("  echo    echo <text> > <file> writes a file");
+                println!("  notepad open Notepad (notepad <file> opens a file)");
+                println!("  explorer open File Explorer (explorer <folder>)");
                 println!("  colors  show the text colours");
                 println!("  panic   test the kernel panic screen");
                 println!("Keys: Alt+Shift switches EN/RU, Up recalls the last command.");
             }
             "clear" => CONSOLE.lock().clear(),
-            "echo" => println!("{}", args),
+            "echo" => match args.split_once(" > ") {
+                Some((text, file)) => {
+                    let mut data = String::from(text);
+                    data.push_str("\r\n");
+                    report(fs::write(&self.path(file), data.as_bytes()));
+                }
+                None => println!("{}", args),
+            },
+            "pwd" => println!("{}", fs::display(&self.path(""))),
+            "cd" => {
+                let path = self.path(args);
+                if fs::is_dir(&path) {
+                    self.cwd = path;
+                } else {
+                    error("no such folder");
+                }
+            }
+            "ls" | "dir" => ls(&self.path(args)),
+            "cat" | "type" => match fs::read(&self.path(args)) {
+                Ok(data) => {
+                    let text = String::from_utf8_lossy(&data).replace('\r', "");
+                    print!("{}", text);
+                    if !text.ends_with('\n') {
+                        println!();
+                    }
+                }
+                Err(e) => error(e.message()),
+            },
+            "mkdir" | "md" => report(fs::create_dir(&self.path(args))),
+            "rm" | "del" => report(fs::remove(&self.path(args))),
+            "notepad" => {
+                if !args.trim().is_empty() {
+                    gui::request_file(&self.path(args));
+                }
+                open(App::Notepad);
+            }
+            "explorer" => {
+                if !args.trim().is_empty() {
+                    gui::request_folder(&self.path(args));
+                }
+                open(App::Explorer);
+            }
             "info" => info(boot),
             "colors" => colors(),
             "paint" => open(App::Paint),
@@ -164,6 +214,52 @@ impl Shell {
                 format_args!("unknown command: {} (try 'help')\n", command),
             ),
         }
+    }
+}
+
+impl Shell {
+    /// A path typed in the shell, relative to the current folder.
+    fn path(&self, arg: &str) -> String {
+        let arg = arg.trim();
+        let cwd = if self.cwd.is_empty() {
+            fs::home(users::current_name().unwrap_or_default().as_str())
+        } else {
+            self.cwd.clone()
+        };
+        if arg.starts_with(['/', '\\']) || arg.starts_with("C:") || arg.starts_with("c:") {
+            fs::parse(arg)
+        } else {
+            fs::parse(&fs::join(&cwd, arg))
+        }
+    }
+}
+
+fn report(result: Result<(), fs::Error>) {
+    if let Err(e) = result {
+        error(e.message());
+    }
+}
+
+/// Print a folder like `dir` on Windows.
+fn ls(path: &str) {
+    match fs::list(path) {
+        Ok(items) => {
+            // on one line first, so the boot test can find it
+            println!("ls: {} ({} items)", fs::display(path), items.len());
+            for item in items {
+                let (y, mo, d, h, mi) = item.modified;
+                if item.dir {
+                    print!("{:02}.{:02}.{} {:02}:{:02}  <DIR>      ", d, mo, y, h, mi);
+                } else {
+                    print!(
+                        "{:02}.{:02}.{} {:02}:{:02}  {:>10} ",
+                        d, mo, y, h, mi, item.size
+                    );
+                }
+                println!("{}", item.name);
+            }
+        }
+        Err(e) => error(e.message()),
     }
 }
 

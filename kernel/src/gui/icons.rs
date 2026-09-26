@@ -79,6 +79,40 @@ pub fn draw_icon(c: &mut Canvas, app: App, x: i32, y: i32) {
             c.outline_round(tile, 8, rgb(0x16, 0x18, 0x1e));
             c.draw_text(x + 10, y + 20, ">_", rgb(0xe8, 0xe8, 0xf0));
         }
+        App::Explorer => {
+            // a yellow folder with a blue band, like Windows 11
+            let back = rgb(0xe8, 0xa4, 0x10);
+            let front = rgb(0xff, 0xc8, 0x3c);
+            c.fill_round(Rect::new(x + 3, y + 7, 18, 10), 3, back);
+            c.fill_round(Rect::new(x + 3, y + 10, 42, 30), 4, back);
+            c.fill_round(Rect::new(x + 3, y + 15, 42, 27), 4, front);
+            c.fill_round(Rect::new(x + 3, y + 30, 42, 12), 4, rgb(0x1c, 0x8c, 0xe8));
+            c.fill_rect(x + 3, y + 30, 42, 4, rgb(0x1c, 0x8c, 0xe8));
+            c.fill_rect(x + 6, y + 15, 36, 1, rgb(0xff, 0xe0, 0x90));
+        }
+        App::Notepad => {
+            // a blue notepad with lines and a spiral
+            let page = Rect::new(x + 8, y + 5, 32, 39);
+            c.fill_round(page, 4, rgb(0x2a, 0x7c, 0xe0));
+            c.fill_round(page.inset(3).offset(0, 3), 2, rgb(0xfa, 0xfb, 0xfe));
+            for i in 0..5 {
+                let ly = y + 17 + i * 5;
+                c.fill_rect(
+                    x + 15,
+                    ly,
+                    if i == 4 { 10 } else { 18 },
+                    2,
+                    rgb(0x5c, 0x6c, 0x84),
+                );
+            }
+            for i in 0..4 {
+                c.fill_round(
+                    Rect::new(x + 13 + i * 7, y + 2, 3, 8),
+                    1,
+                    rgb(0x40, 0x44, 0x50),
+                );
+            }
+        }
         App::Paint => {
             c.fill_round(tile, 8, rgb(0xfa, 0xfa, 0xfc));
             c.outline_round(tile, 8, rgb(0xb8, 0xbc, 0xc8));

@@ -5,6 +5,9 @@
 # the terminal window ran them.
 # A small web server on the host checks the network card, TCP/IP and
 # HTTP: the guest reaches the host at 10.0.2.2 through QEMU's user network.
+# A blank disk image checks the disk driver and FAT32: EverOS formats it,
+# the shell writes a file, and after starting QEMU again the file is
+# still there.
 # Exits 0 if everything works, 1 otherwise.
 set -u
 
@@ -12,7 +15,10 @@ iso="${1:-build/everos.iso}"
 dir="$(mktemp -d)"
 log="$dir/serial.log"
 monitor="$dir/monitor.sock"
-trap 'kill "$qemu" "$web" 2> /dev/null; rm -rf "$dir"' EXIT
+disk="$dir/disk.img"
+qemu=""
+trap 'kill $qemu "$web" 2> /dev/null; rm -rf "$dir"' EXIT
+truncate -s 64M "$disk"
 
 mkdir "$dir/www"
 echo '<html><head><title>EverOS test page</title></head><body><h1>It works</h1><a href="/x">x</a></body></html>' \
@@ -20,9 +26,16 @@ echo '<html><head><title>EverOS test page</title></head><body><h1>It works</h1><
 python3 -m http.server 8123 --bind 127.0.0.1 --directory "$dir/www" > /dev/null 2>&1 &
 web=$!
 
-timeout 90 qemu-system-x86_64 -cdrom "$iso" -m 512M -display none -serial "file:$log" \
-    -monitor "unix:$monitor,server,nowait" -no-reboot -nic user,model=e1000 2> /dev/null &
-qemu=$!
+# start QEMU with the disk; the serial log starts empty
+boot() {
+    rm -f "$log" "$monitor"
+    timeout 90 qemu-system-x86_64 -cdrom "$iso" -boot d -m 512M -display none \
+        -serial "file:$log" -monitor "unix:$monitor,server,nowait" -no-reboot \
+        -drive "file=$disk,format=raw,if=ide,index=0,media=disk" \
+        -nic user,model=e1000 2> /dev/null &
+    qemu=$!
+}
+boot
 
 # wait for a line starting with $1 in the serial log
 wait_for() {
@@ -56,13 +69,19 @@ for key in sys.argv[2:]:
 PY
 }
 
-wait_for "login: lock screen" || fail "the lock screen did not show"
-type_keys ret
-wait_for "login: password prompt" || fail "the sign-in panel did not open"
-# root has no password at first
-type_keys ret
-wait_for "login: signed in as root" || fail "could not sign in as root"
-echo "signed in as root"
+sign_in() {
+    wait_for "login: lock screen" || fail "the lock screen did not show"
+    type_keys ret
+    wait_for "login: password prompt" || fail "the sign-in panel did not open"
+    # root has no password at first
+    type_keys ret
+    wait_for "login: signed in as root" || fail "could not sign in as root"
+    echo "signed in as root"
+}
+
+wait_for "fs: formatted a blank disk as FAT32" || fail "the blank disk was not formatted"
+echo "disk formatted"
+sign_in
 
 wait_for "desktop: opened Terminal" || fail "the desktop did not start"
 echo "desktop started"
@@ -75,7 +94,38 @@ type_keys f e t c h spc 1 0 dot 0 dot 2 dot 2 shift-semicolon 8 1 2 3 slash ret
 wait_for 'fetch: "EverOS test page"' || fail "the network test page did not load"
 echo "network and HTTP work"
 
-type_keys p a i n t ret
-wait_for "desktop: opened Paint" || fail "the shell could not open Paint"
-echo "apps open from the shell"
+# write a file on the disk, in root's home folder, and open it in
+# Notepad (which then has the keyboard)
+type_keys e c h o spc s a v e d minus o k spc shift-dot spc s a v e d dot t x t ret
+type_keys n o t e p a d spc s a v e d dot t x t ret
+wait_for "desktop: opened Notepad" || fail "the shell could not open Notepad"
+echo "file written, apps open from the shell"
+
+# start again from the same disk: the file must still be there
+python3 - "$monitor" << 'PY'
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+s.sendall(b"quit\n")
+PY
+wait "$qemu" 2> /dev/null
+if command -v mtype > /dev/null; then
+    mtype -i "$disk@@1M" ::/Users/root/saved.txt | grep -q "saved-ok" \
+        || fail "mtools could not read the file EverOS wrote"
+    echo "mtools reads the file EverOS wrote"
+fi
+if command -v fsck.fat > /dev/null; then
+    part="$dir/part.img"
+    dd if="$disk" of="$part" bs=512 skip=2048 status=none
+    fsck.fat -n "$part" > "$dir/fsck.log" 2>&1 || { cat "$dir/fsck.log"; fail "fsck.fat found errors"; }
+    echo "fsck.fat finds no errors"
+fi
+
+boot
+wait_for "fs: mounted FAT32 disk" || fail "the disk was not mounted again"
+sign_in
+wait_for "desktop: opened Terminal" || fail "the desktop did not start again"
+type_keys c a t spc s a v e d dot t x t ret
+wait_for "saved-ok" || fail "the file was gone after restarting"
+echo "files survive a restart"
 echo "boot test passed"

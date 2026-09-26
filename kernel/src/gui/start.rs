@@ -18,7 +18,7 @@ pub const H: i32 = 540;
 const RADIUS: i32 = 8;
 const FOOTER: i32 = 64;
 const MAX_RECENT: usize = 4;
-const MAX_TARGETS: usize = 12;
+const MAX_TARGETS: usize = 20;
 
 /// What the desktop should do after an event.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -68,13 +68,19 @@ pub struct StartMenu {
 }
 
 /// Apps in alphabetical order, for "All apps".
-const SORTED: [App; 5] = [
+const SORTED: [App; 7] = [
     App::Browser,
     App::Calculator,
+    App::Explorer,
     App::Demo,
+    App::Notepad,
     App::Paint,
     App::Terminal,
 ];
+
+/// Pinned apps in a row, and where "Recommended" starts below them.
+const PINNED_PER_ROW: usize = 6;
+const RECOMMENDED_Y: i32 = 316;
 
 impl StartMenu {
     pub fn new() -> Self {
@@ -195,9 +201,10 @@ impl StartMenu {
                     Rect::new(p.right() - 144, p.y + 80, 112, 28),
                 );
                 for (i, app) in APPS.into_iter().enumerate() {
+                    let (col, row) = ((i % PINNED_PER_ROW) as i32, (i / PINNED_PER_ROW) as i32);
                     push(
                         Target::App(app),
-                        Rect::new(p.x + 32 + i as i32 * 96, p.y + 120, 96, 88),
+                        Rect::new(p.x + 32 + col * 96, p.y + 120 + row * 90, 96, 88),
                     );
                 }
                 for (i, app) in self.recent.into_iter().flatten().enumerate() {
@@ -205,7 +212,12 @@ impl StartMenu {
                     let w = (p.w - 64) / 2;
                     push(
                         Target::App(app),
-                        Rect::new(p.x + 32 + col * w, p.y + 268 + row * 56, w - 8, 52),
+                        Rect::new(
+                            p.x + 32 + col * w,
+                            p.y + RECOMMENDED_Y + 28 + row * 56,
+                            w - 8,
+                            52,
+                        ),
                     );
                 }
             }
@@ -395,7 +407,8 @@ impl StartMenu {
 
     fn draw_pinned(&self, c: &mut Canvas, p: Rect, icons: &Icons) {
         c.draw_text_in(&UI_BOLD, p.x + 56, p.y + 86, "Pinned", theme::TEXT);
-        c.draw_text_in(&UI_BOLD, p.x + 56, p.y + 240, "Recommended", theme::TEXT);
+        let rec_y = p.y + RECOMMENDED_Y;
+        c.draw_text_in(&UI_BOLD, p.x + 56, rec_y, "Recommended", theme::TEXT);
         let (targets, n) = self.targets(p);
         let mut recent = 0;
         for &(t, r) in &targets[..n] {
@@ -407,7 +420,7 @@ impl StartMenu {
                     c.text_centered(r, "All apps  ›", theme::TEXT);
                 }
                 // pinned apps are in the grid, recent ones below it
-                Target::App(app) if r.y < p.y + 240 => {
+                Target::App(app) if r.y < rec_y => {
                     self.highlight(c, t, r);
                     draw_icon(c, app, r.x + 24, r.y + 8);
                     c.text_centered(Rect::new(r.x, r.y + 60, r.w, 20), app.title(), theme::TEXT);
@@ -424,7 +437,7 @@ impl StartMenu {
         }
         if recent == 0 {
             let text = "Apps you open will show up here.";
-            c.draw_text(p.x + 56, p.y + 276, text, theme::TEXT_DIM);
+            c.draw_text(p.x + 56, rec_y + 36, text, theme::TEXT_DIM);
         }
     }
 

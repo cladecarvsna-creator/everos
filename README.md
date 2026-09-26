@@ -51,7 +51,32 @@ EverOS — операционная система для x86_64 на ASM и Rus
   - *Calculator* — кнопки мышью или ввод с клавиатуры (цифры, `+ - * /`, `%`,
     Enter, Backspace, Esc);
   - *Graphics* — демо графики;
-  - *Browser* — веб-браузер EverBrowser (подробнее ниже).
+  - *Browser* — веб-браузер EverBrowser (подробнее ниже);
+  - *Notepad* — блокнот как в Windows 11: меню File и Edit, New, Open,
+    Save, Save as (Ctrl+N, Ctrl+O, Ctrl+S, Ctrl+Shift+S), выделение мышью,
+    Shift+стрелками и двойным щелчком (слово), Cut/Copy/Paste (Ctrl+X/C/V),
+    Undo/Redo (Ctrl+Z/Y), Select all, вставка даты (F5), прокрутка колёсиком
+    и полосами, переход по словам Ctrl+стрелками. Текст на любом языке
+    (раскладка Alt+Shift), файлы сохраняются в UTF-8 с концами строк
+    Windows (CRLF), старые файлы в Windows-1251 тоже открываются. Если
+    закрыть окно с несохранённым текстом, Блокнот спросит, сохранить ли его;
+  - *File Explorer* — проводник как в Windows 11: кнопки «Назад», «Вперёд»,
+    «Вверх», «Обновить», адресная строка из частей пути (щелчок по части
+    переходит туда, по пустому месту — ввод пути), поиск по папке, панель
+    слева (Home, Desktop, Documents, Downloads, Music, Pictures, Local Disk
+    (C:)), вид «Details» (имя, дата, тип, размер) и «Large icons»,
+    создание папок и текстовых файлов, переименование (F2) и удаление (Del,
+    с подтверждением), контекстное меню по правой кнопке. Двойной щелчок
+    открывает папку, а файл — в Блокноте.
+- **Файлы на диске**: драйвер жёсткого диска ATA (IDE, его эмулирует QEMU,
+  VirtualBox и VMware) и файловая система FAT32 с длинными именами (до 255
+  символов, в том числе по-русски). Пустой диск EverOS сама размечает и
+  форматирует при первом запуске (раздел FAT32, как делает Windows), поэтому
+  файлы переживают перезагрузку, а Windows и Linux могут открыть тот же диск.
+  У каждого пользователя своя папка `C:\Users\<имя>` с папками Desktop,
+  Documents, Downloads, Music, Pictures; при первом входе в Documents
+  появляется `Welcome.txt`. Без диска файлы хранятся в памяти до
+  перезагрузки (Проводник и Блокнот об этом предупреждают).
 - **Сеть**: драйвер сетевой карты Intel e1000 (её эмулирует QEMU, VirtualBox,
   VMware), стек TCP/IP [smoltcp](https://github.com/smoltcp-rs/smoltcp),
   DHCP и DNS. В QEMU нужен флаг `-nic user,model=e1000` (он уже есть в
@@ -98,7 +123,10 @@ EverOS — операционная система для x86_64 на ASM и Rus
   `gfx`, `browser [адрес]`, `fetch <адрес>` (скачать страницу и показать её
   заголовок и ссылки), `exit` (закрыть окно терминала), `panic`,
   `whoami`, `users`, `useradd <имя> [пароль]` (только root),
-  `passwd [<имя>] <пароль>`, `lock`.
+  `passwd [<имя>] <пароль>`, `lock`, файлы: `ls` (`dir`), `cd`, `pwd`,
+  `cat` (`type`), `mkdir`, `rm` (`del`), `echo текст > файл`,
+  `notepad [файл]`, `explorer [папка]`. Пути как в Windows (`C:\Users\root`)
+  или через `/`, относительно текущей папки (сначала это домашняя).
   Стрелка вверх повторяет прошлую команду, Ctrl+L очищает экран, Ctrl+C сбрасывает строку.
 
 ## Структура
@@ -126,11 +154,15 @@ EverOS — операционная система для x86_64 на ASM и Rus
 | `kernel/src/web/` | движок браузера: адреса (`url.rs`), HTTP и HTTPS (`http.rs`), DOM (`dom.rs`), CSS (`css.rs`, `style.rs`), раскладка (`layout.rs`), картинки (`image.rs`), страница и мост к JavaScript (`page.rs`, `runtime.js`) |
 | `kernel/src/js/`, `kernel/quickjs/` | движок JavaScript QuickJS (C, собирается clang из `kernel/build.rs`) и маленькая libc для него |
 | `kernel/src/gui/browser.rs` | окно браузера: панель, адресная строка, страница, прокрутка |
+| `kernel/src/fs/` | файлы: драйвер диска ATA (`ata.rs`), FAT32 с длинными именами и форматирование (`fat.rs`), пути и домашние папки (`mod.rs`) |
+| `kernel/src/gui/notepad.rs` | Блокнот |
+| `kernel/src/gui/explorer.rs` | Проводник |
+| `kernel/src/gui/filedialog.rs`, `widgets.rs` | окна Open и Save as; общие части: буфер обмена, поле ввода, меню, сообщения, полосы прокрутки, значки файлов и папок |
 | `fonts/`, `scripts/gen-font.py` | шрифт Terminus и генератор `kernel/src/font_data.rs` |
 | `scripts/gen-aa-font.py` | сглаженные шрифты DejaVu для рабочего стола, генерирует `kernel/src/gui/font_data.rs` (нужен Pillow) |
 | `linker.ld` | скрипт линкера, ядро грузится по адресу 1 МиБ |
 | `iso/boot/grub/grub.cfg` | конфиг GRUB для загрузочного ISO |
-| `scripts/boot-test.sh` | запуск в QEMU без экрана: проверка старта ядра, рабочего стола, ввода с клавиатуры и загрузки страницы по сети |
+| `scripts/boot-test.sh` | запуск в QEMU без экрана: проверка старта ядра, рабочего стола, ввода с клавиатуры, загрузки страницы по сети и того, что файл на диске остаётся после перезапуска |
 
 ## Запуск на Windows (без сборки и без WSL)
 
@@ -145,11 +177,20 @@ CI собирает ISO при каждом изменении в `main` и вы
 3. Запустите в PowerShell из папки с ISO:
 
    ```powershell
-   & "C:\Program Files\qemu\qemu-system-x86_64.exe" -cdrom everos.iso -m 512M -nic user,model=e1000
+   & "C:\Program Files\qemu\qemu-img.exe" create -f vpc -o subformat=fixed everos-disk.vhd 128M
+   & "C:\Program Files\qemu\qemu-system-x86_64.exe" -cdrom everos.iso -boot d -m 512M -nic user,model=e1000 -drive file=everos-disk.vhd,format=vpc,if=ide,index=0,media=disk
    ```
 
-   Или положите рядом с ISO [`run-windows.bat`](scripts/run-windows.bat)
-   (он есть и в релизе) и запустите его двойным щелчком.
+   Первая команда нужна один раз: она создаёт диск `everos-disk.vhd` на
+   128 МБ для файлов. Или положите рядом с ISO
+   [`run-windows.bat`](scripts/run-windows.bat) (он есть и в релизе) и
+   запустите его двойным щелчком: он сам создаст диск, если его ещё нет.
+
+Файлы, сохранённые в EverOS, лежат в `everos-disk.vhd`. Чтобы посмотреть их
+в Windows, закройте EverOS и дважды щёлкните `everos-disk.vhd`: Windows
+подключит его как диск EVEROS с папкой `Users`. Перед следующим запуском
+EverOS извлеките этот диск (правый щелчок → «Извлечь»), иначе QEMU не сможет
+его открыть. Чтобы начать с чистого диска, удалите `everos-disk.vhd`.
 
 Мышь работает сразу, без захвата. Если окно 1920x1080 не помещается на экран,
 нажмите Ctrl+Alt+F для полноэкранного режима.
@@ -174,9 +215,9 @@ sudo apt install nasm build-essential clang grub-pc-bin grub-common xorriso mtoo
 
 ```sh
 make        # собрать build/everos.iso
-make run    # запустить в окне QEMU
-make test   # загрузить без экрана, проверить старт ядра, рабочий стол и ввод с клавиатуры
-make clean  # удалить сборку
+make run    # запустить в окне QEMU с диском build/disk.img для файлов
+make test   # загрузить без экрана, проверить старт ядра, рабочий стол, ввод, сеть и диск
+make clean  # удалить сборку (диск build/disk.img с файлами остаётся)
 ```
 
 Мышь работает сразу, без захвата. Если окно 1920x1080 не помещается на экран,

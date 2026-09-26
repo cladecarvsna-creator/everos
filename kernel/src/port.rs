@@ -39,3 +39,12 @@ pub unsafe fn inl(port: u16) -> u32 {
 pub fn io_wait() {
     unsafe { outb(0x80, 0) };
 }
+
+/// # Safety
+/// Reading some I/O ports has side effects (the ATA data port hands out
+/// the next word of a sector).
+pub unsafe fn inw(port: u16) -> u16 {
+    let value: u16;
+    core::arch::asm!("in ax, dx", out("ax") value, in("dx") port, options(nomem, nostack));
+    value
+}
