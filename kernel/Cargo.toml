@@ -21,3 +21,7 @@ embedded-tls = { version = "0.19", default-features = false }
 embedded-io = "0.7"
 rand_core = { version = "0.6", default-features = false }
 sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+ab_glyph = { version = "0.2.32", default-features = false, features = ["libm"] }
+zune-png = { version = "0.5.2", default-features = false }
+zune-jpeg = { version = "0.5.15", default-features = false }
+zune-core = { version = "0.5.3", default-features = false }
