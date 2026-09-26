@@ -24,6 +24,7 @@ const IDS: [(u16, u16); 4] = [
 ];
 
 const CTRL: usize = 0x0000;
+const REG_STATUS: usize = 0x0008;
 const EERD: usize = 0x0014;
 const IMC: usize = 0x00d8;
 const RCTL: usize = 0x0100;
@@ -46,6 +47,8 @@ const RAH: usize = 0x5404;
 const CTRL_ASDE: u32 = 1 << 5;
 const CTRL_SLU: u32 = 1 << 6;
 const CTRL_RST: u32 = 1 << 26;
+/// Link up, in the device status register.
+const STATUS_LU: u32 = 1 << 1;
 
 const RCTL_EN: u32 = 1 << 1;
 const RCTL_BAM: u32 = 1 << 15;
@@ -151,6 +154,11 @@ impl E1000 {
         nic.read_mac();
         nic.set_up_rings();
         Some(nic)
+    }
+
+    /// Whether a cable is plugged in and the link is up.
+    pub fn link_up(&self) -> bool {
+        self.read(REG_STATUS) & STATUS_LU != 0
     }
 
     fn read(&self, reg: usize) -> u32 {
