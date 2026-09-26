@@ -21,6 +21,7 @@ mod rtc;
 mod serial;
 mod shell;
 mod sync;
+mod users;
 mod vga;
 mod vmmouse;
 mod web;
@@ -38,6 +39,7 @@ const BLINK_TICKS: u64 = interrupts::TIMER_HZ / 2;
 pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     serial::init();
     heap::init();
+    users::init();
     let boot = unsafe { multiboot::parse(multiboot_info) };
     CONSOLE.lock().init(boot.framebuffer);
 
@@ -168,6 +170,12 @@ impl<const N: usize> StackString<N> {
         if let Some(c) = self.as_str().chars().next_back() {
             self.len -= c.len_utf8();
         }
+    }
+}
+
+impl<const N: usize> Default for StackString<N> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
