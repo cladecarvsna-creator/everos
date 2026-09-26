@@ -40,7 +40,31 @@ EverOS — операционная система для x86_64 на ASM и Rus
 | `iso/boot/grub/grub.cfg` | конфиг GRUB для загрузочного ISO |
 | `scripts/boot-test.sh` | запуск в QEMU без экрана: проверка старта ядра и ввода с клавиатуры |
 
-## Что нужно установить
+## Запуск на Windows (без сборки и без WSL)
+
+CI собирает ISO при каждом изменении в `main` и выкладывает его в релизы.
+
+1. Установите QEMU: [qemu.weilnetz.de/w64](https://qemu.weilnetz.de/w64/)
+   (установщик по умолчанию ставит в `C:\Program Files\qemu`) или командой
+   `winget install SoftwareFreedomConservancy.QEMU`.
+2. Скачайте свежий ISO:
+   [everos.iso](https://github.com/cladecarvsna-creator/everos/releases/latest/download/everos.iso)
+   (все сборки: [Releases](https://github.com/cladecarvsna-creator/everos/releases)).
+3. Запустите в PowerShell из папки с ISO:
+
+   ```powershell
+   & "C:\Program Files\qemu\qemu-system-x86_64.exe" -cdrom everos.iso -m 256M
+   ```
+
+   Или положите рядом с ISO [`run-windows.bat`](scripts/run-windows.bat)
+   (он есть и в релизе) и запустите его двойным щелчком.
+
+В окне QEMU щёлкните мышью, чтобы QEMU захватил указатель (Ctrl+Alt+G отпускает).
+Если QEMU не находит `-cdrom`, проверьте, что команда запущена в папке с `everos.iso`.
+
+## Сборка из исходников
+
+### Что нужно установить
 
 - Rust (stable) через [rustup](https://rustup.rs); нужная цель поставится сама из `rust-toolchain.toml`
 - `nasm`, `ld` (binutils), `make`
@@ -53,7 +77,7 @@ EverOS — операционная система для x86_64 на ASM и Rus
 sudo apt install nasm build-essential grub-pc-bin grub-common xorriso mtools qemu-system-x86
 ```
 
-## Сборка и запуск
+### Команды
 
 ```sh
 make        # собрать build/everos.iso
