@@ -78,7 +78,12 @@ pub extern "C" fn abort() -> ! {
 
 #[no_mangle]
 pub unsafe extern "C" fn __everos_assert(expr: *const u8, file: *const u8, line: c_int) -> ! {
-    panic!("QuickJS assertion failed: {} at {}:{}", cstr(expr), cstr(file), line);
+    panic!(
+        "QuickJS assertion failed: {} at {}:{}",
+        cstr(expr),
+        cstr(file),
+        line
+    );
 }
 
 unsafe fn cstr<'a>(p: *const u8) -> &'a str {

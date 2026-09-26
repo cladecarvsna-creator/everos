@@ -12,6 +12,8 @@
 int everos_js_native(const char *op, size_t op_len, int argc, const char **argv, const size_t *lens,
                      char **out, size_t *out_len);
 int everos_js_interrupt(void);
+char *everos_js_resolve_module(const char *base, const char *name);
+char *everos_js_load_module(const char *name, size_t *len);
 
 enum {
     RESULT_UNDEFINED = 0,
@@ -106,6 +108,36 @@ static int interrupt_handler(JSRuntime *rt, void *opaque)
     return everos_js_interrupt();
 }
 
+/* ES modules: Rust resolves the address and downloads the source. */
+static char *module_normalize(JSContext *ctx, const char *base, const char *name, void *opaque)
+{
+    (void)opaque;
+    char *r = everos_js_resolve_module(base, name);
+    if (!r)
+        return js_strdup(ctx, name);
+    char *copy = js_strdup(ctx, r);
+    free(r);
+    return copy;
+}
+
+static JSModuleDef *module_loader(JSContext *ctx, const char *name, void *opaque)
+{
+    size_t len = 0;
+    (void)opaque;
+    char *src = everos_js_load_module(name, &len);
+    if (!src) {
+        JS_ThrowReferenceError(ctx, "could not load module '%s'", name);
+        return NULL;
+    }
+    JSValue f = JS_Eval(ctx, src, len, name, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    free(src);
+    if (JS_IsException(f))
+        return NULL;
+    JSModuleDef *m = JS_VALUE_GET_PTR(f);
+    JS_FreeValue(ctx, f);
+    return m;
+}
+
 JSContext *ejs_new(size_t memory_limit, size_t stack_size)
 {
     JSRuntime *rt = JS_NewRuntime();
@@ -114,6 +146,7 @@ JSContext *ejs_new(size_t memory_limit, size_t stack_size)
     JS_SetMemoryLimit(rt, memory_limit);
     JS_SetMaxStackSize(rt, stack_size);
     JS_SetInterruptHandler(rt, interrupt_handler, NULL);
+    JS_SetModuleLoaderFunc(rt, module_normalize, module_loader, NULL);
     JSContext *ctx = JS_NewContext(rt);
     if (!ctx) {
         JS_FreeRuntime(rt);
@@ -174,24 +207,32 @@ void ejs_run_jobs(JSContext *ctx)
         ;
 }
 
-/* Evaluate a script as global code. Returns 0 on success with the
- * result's text in *out (when out is not NULL), or -1 with the error in
- * *out. *out is malloc'ed; the caller frees it with free(). */
-int ejs_eval(JSContext *ctx, const char *src, size_t len, const char *filename, char **out, size_t *out_len)
+/* Evaluate a script (as global code, or as a module when module is set).
+ * Returns 0 on success with the result's text in *out (when out is not
+ * NULL), or -1 with the error in *out. *out is malloc'ed; the caller
+ * frees it with free(). */
+int ejs_eval(JSContext *ctx, const char *src, size_t len, const char *filename, int module, char **out,
+             size_t *out_len)
 {
     /* QuickJS wants the source terminated */
     char *buf = malloc(len + 1);
     memcpy(buf, src, len);
     buf[len] = 0;
-    JSValue v = JS_Eval(ctx, buf, len, filename, JS_EVAL_TYPE_GLOBAL);
+    JSValue v = JS_Eval(ctx, buf, len, filename, module ? JS_EVAL_TYPE_MODULE : JS_EVAL_TYPE_GLOBAL);
     free(buf);
     int ok = !JS_IsException(v);
     if (!ok)
         v = JS_GetException(ctx);
+    ejs_run_jobs(ctx);
+    if (ok && module && JS_PromiseState(ctx, v) == JS_PROMISE_REJECTED) {
+        JSValue reason = JS_PromiseResult(ctx, v);
+        JS_FreeValue(ctx, v);
+        v = reason;
+        ok = 0;
+    }
     if (out)
         *out = describe(ctx, v, out_len);
     JS_FreeValue(ctx, v);
-    ejs_run_jobs(ctx);
     return ok ? 0 : -1;
 }
 

@@ -10,15 +10,6 @@ pub struct Tag {
     pub attrs: Vec<(String, String)>,
 }
 
-impl Tag {
-    pub fn attr(&self, name: &str) -> Option<&str> {
-        self.attrs
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| v.as_str())
-    }
-}
-
 /// Read a tag starting at `<`. Returns the index after `>` and the tag.
 pub fn read_tag(s: &str, start: usize) -> (usize, Tag) {
     let b = s.as_bytes();

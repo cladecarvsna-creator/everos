@@ -22,7 +22,9 @@ static mut HEAP_MEMORY: HeapMemory = HeapMemory([0; HEAP_SIZE]);
 
 /// Block sizes served from free lists. All are multiples of 16, so every
 /// block is 16-byte aligned.
-const CLASSES: [usize; 16] = [16, 32, 48, 64, 80, 96, 128, 160, 192, 256, 320, 384, 512, 768, 1024, 2048];
+const CLASSES: [usize; 16] = [
+    16, 32, 48, 64, 80, 96, 128, 160, 192, 256, 320, 384, 512, 768, 1024, 2048,
+];
 /// Small blocks are carved out of chunks this big.
 const CHUNK: usize = 64 * 1024;
 
@@ -52,7 +54,10 @@ impl Allocator {
     unsafe fn alloc_small(&mut self, class: usize) -> *mut u8 {
         if self.free[class].is_null() {
             let size = CLASSES[class];
-            let Ok(chunk) = self.big.allocate_first_fit(Layout::from_size_align_unchecked(CHUNK, 16)) else {
+            let Ok(chunk) = self
+                .big
+                .allocate_first_fit(Layout::from_size_align_unchecked(CHUNK, 16))
+            else {
                 return null_mut();
             };
             let base = chunk.as_ptr();
@@ -60,7 +65,11 @@ impl Allocator {
             let n = CHUNK / size;
             for i in 0..n {
                 let block = base.add(i * size);
-                let next = if i + 1 < n { base.add((i + 1) * size) } else { null_mut() };
+                let next = if i + 1 < n {
+                    base.add((i + 1) * size)
+                } else {
+                    null_mut()
+                };
                 *(block as *mut *mut u8) = next;
             }
             self.free[class] = base;
@@ -76,7 +85,10 @@ unsafe impl GlobalAlloc for KernelHeap {
         let mut a = self.0.lock();
         match class_of(&layout) {
             Some(class) => a.alloc_small(class),
-            None => a.big.allocate_first_fit(layout).map_or(null_mut(), |p| p.as_ptr()),
+            None => a
+                .big
+                .allocate_first_fit(layout)
+                .map_or(null_mut(), |p| p.as_ptr()),
         }
     }
 
@@ -97,9 +109,4 @@ pub fn init() {
         let start = addr_of_mut!(HEAP_MEMORY.0) as *mut u8;
         ALLOCATOR.0.lock().big.init(start, HEAP_SIZE);
     }
-}
-
-/// Bytes still free in the big heap (small-block free lists not counted).
-pub fn free_bytes() -> usize {
-    ALLOCATOR.0.lock().big.free()
 }

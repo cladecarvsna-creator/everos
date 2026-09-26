@@ -132,6 +132,11 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// The area that can be drawn on, in this view's coordinates.
+    pub fn clip_rect(&self) -> Rect {
+        self.clip.offset(-self.ox, -self.oy)
+    }
+
     /// Limit drawing to `r` (in this view's coordinates) as well.
     pub fn clip_to(&mut self, r: Rect) {
         self.clip = self.clip.intersect(&r.offset(self.ox, self.oy));

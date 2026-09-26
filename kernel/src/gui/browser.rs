@@ -8,46 +8,30 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use super::canvas::{mix, rgb, Canvas, Color, Rect};
-use super::text::{Font, MONO, TITLE, UI};
+use super::text::UI;
 use super::theme;
-use super::web_font_data::{H1, H2, PAGE, PAGE_BOLD};
+use super::webfont;
 use super::{MouseEvent, MouseKind};
 use crate::keyboard::Key;
 use crate::sync::IrqMutex;
-use crate::web::html::Style;
-use crate::web::layout::{self, Layout, Metrics, RunKind};
-use crate::web::url::{self, Url};
-use crate::web::{self, Page};
+use crate::web::dom::NodeId;
+use crate::web::layout::{self, Control, Item};
+use crate::web::{self, Nav, Page};
 use crate::{interrupts, net};
 
-pub const CLIENT_W: i32 = 1280;
-pub const CLIENT_H: i32 = 840;
+pub const CLIENT_W: i32 = 1500;
+pub const CLIENT_H: i32 = 900;
 
 const TOOLBAR_H: i32 = 48;
 const STATUS_H: i32 = 26;
 const SCROLLBAR_W: i32 = 12;
-const PAD_X: i32 = 24;
-const PAD_Y: i32 = 14;
 const BUTTON: i32 = 34;
-
-const PAGE_BG: Color = rgb(0xff, 0xff, 0xff);
-const LINK: Color = rgb(0x1a, 0x0d, 0xab);
-const TEXT: Color = rgb(0x20, 0x21, 0x24);
-const FAINT: Color = rgb(0x5f, 0x63, 0x68);
-const HEADING: Color = rgb(0x10, 0x10, 0x14);
-
-#[derive(Clone)]
-enum Nav {
-    Home,
-    Get(Url),
-    Post(Url, String),
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Page,
     Address,
-    Field(u32, u32),
+    Field(NodeId),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -63,7 +47,6 @@ enum Pressed {
 
 pub struct Browser {
     page: Page,
-    layout: Layout,
     scroll: i32,
     history: Vec<Nav>,
     current: Option<Nav>,
@@ -74,6 +57,8 @@ pub struct Browser {
     /// The whole text is selected; typing replaces it.
     select_all: bool,
     focus: Focus,
+    /// The text of the focused form field.
+    field_text: String,
     pressed: Pressed,
     status: String,
     /// Where the link under the mouse goes.
@@ -86,77 +71,6 @@ static REQUESTED: IrqMutex<Option<String>> = IrqMutex::new(None);
 
 pub fn request_address(address: &str) {
     *REQUESTED.lock() = Some(address.to_string());
-}
-
-struct TextMetrics;
-
-/// The font for a page style.
-fn font_for(style: Style) -> &'static Font {
-    match style.heading {
-        1 => &H1,
-        2 => &H2,
-        3 => &TITLE,
-        4..=6 => &PAGE_BOLD,
-        _ if style.mono => &MONO,
-        _ if style.bold => &PAGE_BOLD,
-        _ => &PAGE,
-    }
-}
-
-impl Metrics for TextMetrics {
-    fn text_width(&self, text: &str, style: Style) -> i32 {
-        let f = font_for(style);
-        let sixteenths: i32 = text
-            .chars()
-            .map(|c| f.advance16(substitute(c)) as i32)
-            .sum();
-        (sixteenths + 8) / 16
-    }
-
-    fn line_height(&self, style: Style) -> i32 {
-        font_for(style).line_height + if style.heading > 0 { 8 } else { 6 }
-    }
-}
-
-/// Characters the fonts lack, replaced by ones that look alike.
-fn substitute(c: char) -> char {
-    match c {
-        '\u{a0}' | '\u{2009}' | '\u{202f}' | '\u{2002}' | '\u{2003}' | '\t' => ' ',
-        '\u{ad}' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{200e}' | '\u{200f}' | '\u{feff}' => {
-            '\u{200b}'
-        }
-        '′' => '\'',
-        '″' => '"',
-        '‒' | '―' | '‐' => '-',
-        '∙' | '●' => '•',
-        '✓' | '✔' => 'v',
-        c => c,
-    }
-}
-
-/// Draw text in a page style. Returns the width.
-fn draw_styled(c: &mut Canvas, x: i32, y: i32, text: &str, style: Style, color: Color) -> i32 {
-    let f = font_for(style);
-    let mut pen = x * 16;
-    for ch in text.chars() {
-        let ch = substitute(ch);
-        if ch == '\u{200b}' {
-            continue;
-        }
-        let shown = if f.glyph(ch).is_some() { ch } else { '?' };
-        if ch != ' ' {
-            c.draw_glyph(f, (pen + 8) / 16, y, shown, color);
-            if style.bold && core::ptr::eq(f, &MONO) {
-                c.draw_glyph(f, (pen + 8) / 16 + 1, y, shown, color);
-            }
-        }
-        pen += f.advance16(ch) as i32;
-    }
-    let w = (pen + 8) / 16 - x;
-    if style.underline || style.link.is_some() {
-        c.fill_rect(x, y + f.line_height * 13 / 16, w, 1, color);
-    }
-    w
 }
 
 /// An anti-aliased line `width` pixels thick, for toolbar icons.
@@ -223,17 +137,21 @@ fn scrollbar_rect() -> Rect {
     )
 }
 
-fn page_width() -> i32 {
-    content_rect().w - 2 * PAD_X
+/// The page's viewport: the content area.
+fn viewport() -> (i32, i32) {
+    (content_rect().w, content_rect().h)
+}
+
+/// A web colour (0xAARRGGBB) as a desktop colour and its opacity (0 to 256).
+fn web_color(c: u32) -> (Color, i32) {
+    let a = (c >> 24) as i32;
+    (c & 0xff_ffff, if a >= 255 { 256 } else { a })
 }
 
 impl Browser {
     pub fn new() -> Self {
-        let page = web::home();
-        let layout = layout::layout(&page.doc, page_width(), &TextMetrics);
         Browser {
-            page,
-            layout,
+            page: web::home(viewport()),
             scroll: 0,
             history: Vec::new(),
             current: Some(Nav::Home),
@@ -242,6 +160,7 @@ impl Browser {
             cursor: 0,
             select_all: false,
             focus: Focus::Address,
+            field_text: String::new(),
             pressed: Pressed::None,
             status: String::new(),
             hover: None,
@@ -282,11 +201,45 @@ impl Browser {
             self.load(nav);
             return true;
         }
+        let mut redraw = false;
+        if self.page.run_timers(false) {
+            self.after_script();
+            redraw |= self.page.update();
+        }
+        if self.pending.is_none() && self.page.images_pending() > 0 {
+            self.page.load_next_image();
+            if self.page.images_pending() == 0 || self.page.images.len().is_multiple_of(4) {
+                redraw |= self.page.update();
+                self.scroll = self.scroll.clamp(0, self.max_scroll());
+            }
+        }
         if self.status.starts_with("Network card") && net::configured() {
             self.status = alloc::format!("Online, address {}", net::address().unwrap_or_default());
             return true;
         }
-        false
+        redraw
+    }
+
+    /// Act on what a script asked for: going somewhere, back, scrolling.
+    fn after_script(&mut self) {
+        if let Some(nav) = self.page.st.nav.take() {
+            self.navigate(nav);
+        }
+        if core::mem::take(&mut self.page.st.back) {
+            self.back();
+        }
+        self.page.update();
+        if let Some(n) = self.page.st.scroll_to.take() {
+            if let Some(y) = self.page.element_top(n) {
+                self.scroll = y.clamp(0, self.max_scroll());
+            }
+        }
+        // the address follows history.pushState
+        if self.focus != Focus::Address && self.pending.is_none() {
+            if let Some(u) = &self.page.url {
+                self.address = u.to_string();
+            }
+        }
     }
 
     fn navigate(&mut self, nav: Nav) {
@@ -304,9 +257,9 @@ impl Browser {
     fn load(&mut self, nav: Nav) {
         let started = interrupts::ticks();
         let page = match &nav {
-            Nav::Home => web::home(),
-            Nav::Get(u) => web::load(u, None),
-            Nav::Post(u, body) => web::load(u, Some(body)),
+            Nav::Home => web::home(viewport()),
+            Nav::Get(u) => web::load(u, None, viewport(), true),
+            Nav::Post(u, body) => web::load(u, Some(body), viewport(), true),
         };
         if let Some(prev) = self.current.take() {
             if self.history.len() >= 64 {
@@ -323,6 +276,8 @@ impl Browser {
         self.set_page(page);
         let secs = (interrupts::ticks() - started) as f32 / interrupts::TIMER_HZ as f32;
         self.status = alloc::format!("Done in {}.{} s", secs as u32, (secs * 10.0) as u32 % 10);
+        // a script may have moved on straight away
+        self.after_script();
     }
 
     fn set_page(&mut self, page: Page) {
@@ -330,7 +285,6 @@ impl Browser {
             Some(u) => u.to_string(),
             None => String::new(),
         };
-        self.layout = layout::layout(&page.doc, page_width(), &TextMetrics);
         self.page = page;
         self.scroll = 0;
         self.hover = None;
@@ -355,61 +309,8 @@ impl Browser {
         }
     }
 
-    fn follow(&mut self, link: u32) {
-        let Some(href) = self.page.doc.links.get(link as usize).cloned() else {
-            return;
-        };
-        if href.trim().eq_ignore_ascii_case(web::HOME) {
-            self.navigate(Nav::Home);
-            return;
-        }
-        if let Some(fragment) = href.trim().strip_prefix('#') {
-            // same page: just go to the top when we can't find the anchor
-            let _ = fragment;
-            self.scroll = 0;
-            return;
-        }
-        match self.page.resolve(&href) {
-            Some(u) => self.navigate(Nav::Get(u)),
-            None => self.status = alloc::format!("Can't open {}", href),
-        }
-    }
-
-    fn submit(&mut self, form: u32) {
-        let Some(f) = self.page.doc.forms.get(form as usize) else {
-            return;
-        };
-        let mut query = String::new();
-        for field in &f.fields {
-            if field.name.is_empty() {
-                continue;
-            }
-            if !query.is_empty() {
-                query.push('&');
-            }
-            query.push_str(&url::encode_query(&field.name));
-            query.push('=');
-            query.push_str(&url::encode_query(&field.value));
-        }
-        let action = if f.action.is_empty() {
-            self.page.address()
-        } else {
-            f.action.clone()
-        };
-        let Some(mut target) = self.page.resolve(&action) else {
-            return;
-        };
-        if f.post {
-            self.navigate(Nav::Post(target, query));
-        } else {
-            let base = target.path.split('?').next().unwrap_or("/").to_string();
-            target.path = alloc::format!("{}?{}", base, query);
-            self.navigate(Nav::Get(target));
-        }
-    }
-
     fn max_scroll(&self) -> i32 {
-        (self.layout.height + 2 * PAD_Y - content_rect().h).max(0)
+        (self.page.layout.height - content_rect().h).max(0)
     }
 
     fn scroll_by(&mut self, dy: i32) -> bool {
@@ -423,13 +324,7 @@ impl Browser {
     fn edit_text(&mut self) -> Option<&mut String> {
         match self.focus {
             Focus::Address => Some(&mut self.address),
-            Focus::Field(form, field) => self
-                .page
-                .doc
-                .forms
-                .get_mut(form as usize)
-                .and_then(|f| f.fields.get_mut(field as usize))
-                .map(|f| &mut f.value),
+            Focus::Field(_) => Some(&mut self.field_text),
             Focus::Page => None,
         }
     }
@@ -493,7 +388,15 @@ impl Browser {
                             self.navigate(Nav::Get(u));
                         }
                     }
-                    Focus::Field(form, _) => self.submit(form),
+                    Focus::Field(n) => {
+                        if let Some(form) = self.page.form_of(n) {
+                            let nav = self.page.submit(form, None);
+                            if let Some(nav) = nav {
+                                self.navigate(nav);
+                            }
+                        }
+                        self.after_script();
+                    }
                     Focus::Page => {}
                 }
                 return true;
@@ -513,12 +416,30 @@ impl Browser {
             _ => return false,
         }
         self.cursor = cursor;
+        if let Focus::Field(n) = self.focus {
+            let value = self.field_text.clone();
+            self.page.set_field(n, &value);
+            self.after_script();
+        }
         true
     }
 
     pub fn on_key(&mut self, key: Key) -> bool {
         if self.focus != Focus::Page {
             return self.edit_key(key);
+        }
+        let name = match key {
+            Key::Up => "ArrowUp",
+            Key::Down => "ArrowDown",
+            Key::Left => "ArrowLeft",
+            Key::Right => "ArrowRight",
+            Key::Enter => "Enter",
+            Key::Escape => "Escape",
+            _ => "",
+        };
+        if !name.is_empty() && !self.page.key_event(None, name) {
+            self.after_script();
+            return true;
         }
         let page = content_rect().h - 40;
         match key {
@@ -602,14 +523,13 @@ impl Browser {
         let area = content_rect();
         let mut hover = None;
         if area.contains(x, y) {
-            let px = x - area.x - PAD_X;
-            let py = y - area.y - PAD_Y + self.scroll;
-            if let Some(link) = self.layout.run_at(px, py).and_then(|r| r.style.link) {
-                let href = &self.page.doc.links[link as usize];
-                hover = Some(match self.page.resolve(href) {
-                    Some(u) => u.to_string(),
-                    None => href.clone(),
-                });
+            let (px, py) = (x - area.x, y - area.y + self.scroll);
+            if let Some(a) = self
+                .page
+                .element_at(px, py)
+                .and_then(|n| self.page.link_of(n))
+            {
+                hover = self.page.link_target(a);
             }
         }
         if hover != self.hover {
@@ -622,7 +542,7 @@ impl Browser {
     /// Top and height of the scroll bar thumb.
     fn thumb(&self) -> (i32, i32) {
         let track = scrollbar_rect();
-        let total = self.layout.height + 2 * PAD_Y;
+        let total = self.page.layout.height;
         let view = content_rect().h;
         if total <= view {
             return (track.y, track.h);
@@ -670,34 +590,49 @@ impl Browser {
             return true;
         }
         if hit(content_rect()) {
-            let px = x - content_rect().x - PAD_X;
-            let py = y - content_rect().y - PAD_Y + self.scroll;
-            let run = self.layout.run_at(px, py).cloned();
-            let was_editing = self.focus != Focus::Page;
+            let area = content_rect();
+            let (px, py) = (x - area.x, y - area.y + self.scroll);
             self.focus = Focus::Page;
-            if let Some(run) = run {
-                match run.kind {
-                    RunKind::Input(form, field) => {
-                        self.focus = Focus::Field(form, field);
-                        self.select_all = false;
-                        self.cursor = self.page.doc.forms[form as usize].fields[field as usize]
-                            .value
-                            .chars()
-                            .count();
-                        return true;
-                    }
-                    RunKind::Button(form, _) => {
-                        self.submit(form);
-                        return true;
-                    }
-                    _ => {}
-                }
-                if let Some(link) = run.style.link {
-                    self.follow(link);
-                    return true;
+            let Some(node) = self.page.element_at(px, py) else {
+                return true;
+            };
+            // a text field takes the focus
+            let tag = self.page.dom.tag(node).to_string();
+            let ty = self
+                .page
+                .dom
+                .attr(node, "type")
+                .unwrap_or("text")
+                .to_ascii_lowercase();
+            let is_field = tag == "textarea"
+                || tag == "input"
+                    && !matches!(
+                        ty.as_str(),
+                        "submit"
+                            | "button"
+                            | "reset"
+                            | "checkbox"
+                            | "radio"
+                            | "image"
+                            | "hidden"
+                            | "file"
+                    );
+            self.page.dispatch(node, "mousedown", px, py);
+            self.page.dispatch(node, "mouseup", px, py);
+            if is_field {
+                self.focus = Focus::Field(node);
+                self.field_text = self.page.field_value(node);
+                self.cursor = self.field_text.chars().count();
+                self.select_all = false;
+                self.page.dispatch(node, "focus", px, py);
+            }
+            if self.page.dispatch(node, "click", px, py) {
+                if let Some(nav) = self.page.default_action(node) {
+                    self.navigate(nav);
                 }
             }
-            return was_editing;
+            self.after_script();
+            return true;
         }
         false
     }
@@ -820,71 +755,218 @@ impl Browser {
 
     fn draw_page(&self, c: &mut Canvas) {
         let area = content_rect();
-        let mut c = c.sub(area);
-        c.fill(Rect::new(0, 0, area.w, area.h), PAGE_BG);
-        let top = self.scroll - PAD_Y;
-        let first = self.layout.first_line_below(top);
-        for line in &self.layout.lines[first..] {
-            let y = line.y - top;
-            if y > area.h {
-                break;
+        let mut page = c.sub(area);
+        let (bg, _) = web_color(self.page.layout.canvas);
+        page.fill(Rect::new(0, 0, area.w, area.h), bg);
+        let dy = -self.scroll;
+        let view = Rect::new(0, 0, area.w, area.h);
+        let mut clips: Vec<Rect> = alloc::vec![view];
+        for item in &self.page.layout.items {
+            let clip = *clips.last().unwrap();
+            let r = |r: &layout::Rect| Rect::new(r.x, r.y + dy, r.w, r.h);
+            match item {
+                Item::Clip(cr) => {
+                    clips.push(clip.intersect(&r(cr)));
+                    continue;
+                }
+                Item::Unclip => {
+                    if clips.len() > 1 {
+                        clips.pop();
+                    }
+                    continue;
+                }
+                Item::None => continue,
+                _ => {}
             }
-            for run in &line.runs {
-                let x = PAD_X + run.x;
-                let ry = y + line.h - run.h;
-                match &run.kind {
-                    RunKind::Text(text) => {
-                        let color = if run.style.link.is_some() {
-                            LINK
-                        } else if run.style.faint {
-                            FAINT
-                        } else if run.style.heading > 0 {
-                            HEADING
-                        } else {
-                            TEXT
-                        };
-                        let style = run.style;
-                        let th = TextMetrics.line_height(style);
-                        let text_h = font_for(style).line_height;
-                        let ty = ry + (th - text_h) / 2;
-                        if style.mono && !style.link.is_some() {
-                            c.fill_rect(x, ty - 1, run.w, text_h + 2, rgb(0xf1, 0xf3, 0xf4));
-                        }
-                        draw_styled(&mut c, x, ty, text, style, color);
+            if clip.is_empty() {
+                continue;
+            }
+            // skip what is off screen
+            let bounds = match item {
+                Item::Fill { r: b, .. }
+                | Item::Border { r: b, .. }
+                | Item::Image { r: b, .. }
+                | Item::Control { r: b, .. } => r(b),
+                Item::Text {
+                    x,
+                    baseline,
+                    w,
+                    size,
+                    ..
+                } => Rect::new(
+                    *x - 2,
+                    baseline + dy - (*size as i32) * 2,
+                    w + 4,
+                    (*size as i32) * 3,
+                ),
+                _ => continue,
+            };
+            if bounds.intersect(&clip).is_empty() {
+                continue;
+            }
+            let mut sub = page.sub(view);
+            sub.clip_to(clip);
+            self.draw_item(&mut sub, item, dy);
+        }
+    }
+
+    fn draw_item(&self, c: &mut Canvas, item: &Item, dy: i32) {
+        match item {
+            Item::Fill { r, color, radius } => {
+                let rr = Rect::new(r.x, r.y + dy, r.w, r.h);
+                let (col, a) = web_color(*color);
+                if *radius > 0 || a < 256 {
+                    c.fill_round_alpha(rr, *radius, col, a);
+                } else {
+                    c.fill(rr, col);
+                }
+            }
+            Item::Border {
+                r,
+                widths,
+                colors,
+                radius,
+            } => {
+                let rr = Rect::new(r.x, r.y + dy, r.w, r.h);
+                let uniform = widths.iter().all(|&w| w == widths[0])
+                    && colors.iter().all(|&c| c == colors[0]);
+                if *radius > 1 && uniform && widths[0] <= 3 {
+                    let (col, _) = web_color(colors[0]);
+                    for i in 0..widths[0] {
+                        c.outline_round(rr.inset(i), (*radius - i).max(0), col);
                     }
-                    RunKind::Rule => {
-                        c.fill_rect(x, ry + run.h / 2, run.w, 1, rgb(0xd0, 0xd0, 0xd4));
-                    }
-                    RunKind::Input(form, field) => {
-                        let r = Rect::new(x + 2, ry + 2, run.w - 6, layout::FIELD_H);
-                        let focused = self.focus == Focus::Field(*form, *field);
-                        c.fill_round(r, 4, theme::LIGHT);
-                        c.outline_round(
-                            r,
-                            4,
-                            if focused {
-                                theme::ACCENT
-                            } else {
-                                rgb(0x9a, 0xa0, 0xa6)
-                            },
-                        );
-                        let f = &self.page.doc.forms[*form as usize].fields[*field as usize];
-                        let inner = Rect::new(r.x + 8, r.y, r.w - 16, r.h);
-                        draw_edit(
-                            &mut c,
-                            inner,
-                            &f.value,
-                            &f.placeholder,
-                            self.cursor,
-                            focused,
-                            false,
-                        );
-                    }
-                    RunKind::Button(_, label) => {
-                        let r = Rect::new(x + 2, ry + 2, run.w - 6, layout::FIELD_H);
-                        theme::button(&mut c, r, label, false);
+                    return;
+                }
+                let sides = [
+                    Rect::new(rr.x, rr.y, rr.w, widths[0]),
+                    Rect::new(rr.right() - widths[1], rr.y, widths[1], rr.h),
+                    Rect::new(rr.x, rr.bottom() - widths[2], rr.w, widths[2]),
+                    Rect::new(rr.x, rr.y, widths[3], rr.h),
+                ];
+                for (i, s) in sides.iter().enumerate() {
+                    if widths[i] > 0 && colors[i] >> 24 != 0 {
+                        let (col, a) = web_color(colors[i]);
+                        c.fill_round_alpha(*s, 0, col, a);
                     }
                 }
+            }
+            Item::Text {
+                x,
+                baseline,
+                w,
+                text,
+                face,
+                size,
+                color,
+                underline,
+                strike,
+            } => {
+                let (col, _) = web_color(*color);
+                let f = webfont::Face {
+                    bold: face.bold,
+                    italic: face.italic,
+                    mono: face.mono,
+                };
+                let by = baseline + dy;
+                webfont::draw(c, f, *size, *x, by, text, col);
+                let thick = (*size as i32 / 14).max(1);
+                if *underline {
+                    c.fill_rect(*x, by + (*size as i32) / 8, *w, thick, col);
+                }
+                if *strike {
+                    c.fill_rect(*x, by - (*size as i32) * 3 / 10, *w, thick, col);
+                }
+            }
+            Item::Image { r, src, cover } => {
+                if let Some(img) = self.page.images.get(src) {
+                    draw_image(c, img, Rect::new(r.x, r.y + dy, r.w, r.h), *cover);
+                }
+            }
+            Item::Control { r, node, kind } => {
+                let rr = Rect::new(r.x, r.y + dy, r.w, r.h);
+                self.draw_control(c, rr, *node, *kind);
+            }
+            _ => {}
+        }
+    }
+
+    fn draw_control(&self, c: &mut Canvas, r: Rect, node: NodeId, kind: Control) {
+        let dom = &self.page.dom;
+        match kind {
+            Control::Checkbox | Control::Radio => {
+                let checked = dom.attr(node, "checked").is_some();
+                let bx = Rect::new(r.x, r.y, r.w.max(13), r.h.max(13));
+                let radius = if kind == Control::Radio { bx.w / 2 } else { 3 };
+                if checked {
+                    c.fill_round(bx, radius, theme::ACCENT);
+                    if kind == Control::Radio {
+                        c.fill_round(bx.inset(4), (bx.w - 8) / 2, rgb(255, 255, 255));
+                    } else {
+                        let (x0, y0) = (bx.x as f32, bx.y as f32);
+                        stroke(
+                            c,
+                            x0 + 3.0,
+                            y0 + 7.0,
+                            x0 + 5.5,
+                            y0 + 10.0,
+                            2.0,
+                            rgb(255, 255, 255),
+                        );
+                        stroke(
+                            c,
+                            x0 + 5.5,
+                            y0 + 10.0,
+                            x0 + 10.5,
+                            y0 + 3.5,
+                            2.0,
+                            rgb(255, 255, 255),
+                        );
+                    }
+                } else {
+                    c.fill_round(bx, radius, rgb(255, 255, 255));
+                    c.outline_round(bx, radius, rgb(0x76, 0x76, 0x76));
+                }
+            }
+            Control::Select => {
+                let text = self.page.field_value(node);
+                let label = dom
+                    .descendants(node)
+                    .into_iter()
+                    .filter(|&o| dom.tag(o) == "option")
+                    .find(|&o| {
+                        dom.attr(o, "selected").is_some()
+                            || dom.attr(o, "value").unwrap_or("") == text
+                    })
+                    .map(|o| web::text::collapse(&dom.text_content(o)))
+                    .unwrap_or(text);
+                let ty = r.y + (r.h - UI.line_height) / 2;
+                let mut inner = c.sub(Rect::new(r.x, r.y, (r.w - 18).max(0), r.h));
+                inner.draw_text(0, ty - r.y, &label, theme::TEXT);
+                let (ax, ay) = ((r.right() - 10) as f32, (r.y + r.h / 2) as f32);
+                stroke(c, ax - 4.0, ay - 2.0, ax, ay + 2.0, 1.5, theme::TEXT);
+                stroke(c, ax, ay + 2.0, ax + 4.0, ay - 2.0, 1.5, theme::TEXT);
+            }
+            Control::Text | Control::Password | Control::TextArea => {
+                let focused = self.focus == Focus::Field(node);
+                let value = if focused {
+                    self.field_text.clone()
+                } else {
+                    self.page.field_value(node)
+                };
+                let shown = if kind == Control::Password {
+                    value.chars().map(|_| '•').collect()
+                } else if kind == Control::TextArea {
+                    value.replace('\n', " ")
+                } else {
+                    value
+                };
+                let placeholder = dom.attr(node, "placeholder").unwrap_or("");
+                let line = if kind == Control::TextArea {
+                    Rect::new(r.x, r.y, r.w, UI.line_height + 4)
+                } else {
+                    r
+                };
+                draw_edit(c, line, &shown, placeholder, self.cursor, focused, false);
             }
         }
     }
@@ -924,11 +1006,45 @@ impl Browser {
             (Some(link), false) => link.as_str(),
             _ => self.status.as_str(),
         };
-        let title: String = self.page.doc.title.chars().take(80).collect();
+        let title: String = self.page.title().chars().take(80).collect();
         let right_w = UI.width(&title);
         c.draw_text(CLIENT_W - right_w - 14, ty, &title, theme::TEXT);
         let mut left = c.sub(Rect::new(x, bar.y, CLIENT_W - x - right_w - 40, STATUS_H));
         left.draw_text(0, ty - bar.y, status, theme::TEXT_DIM);
+    }
+}
+
+/// Draw an image scaled into `r`; with `cover`, scaled to cover it and cut.
+fn draw_image(c: &mut Canvas, img: &web::image::Image, r: Rect, cover: bool) {
+    if img.width == 0 || r.w <= 0 || r.h <= 0 {
+        return;
+    }
+    let (iw, ih) = (img.width as i64, img.height as i64);
+    // source pixels per destination pixel, in 1/1024
+    let (sx, sy, ox, oy) = if cover {
+        let scale = ((iw * 1024) / r.w as i64)
+            .min((ih * 1024) / r.h as i64)
+            .max(1);
+        let ox = (iw * 1024 - scale * r.w as i64) / 2;
+        let oy = (ih * 1024 - scale * r.h as i64) / 2;
+        (scale, scale, ox.max(0), oy.max(0))
+    } else {
+        ((iw * 1024) / r.w as i64, (ih * 1024) / r.h as i64, 0, 0)
+    };
+    let step = ((sx.max(sy) + 512) / 1024).max(1) as usize;
+    let visible = r.intersect(&c.clip_rect());
+    for py in visible.y..visible.bottom() {
+        let src_y = ((oy + (py - r.y) as i64 * sy) / 1024).clamp(0, ih - 1) as usize;
+        for px in visible.x..visible.right() {
+            let src_x = ((ox + (px - r.x) as i64 * sx) / 1024).clamp(0, iw - 1) as usize;
+            let p = img.sample(src_x, src_y, step);
+            let a = (p >> 24) as i32;
+            if a == 255 {
+                c.pixel(px, py, p & 0xff_ffff);
+            } else if a > 0 {
+                c.blend_at(px, py, p & 0xff_ffff, a);
+            }
+        }
     }
 }
 

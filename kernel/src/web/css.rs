@@ -216,6 +216,11 @@ pub fn parse_url(s: &str) -> Option<String> {
     (!inner.is_empty()).then(|| inner.to_string())
 }
 
+/// Evaluate a media query (for matchMedia).
+pub fn media_query(query: &str, m: &Media) -> bool {
+    media_matches(&query.to_ascii_lowercase(), m)
+}
+
 fn media_matches(query: &str, m: &Media) -> bool {
     let query = query.trim();
     if query.is_empty() {
@@ -251,7 +256,11 @@ fn feature_matches(f: &str, m: &Media) -> bool {
                 if let Some((n, v)) = f.split_once(op) {
                     let n = n.trim();
                     let px = media_px(v.trim());
-                    let actual = if n.contains("height") { m.height } else { m.width };
+                    let actual = if n.contains("height") {
+                        m.height
+                    } else {
+                        m.width
+                    };
                     return match cmp {
                         0 => actual >= px,
                         1 => actual <= px,
@@ -281,7 +290,10 @@ fn feature_matches(f: &str, m: &Media) -> bool {
 }
 
 fn media_px(v: &str) -> i32 {
-    let num: String = v.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let num: String = v
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
     let n = parse_f32(&num).unwrap_or(0.0);
     if v.ends_with("em") {
         (n * 16.0) as i32
@@ -577,7 +589,10 @@ fn parse_compound(chars: &[char], mut i: usize) -> Option<(Compound, usize)> {
                                     parts: alloc::vec![(
                                         Compound {
                                             pseudo: alloc::vec![Pseudo::Is(
-                                                inner.iter().filter_map(|s| parse_selector(s)).collect()
+                                                inner
+                                                    .iter()
+                                                    .filter_map(|s| parse_selector(s))
+                                                    .collect()
                                             )],
                                             ..Compound::default()
                                         },
@@ -596,7 +611,9 @@ fn parse_compound(chars: &[char], mut i: usize) -> Option<(Compound, usize)> {
                         "visited" | "hover" | "active" | "focus" | "focus-visible"
                         | "focus-within" | "target" | "disabled" | "placeholder-shown"
                         | "invalid" | "has" | "fullscreen" | "indeterminate" => Pseudo::Never,
-                        "enabled" | "lang" | "dir" | "defined" | "valid" | "scope" => Pseudo::Always,
+                        "enabled" | "lang" | "dir" | "defined" | "valid" | "scope" => {
+                            Pseudo::Always
+                        }
                         _ => Pseudo::Never,
                     }
                 };
@@ -625,7 +642,11 @@ fn parse_nth(arg: &str) -> Option<(i32, i32)> {
             c => c.parse().ok()?,
         };
         let rest = &a[pos + 1..];
-        let b = if rest.is_empty() { 0 } else { rest.parse().ok()? };
+        let b = if rest.is_empty() {
+            0
+        } else {
+            rest.parse().ok()?
+        };
         Some((a_val, b))
     } else {
         Some((0, a.parse().ok()?))
@@ -719,10 +740,13 @@ fn compound_matches(dom: &Dom, node: NodeId, c: &Compound) -> bool {
             Pseudo::Root => el.tag == "html",
             Pseudo::Link => (el.tag == "a" || el.tag == "area") && el.attr("href").is_some(),
             Pseudo::Checked => el.attr("checked").is_some() || el.attr("selected").is_some(),
-            Pseudo::Empty => dom.nodes[node].children.iter().all(|&ch| match &dom.nodes[ch].data {
-                NodeData::Text(t) => t.is_empty(),
-                _ => false,
-            }),
+            Pseudo::Empty => dom.nodes[node]
+                .children
+                .iter()
+                .all(|&ch| match &dom.nodes[ch].data {
+                    NodeData::Text(t) => t.is_empty(),
+                    _ => false,
+                }),
             Pseudo::Not(sel) => !matches(dom, node, sel),
             Pseudo::Is(list) => list.iter().any(|s| matches(dom, node, s)),
             _ => {
@@ -735,8 +759,12 @@ fn compound_matches(dom: &Dom, node: NodeId, c: &Compound) -> bool {
                     Pseudo::OnlyChild => n == 1,
                     Pseudo::NthChild(a, b) => nth_matches(*a, *b, pos + 1),
                     Pseudo::NthLastChild(a, b) => nth_matches(*a, *b, n - pos),
-                    Pseudo::FirstOfType => !sibs[..pos as usize].iter().any(|&s| dom.tag(s) == el.tag),
-                    Pseudo::LastOfType => !sibs[pos as usize + 1..].iter().any(|&s| dom.tag(s) == el.tag),
+                    Pseudo::FirstOfType => {
+                        !sibs[..pos as usize].iter().any(|&s| dom.tag(s) == el.tag)
+                    }
+                    Pseudo::LastOfType => !sibs[pos as usize + 1..]
+                        .iter()
+                        .any(|&s| dom.tag(s) == el.tag),
                     _ => false,
                 }
             }
@@ -781,7 +809,9 @@ fn match_from(dom: &Dom, node: NodeId, parts: &[(Compound, Combinator)], i: usiz
             if parts[i].1 == Combinator::Next {
                 pos > 0 && match_from(dom, sibs[pos - 1], parts, i + 1)
             } else {
-                sibs[..pos].iter().any(|&s| match_from(dom, s, parts, i + 1))
+                sibs[..pos]
+                    .iter()
+                    .any(|&s| match_from(dom, s, parts, i + 1))
             }
         }
     }

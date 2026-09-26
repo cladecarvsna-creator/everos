@@ -35,7 +35,10 @@ pub enum Display {
 
 impl Display {
     pub fn is_inline_level(self) -> bool {
-        matches!(self, Display::Inline | Display::InlineBlock | Display::InlineFlex)
+        matches!(
+            self,
+            Display::Inline | Display::InlineBlock | Display::InlineFlex
+        )
     }
 }
 
@@ -159,6 +162,12 @@ pub struct Style {
     pub order: i32,
     pub grid_columns: usize,
     pub position: Position,
+    /// top, right, bottom, left
+    pub inset: [Len; 4],
+    /// align-items is stretch (or normal)
+    pub align_stretch: bool,
+    pub align_end: bool,
+    pub border_spacing: f32,
     pub float_left: bool,
     pub float_right: bool,
     pub clip: bool,
@@ -210,6 +219,10 @@ impl Style {
             order: 0,
             grid_columns: 0,
             position: Position::Static,
+            inset: [Len::Auto; 4],
+            align_stretch: true,
+            align_end: false,
+            border_spacing: 0.0,
             float_left: false,
             float_right: false,
             clip: false,
@@ -234,6 +247,7 @@ impl Style {
         s.transform = self.transform;
         s.list_style = self.list_style;
         s.visible = self.visible;
+        s.border_spacing = self.border_spacing;
         s.vars = self.vars.clone();
         s.display = Display::Inline;
         s
@@ -299,7 +313,7 @@ ruby rt { display: none }
 "#;
 
 pub struct Styler {
-    sheets: Vec<(Stylesheet, u8)>,
+    sheets: Vec<(Rc<Stylesheet>, u8)>,
     /// Rules indexed by the key of their rightmost compound.
     by_id: BTreeMap<String, Vec<(usize, usize, usize)>>,
     by_class: BTreeMap<String, Vec<(usize, usize, usize)>>,
@@ -310,12 +324,12 @@ pub struct Styler {
 
 impl Styler {
     /// `author` holds the page's style sheets in document order.
-    pub fn new(author: Vec<Stylesheet>, viewport: (i32, i32)) -> Styler {
+    pub fn new(author: Vec<Rc<Stylesheet>>, viewport: (i32, i32)) -> Styler {
         let media = Media {
             width: viewport.0,
             height: viewport.1,
         };
-        let mut sheets = alloc::vec![(css::parse_stylesheet(USER_AGENT_CSS, &media), 0u8)];
+        let mut sheets = alloc::vec![(Rc::new(css::parse_stylesheet(USER_AGENT_CSS, &media)), 0u8)];
         for s in author {
             sheets.push((s, 1));
         }
@@ -345,13 +359,6 @@ impl Styler {
             }
         }
         st
-    }
-
-    pub fn media(&self) -> Media {
-        Media {
-            width: self.viewport.0,
-            height: self.viewport.1,
-        }
     }
 
     fn selector(&self, key: (usize, usize, usize)) -> &Selector {
@@ -412,11 +419,15 @@ impl Styler {
             let origin = self.sheets[si].1 as u32;
             let order = ((si << 20) + ri) as u32;
             for d in &self.sheets[si].0.rules[ri].decls {
-                let weight = (d.important as u32) << 31 | origin << 30 | (spec - 1).min((1 << 30) - 1);
+                let weight =
+                    (d.important as u32) << 31 | origin << 30 | (spec - 1).min((1 << 30) - 1);
                 matched.push((weight, order, d));
             }
         }
-        let inline = el.attr("style").map(css::parse_declarations).unwrap_or_default();
+        let inline = el
+            .attr("style")
+            .map(css::parse_declarations)
+            .unwrap_or_default();
         for d in &inline {
             let weight = (d.important as u32) << 31 | 1 << 30 | ((1 << 30) - 1);
             matched.push((weight, u32::MAX, d));
@@ -424,7 +435,6 @@ impl Styler {
         matched.sort_by_key(|&(w, o, _)| (w, o));
 
         let mut s = parent.inherit();
-        self.presentational_hints(dom, node, &mut s, parent);
         // custom properties first, so var() sees them
         let mut vars: Option<BTreeMap<String, String>> = None;
         for (_, _, d) in &matched {
@@ -436,7 +446,13 @@ impl Styler {
         if let Some(v) = vars {
             s.vars = Rc::new(v);
         }
-        for (_, _, d) in &matched {
+        let mut hinted = false;
+        for (w, _, d) in &matched {
+            // presentational attributes sit between the browser's and the page's rules
+            if !hinted && w >> 30 != 0 {
+                hinted = true;
+                self.presentational_hints(dom, node, &mut s, parent);
+            }
             if d.name.starts_with("--") {
                 continue;
             }
@@ -446,6 +462,9 @@ impl Styler {
                 d.value.clone()
             };
             apply(&mut s, parent, &d.name, value.trim(), self.viewport);
+        }
+        if !hinted {
+            self.presentational_hints(dom, node, &mut s, parent);
         }
         fixups(&mut s, parent, dom.tag(node));
         s
@@ -480,7 +499,19 @@ impl Styler {
         }
         for (attr, target) in [("width", 0), ("height", 1)] {
             if let Some(v) = el.attr(attr) {
-                if matches!(tag, "img" | "table" | "td" | "th" | "input" | "col" | "iframe" | "hr" | "video" | "canvas") {
+                if matches!(
+                    tag,
+                    "img"
+                        | "table"
+                        | "td"
+                        | "th"
+                        | "input"
+                        | "col"
+                        | "iframe"
+                        | "hr"
+                        | "video"
+                        | "canvas"
+                ) {
                     let v = v.trim();
                     let len = if let Some(p) = v.strip_suffix('%') {
                         parse_f32(p).map(|p| Len::Val { px: 0.0, pct: p })
@@ -516,7 +547,10 @@ impl Styler {
             let mut t = dom.nodes[node].parent;
             while let Some(p) = t {
                 if dom.tag(p) == "table" {
-                    if let Some(cp) = dom.attr(p, "cellpadding").and_then(|v| v.trim().parse::<f32>().ok()) {
+                    if let Some(cp) = dom
+                        .attr(p, "cellpadding")
+                        .and_then(|v| v.trim().parse::<f32>().ok())
+                    {
                         s.padding = [Len::px(cp); 4];
                     }
                     if dom.attr(p, "border").is_some_and(|b| b.trim() != "0") {
@@ -529,6 +563,12 @@ impl Styler {
             }
         }
         if tag == "table" {
+            if let Some(cs) = el
+                .attr("cellspacing")
+                .and_then(|b| b.trim().parse::<f32>().ok())
+            {
+                s.border_spacing = cs;
+            }
             if let Some(b) = el.attr("border").and_then(|b| b.trim().parse::<f32>().ok()) {
                 s.border = [b; 4];
                 s.border_color = [0xff80_8080; 4];
@@ -572,7 +612,12 @@ fn substitute_vars(value: &str, vars: &BTreeMap<String, String>) -> String {
             .or(fallback)
             .unwrap_or("")
             .to_string();
-        out = alloc::format!("{}{}{}", &out[..pos], replacement, out.get(end + 1..).unwrap_or(""));
+        out = alloc::format!(
+            "{}{}{}",
+            &out[..pos],
+            replacement,
+            out.get(end + 1..).unwrap_or("")
+        );
     }
     out
 }
@@ -580,7 +625,8 @@ fn substitute_vars(value: &str, vars: &BTreeMap<String, String>) -> String {
 /// Parse a length. `em` is the font size ems refer to.
 pub fn parse_len(v: &str, em: f32, viewport: (i32, i32)) -> Option<Len> {
     let v = v.trim().to_ascii_lowercase();
-    if v == "auto" || v == "fit-content" || v == "max-content" || v == "min-content" || v == "none" {
+    if v == "auto" || v == "fit-content" || v == "max-content" || v == "min-content" || v == "none"
+    {
         return Some(Len::Auto);
     }
     if v == "0" {
@@ -594,7 +640,10 @@ pub fn parse_len(v: &str, em: f32, viewport: (i32, i32)) -> Option<Len> {
             }
             // min/max/clamp: take the plain-pixel argument if there is one
             let args = split_top(inner, ',');
-            let lens: Vec<Len> = args.iter().filter_map(|a| parse_len(a, em, viewport)).collect();
+            let lens: Vec<Len> = args
+                .iter()
+                .filter_map(|a| parse_len(a, em, viewport))
+                .collect();
             let pick = match f {
                 "clamp(" => lens.get(1).copied(),
                 "min(" => lens
@@ -808,7 +857,11 @@ fn apply(s: &mut Style, parent: &Style, name: &str, v: &str, vp: (i32, i32)) {
                     s.bold = true;
                 } else if p == "italic" || p == "oblique" {
                     s.italic = true;
-                } else if p.chars().next().is_some_and(|c| c.is_ascii_digit() || c == '.') {
+                } else if p
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit() || c == '.')
+                {
                     let (size, lh) = match p.split_once('/') {
                         Some((a, b)) => (a, Some(b)),
                         None => (p.as_str(), None),
@@ -831,7 +884,9 @@ fn apply(s: &mut Style, parent: &Style, name: &str, v: &str, vp: (i32, i32)) {
                 _ => match parse_f32(v_l) {
                     Some(n) => Some(n.min(4.0)),
                     None => match parse_len(v, s.font_size, vp) {
-                        Some(Len::Val { px, pct }) => Some((px + pct * s.font_size / 100.0).max(4.01)),
+                        Some(Len::Val { px, pct }) => {
+                            Some((px + pct * s.font_size / 100.0).max(4.01))
+                        }
                         _ => None,
                     },
                 },
@@ -872,10 +927,16 @@ fn apply(s: &mut Style, parent: &Style, name: &str, v: &str, vp: (i32, i32)) {
                 s.padding = b;
             }
         }
-        "margin-top" | "margin-right" | "margin-bottom" | "margin-left" | "margin-block-start"
-        | "margin-block-end" | "margin-inline-start" | "margin-inline-end" => {
+        "margin-top"
+        | "margin-right"
+        | "margin-bottom"
+        | "margin-left"
+        | "margin-block-start"
+        | "margin-block-end"
+        | "margin-inline-start"
+        | "margin-inline-end" => {
             if let Some(l) = len(v) {
-                for i in side(name) {
+                for &i in side(name) {
                     s.margin[i] = l;
                 }
             }
@@ -884,24 +945,45 @@ fn apply(s: &mut Style, parent: &Style, name: &str, v: &str, vp: (i32, i32)) {
             let parts: Vec<Len> = split_top(v, ' ').iter().filter_map(|p| len(p)).collect();
             if let Some(&a) = parts.first() {
                 let b = parts.get(1).copied().unwrap_or(a);
-                let idx = if name.ends_with("block") { [0, 2] } else { [3, 1] };
-                let target = if name.starts_with("margin") { &mut s.margin } else { &mut s.padding };
+                let idx = if name.ends_with("block") {
+                    [0, 2]
+                } else {
+                    [3, 1]
+                };
+                let target = if name.starts_with("margin") {
+                    &mut s.margin
+                } else {
+                    &mut s.padding
+                };
                 target[idx[0]] = a;
                 target[idx[1]] = b;
             }
         }
-        "padding-top" | "padding-right" | "padding-bottom" | "padding-left"
-        | "padding-block-start" | "padding-block-end" | "padding-inline-start"
+        "padding-top"
+        | "padding-right"
+        | "padding-bottom"
+        | "padding-left"
+        | "padding-block-start"
+        | "padding-block-end"
+        | "padding-inline-start"
         | "padding-inline-end" => {
             if let Some(l) = len(v) {
-                for i in side(name) {
+                for &i in side(name) {
                     s.padding[i] = l;
                 }
             }
         }
-        "border" | "border-top" | "border-right" | "border-bottom" | "border-left"
-        | "border-block" | "border-inline" | "border-block-start" | "border-block-end"
-        | "border-inline-start" | "border-inline-end" => {
+        "border"
+        | "border-top"
+        | "border-right"
+        | "border-bottom"
+        | "border-left"
+        | "border-block"
+        | "border-inline"
+        | "border-block-start"
+        | "border-block-end"
+        | "border-inline-start"
+        | "border-inline-end" => {
             let (w, c) = parse_border(v, s.color, em, vp);
             let sides: Vec<usize> = match name {
                 "border" => alloc::vec![0, 1, 2, 3],
@@ -916,21 +998,24 @@ fn apply(s: &mut Style, parent: &Style, name: &str, v: &str, vp: (i32, i32)) {
         }
         "border-width" => {
             if let Some(b) = box4(v, &|p: &str| border_width(p, em, vp).map(Len::px)) {
-                for i in 0..4 {
-                    s.border[i] = b[i].or0(0) as f32;
+                for (dst, l) in s.border.iter_mut().zip(b) {
+                    *dst = l.or0(0) as f32;
                 }
             }
         }
         "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" => {
             if let Some(w) = border_width(v, em, vp) {
-                for i in side(name) {
+                for &i in side(name) {
                     s.border[i] = w;
                 }
             }
         }
         "border-color" => {
             let parts = split_top(v, ' ');
-            let colors: Vec<Color> = parts.iter().filter_map(|p| parse_color_with(p, s.color)).collect();
+            let colors: Vec<Color> = parts
+                .iter()
+                .filter_map(|p| parse_color_with(p, s.color))
+                .collect();
             if !colors.is_empty() {
                 let b = expand4(&colors);
                 s.border_color = b;
@@ -938,7 +1023,7 @@ fn apply(s: &mut Style, parent: &Style, name: &str, v: &str, vp: (i32, i32)) {
         }
         "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => {
             if let Some(c) = parse_color_with(v, s.color) {
-                for i in side(name) {
+                for &i in side(name) {
                     s.border_color[i] = c;
                 }
             }
@@ -996,9 +1081,40 @@ fn apply(s: &mut Style, parent: &Style, name: &str, v: &str, vp: (i32, i32)) {
                 _ => Justify::Start,
             }
         }
-        "align-items" | "place-items" => s.align_center = v_l.starts_with("center"),
+        "align-items" | "place-items" => {
+            let first = v_l.split_whitespace().next().unwrap_or("");
+            s.align_center = first == "center";
+            s.align_end = matches!(first, "flex-end" | "end" | "self-end");
+            s.align_stretch = matches!(first, "stretch" | "normal");
+        }
+        "top" | "right" | "bottom" | "left" | "inset" => {
+            if name == "inset" {
+                if let Some(b) = box4(v, &len) {
+                    s.inset = b;
+                }
+            } else if let Some(l) = len(v) {
+                let i = match name {
+                    "top" => 0,
+                    "right" => 1,
+                    "bottom" => 2,
+                    _ => 3,
+                };
+                s.inset[i] = l;
+            }
+        }
+        "border-spacing" => {
+            if let Some(Len::Val { px, .. }) = len(split_top(v, ' ')[0]) {
+                s.border_spacing = px;
+            }
+        }
+        "border-collapse" => {
+            if v_l == "collapse" {
+                s.border_spacing = 0.0;
+            }
+        }
         "gap" | "grid-gap" | "column-gap" | "grid-column-gap" => {
-            if let Some(Len::Val { px, .. }) = len(split_top(v, ' ').last().copied().unwrap_or("0")) {
+            if let Some(Len::Val { px, .. }) = len(split_top(v, ' ').last().copied().unwrap_or("0"))
+            {
                 s.gap = px;
             }
         }
@@ -1065,11 +1181,7 @@ fn apply(s: &mut Style, parent: &Style, name: &str, v: &str, vp: (i32, i32)) {
             }
         }
         "vertical-align" => s.vertical_middle = v_l == "middle",
-        "content-visibility" => {
-            if v_l == "hidden" {
-                s.display = Display::None;
-            }
-        }
+        "content-visibility" if v_l == "hidden" => s.display = Display::None,
         _ => {}
     }
 }
@@ -1079,7 +1191,11 @@ fn count_grid_columns(v: &str) -> usize {
         let n = rest.split(',').next().unwrap_or("").trim();
         return n.parse().unwrap_or(3).min(12);
     }
-    split_top(v, ' ').iter().filter(|p| !p.trim().is_empty()).count().min(12)
+    split_top(v, ' ')
+        .iter()
+        .filter(|p| !p.trim().is_empty())
+        .count()
+        .min(12)
 }
 
 fn inherit_one(s: &mut Style, p: &Style, name: &str) {
@@ -1096,7 +1212,12 @@ fn inherit_one(s: &mut Style, p: &Style, name: &str) {
 }
 
 fn is_mono_family(v: &str) -> bool {
-    let first = v.split(',').next().unwrap_or("").trim().trim_matches(|c| c == '"' || c == '\'');
+    let first = v
+        .split(',')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'');
     first.contains("mono")
         || first.contains("courier")
         || first.contains("consolas")
@@ -1186,16 +1307,17 @@ fn fixups(s: &mut Style, parent: &Style, tag: &str) {
         // banners, pop-ups and toolbars: a static page has nowhere to pin them
         s.display = Display::None;
     }
-    if parent.display == Display::Flex || parent.display == Display::InlineFlex || parent.display == Display::Grid {
+    if parent.display == Display::Flex
+        || parent.display == Display::InlineFlex
+        || parent.display == Display::Grid
+    {
         // flex items are blockified
         if s.display == Display::Inline {
             s.display = Display::Block;
         }
     }
-    if s.float_left || s.float_right {
-        if s.display == Display::Inline {
-            s.display = Display::InlineBlock;
-        }
+    if (s.float_left || s.float_right) && s.display == Display::Inline {
+        s.display = Display::InlineBlock;
     }
     if tag == "br" {
         s.display = Display::Inline;
@@ -1261,12 +1383,14 @@ pub fn parse_color_with(v: &str, current: Color) -> Option<Color> {
             return None;
         }
         let chan = |s: &str| -> Option<u32> {
-            Some(if let Some(p) = s.strip_suffix('%') {
-                (parse_f32(p)? * 2.55) as u32
-            } else {
-                parse_f32(s)? as u32
-            }
-            .min(255))
+            Some(
+                if let Some(p) = s.strip_suffix('%') {
+                    (parse_f32(p)? * 2.55) as u32
+                } else {
+                    parse_f32(s)? as u32
+                }
+                .min(255),
+            )
         };
         let a = match nums.get(3) {
             Some(s) => {
@@ -1286,7 +1410,10 @@ pub fn parse_color_with(v: &str, current: Color) -> Option<Color> {
         .or_else(|| l.strip_prefix("hsl("))
         .and_then(|a| a.strip_suffix(')'))
     {
-        let nums: Vec<&str> = args.split([',', ' ', '/']).filter(|s| !s.is_empty()).collect();
+        let nums: Vec<&str> = args
+            .split([',', ' ', '/'])
+            .filter(|s| !s.is_empty())
+            .collect();
         if nums.len() < 3 {
             return None;
         }
@@ -1306,118 +1433,128 @@ pub fn parse_color_with(v: &str, current: Color) -> Option<Color> {
         let (r, g, b) = hsl_to_rgb(h - (h as i32) as f32, s, lt);
         return Some(((a * 255.0) as u32).min(255) << 24 | r << 16 | g << 8 | b);
     }
-    Some(match l.as_str() {
-        "transparent" => TRANSPARENT,
-        "currentcolor" => current,
-        "black" => 0x000000,
-        "white" => 0xffffff,
-        "red" => 0xff0000,
-        "green" => 0x008000,
-        "blue" => 0x0000ff,
-        "yellow" => 0xffff00,
-        "orange" => 0xffa500,
-        "purple" => 0x800080,
-        "gray" | "grey" => 0x808080,
-        "silver" => 0xc0c0c0,
-        "maroon" => 0x800000,
-        "navy" => 0x000080,
-        "teal" => 0x008080,
-        "olive" => 0x808000,
-        "lime" => 0x00ff00,
-        "aqua" | "cyan" => 0x00ffff,
-        "fuchsia" | "magenta" => 0xff00ff,
-        "lightgray" | "lightgrey" => 0xd3d3d3,
-        "darkgray" | "darkgrey" => 0xa9a9a9,
-        "dimgray" | "dimgrey" => 0x696969,
-        "gainsboro" => 0xdcdcdc,
-        "whitesmoke" => 0xf5f5f5,
-        "darkblue" => 0x00008b,
-        "darkred" => 0x8b0000,
-        "darkgreen" => 0x006400,
-        "lightblue" => 0xadd8e6,
-        "lightgreen" => 0x90ee90,
-        "lightyellow" => 0xffffe0,
-        "skyblue" => 0x87ceeb,
-        "steelblue" => 0x4682b4,
-        "royalblue" => 0x4169e1,
-        "dodgerblue" => 0x1e90ff,
-        "cornflowerblue" => 0x6495ed,
-        "slategray" | "slategrey" => 0x708090,
-        "lightslategray" => 0x778899,
-        "gold" => 0xffd700,
-        "pink" => 0xffc0cb,
-        "brown" => 0xa52a2a,
-        "crimson" => 0xdc143c,
-        "tomato" => 0xff6347,
-        "coral" => 0xff7f50,
-        "salmon" => 0xfa8072,
-        "beige" => 0xf5f5dc,
-        "ivory" => 0xfffff0,
-        "linen" => 0xfaf0e6,
-        "wheat" => 0xf5deb3,
-        "tan" => 0xd2b48c,
-        "khaki" => 0xf0e68c,
-        "indigo" => 0x4b0082,
-        "violet" => 0xee82ee,
-        "orchid" => 0xda70d6,
-        "plum" => 0xdda0dd,
-        "lavender" => 0xe6e6fa,
-        "aliceblue" => 0xf0f8ff,
-        "azure" => 0xf0ffff,
-        "honeydew" => 0xf0fff0,
-        "mintcream" => 0xf5fffa,
-        "seashell" => 0xfff5ee,
-        "snow" => 0xfffafa,
-        "ghostwhite" => 0xf8f8ff,
-        "floralwhite" => 0xfffaf0,
-        "oldlace" => 0xfdf5e6,
-        "cornsilk" => 0xfff8dc,
-        "lemonchiffon" => 0xfffacd,
-        "papayawhip" => 0xffefd5,
-        "blanchedalmond" => 0xffebcd,
-        "bisque" => 0xffe4c4,
-        "moccasin" => 0xffe4b5,
-        "peachpuff" => 0xffdab9,
-        "mistyrose" => 0xffe4e1,
-        "lavenderblush" => 0xfff0f5,
-        "antiquewhite" => 0xfaebd7,
-        "firebrick" => 0xb22222,
-        "darkorange" => 0xff8c00,
-        "orangered" => 0xff4500,
-        "seagreen" => 0x2e8b57,
-        "forestgreen" => 0x228b22,
-        "limegreen" => 0x32cd32,
-        "darkslategray" | "darkslategrey" => 0x2f4f4f,
-        "midnightblue" => 0x191970,
-        "darkcyan" => 0x008b8b,
-        "cadetblue" => 0x5f9ea0,
-        "turquoise" => 0x40e0d0,
-        "chocolate" => 0xd2691e,
-        "sienna" => 0xa0522d,
-        "goldenrod" => 0xdaa520,
-        "darkviolet" => 0x9400d3,
-        "rebeccapurple" => 0x663399,
-        "slateblue" => 0x6a5acd,
-        "lightcoral" => 0xf08080,
-        "lightpink" => 0xffb6c1,
-        "hotpink" => 0xff69b4,
-        "deeppink" => 0xff1493,
-        "lightcyan" => 0xe0ffff,
-        "lightsteelblue" => 0xb0c4de,
-        "powderblue" => 0xb0e0e6,
-        "paleturquoise" => 0xafeeee,
-        "palegreen" => 0x98fb98,
-        "darkkhaki" => 0xbdb76b,
-        "canvas" | "field" | "buttonface" => 0xffffff,
-        "canvastext" | "fieldtext" | "buttontext" => 0x000000,
-        "linktext" => 0x1a0dab,
-        "graytext" => 0x808080,
-        _ => return None,
-    } | if l == "transparent" || l == "currentcolor" { 0 } else { 0xff00_0000 })
+    Some(
+        match l.as_str() {
+            "transparent" => TRANSPARENT,
+            "currentcolor" => current,
+            "black" => 0x000000,
+            "white" => 0xffffff,
+            "red" => 0xff0000,
+            "green" => 0x008000,
+            "blue" => 0x0000ff,
+            "yellow" => 0xffff00,
+            "orange" => 0xffa500,
+            "purple" => 0x800080,
+            "gray" | "grey" => 0x808080,
+            "silver" => 0xc0c0c0,
+            "maroon" => 0x800000,
+            "navy" => 0x000080,
+            "teal" => 0x008080,
+            "olive" => 0x808000,
+            "lime" => 0x00ff00,
+            "aqua" | "cyan" => 0x00ffff,
+            "fuchsia" | "magenta" => 0xff00ff,
+            "lightgray" | "lightgrey" => 0xd3d3d3,
+            "darkgray" | "darkgrey" => 0xa9a9a9,
+            "dimgray" | "dimgrey" => 0x696969,
+            "gainsboro" => 0xdcdcdc,
+            "whitesmoke" => 0xf5f5f5,
+            "darkblue" => 0x00008b,
+            "darkred" => 0x8b0000,
+            "darkgreen" => 0x006400,
+            "lightblue" => 0xadd8e6,
+            "lightgreen" => 0x90ee90,
+            "lightyellow" => 0xffffe0,
+            "skyblue" => 0x87ceeb,
+            "steelblue" => 0x4682b4,
+            "royalblue" => 0x4169e1,
+            "dodgerblue" => 0x1e90ff,
+            "cornflowerblue" => 0x6495ed,
+            "slategray" | "slategrey" => 0x708090,
+            "lightslategray" => 0x778899,
+            "gold" => 0xffd700,
+            "pink" => 0xffc0cb,
+            "brown" => 0xa52a2a,
+            "crimson" => 0xdc143c,
+            "tomato" => 0xff6347,
+            "coral" => 0xff7f50,
+            "salmon" => 0xfa8072,
+            "beige" => 0xf5f5dc,
+            "ivory" => 0xfffff0,
+            "linen" => 0xfaf0e6,
+            "wheat" => 0xf5deb3,
+            "tan" => 0xd2b48c,
+            "khaki" => 0xf0e68c,
+            "indigo" => 0x4b0082,
+            "violet" => 0xee82ee,
+            "orchid" => 0xda70d6,
+            "plum" => 0xdda0dd,
+            "lavender" => 0xe6e6fa,
+            "aliceblue" => 0xf0f8ff,
+            "azure" => 0xf0ffff,
+            "honeydew" => 0xf0fff0,
+            "mintcream" => 0xf5fffa,
+            "seashell" => 0xfff5ee,
+            "snow" => 0xfffafa,
+            "ghostwhite" => 0xf8f8ff,
+            "floralwhite" => 0xfffaf0,
+            "oldlace" => 0xfdf5e6,
+            "cornsilk" => 0xfff8dc,
+            "lemonchiffon" => 0xfffacd,
+            "papayawhip" => 0xffefd5,
+            "blanchedalmond" => 0xffebcd,
+            "bisque" => 0xffe4c4,
+            "moccasin" => 0xffe4b5,
+            "peachpuff" => 0xffdab9,
+            "mistyrose" => 0xffe4e1,
+            "lavenderblush" => 0xfff0f5,
+            "antiquewhite" => 0xfaebd7,
+            "firebrick" => 0xb22222,
+            "darkorange" => 0xff8c00,
+            "orangered" => 0xff4500,
+            "seagreen" => 0x2e8b57,
+            "forestgreen" => 0x228b22,
+            "limegreen" => 0x32cd32,
+            "darkslategray" | "darkslategrey" => 0x2f4f4f,
+            "midnightblue" => 0x191970,
+            "darkcyan" => 0x008b8b,
+            "cadetblue" => 0x5f9ea0,
+            "turquoise" => 0x40e0d0,
+            "chocolate" => 0xd2691e,
+            "sienna" => 0xa0522d,
+            "goldenrod" => 0xdaa520,
+            "darkviolet" => 0x9400d3,
+            "rebeccapurple" => 0x663399,
+            "slateblue" => 0x6a5acd,
+            "lightcoral" => 0xf08080,
+            "lightpink" => 0xffb6c1,
+            "hotpink" => 0xff69b4,
+            "deeppink" => 0xff1493,
+            "lightcyan" => 0xe0ffff,
+            "lightsteelblue" => 0xb0c4de,
+            "powderblue" => 0xb0e0e6,
+            "paleturquoise" => 0xafeeee,
+            "palegreen" => 0x98fb98,
+            "darkkhaki" => 0xbdb76b,
+            "canvas" | "field" | "buttonface" => 0xffffff,
+            "canvastext" | "fieldtext" | "buttontext" => 0x000000,
+            "linktext" => 0x1a0dab,
+            "graytext" => 0x808080,
+            _ => return None,
+        } | if l == "transparent" || l == "currentcolor" {
+            0
+        } else {
+            0xff00_0000
+        },
+    )
 }
 
 fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u32, u32, u32) {
-    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
     let p = 2.0 * l - q;
     let f = |mut t: f32| {
         if t < 0.0 {

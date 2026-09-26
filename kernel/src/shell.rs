@@ -130,6 +130,7 @@ impl Shell {
                 }
             }
             "fetch" => fetch(args.trim()),
+            "js" => js(args.trim()),
             "panic" => panic!("panic requested from the shell"),
             _ => console::print_colored(
                 Color::LightRed,
@@ -224,24 +225,51 @@ fn fetch(address: &str) {
         return;
     };
     println!("Loading {} ...", url);
-    let page = crate::web::load(&url, None);
-    let text: usize = page
-        .doc
-        .items
-        .iter()
-        .map(|i| match i {
-            crate::web::html::Item::Text(t, _) => t.chars().count(),
-            _ => 0,
-        })
-        .sum();
+    let page = crate::web::load(&url, None, (1200, 800), true);
+    let dom = &page.dom;
+    let text = dom
+        .text_content(dom.body())
+        .split_whitespace()
+        .map(|w| w.chars().count())
+        .sum::<usize>();
+    let links: alloc::vec::Vec<alloc::string::String> = dom
+        .descendants(crate::web::dom::DOCUMENT)
+        .into_iter()
+        .filter(|&n| dom.tag(n) == "a")
+        .filter_map(|n| dom.attr(n, "href").map(alloc::string::ToString::to_string))
+        .collect();
     // on one line, so the boot test can find it on the serial port
     println!(
-        "fetch: \"{}\", {} characters of text, {} links",
-        page.doc.title,
+        "fetch: \"{}\", {} characters of text, {} links, page height {} px",
+        page.title(),
         text,
-        page.doc.links.len()
+        links.len(),
+        page.layout.height
     );
-    for link in page.doc.links.iter().take(8) {
+    for link in links.iter().take(8) {
         println!("  {}", link);
     }
+}
+
+/// Evaluate a line of JavaScript and print the result.
+fn js(source: &str) {
+    if source.is_empty() {
+        println!("usage: js <expression>, e.g. js [1, 2, 3].map(x => x * 2)");
+        return;
+    }
+    let Some(mut ctx) = crate::js::Context::new() else {
+        println!("js: out of memory");
+        return;
+    };
+    let mut host = crate::js::ConsoleHost;
+    let _ = ctx.eval(&mut host, crate::js::BASE_PRELUDE, "<prelude>");
+    let t0 = crate::js::now_ms();
+    match ctx.eval(&mut host, source, "<shell>") {
+        Ok(v) => println!("{}", v),
+        Err(e) => println!("error: {}", e),
+    }
+    crate::serial::write_str(&alloc::format!(
+        "\njs: done in {} ms\n",
+        crate::js::now_ms() - t0
+    ));
 }

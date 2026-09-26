@@ -21,10 +21,10 @@ extern "C" {
         src: *const u8,
         len: usize,
         filename: *const c_char,
+        module: c_int,
         out: *mut *mut u8,
         out_len: *mut usize,
     ) -> c_int;
-    fn ejs_run_jobs(ctx: *mut c_void);
 }
 
 /// What a native call returns to JavaScript.
@@ -43,6 +43,14 @@ pub enum Value {
 /// The embedder: answers `__native` calls from scripts.
 pub trait Host {
     fn call(&mut self, op: &str, args: &[Option<&str>]) -> Value;
+    /// The full address of an imported module.
+    fn resolve_module(&mut self, _base: &str, _name: &str) -> Option<String> {
+        None
+    }
+    /// The source of a module, by its full address.
+    fn load_module(&mut self, _name: &str) -> Option<String> {
+        None
+    }
 }
 
 /// The host of the script that is running now.
@@ -69,7 +77,32 @@ impl Context {
 
     /// Run `source` as a global script with `host` answering native calls.
     /// Returns the completion value as text, or the error with its stack.
-    pub fn eval(&mut self, host: &mut dyn Host, source: &str, filename: &str) -> Result<String, String> {
+    pub fn eval(
+        &mut self,
+        host: &mut dyn Host,
+        source: &str,
+        filename: &str,
+    ) -> Result<String, String> {
+        self.eval_as(host, source, filename, false)
+    }
+
+    /// Run `source` as an ES module.
+    pub fn eval_module(
+        &mut self,
+        host: &mut dyn Host,
+        source: &str,
+        filename: &str,
+    ) -> Result<String, String> {
+        self.eval_as(host, source, filename, true)
+    }
+
+    fn eval_as(
+        &mut self,
+        host: &mut dyn Host,
+        source: &str,
+        filename: &str,
+        module: bool,
+    ) -> Result<String, String> {
         let mut name = Vec::with_capacity(filename.len() + 1);
         name.extend_from_slice(filename.as_bytes());
         name.retain(|&b| b != 0);
@@ -82,6 +115,7 @@ impl Context {
                 source.as_ptr(),
                 source.len(),
                 name.as_ptr() as *const c_char,
+                module as c_int,
                 &mut out,
                 &mut out_len,
             )
@@ -89,7 +123,8 @@ impl Context {
         let text = if out.is_null() {
             String::new()
         } else {
-            let s = String::from_utf8_lossy(unsafe { core::slice::from_raw_parts(out, out_len) }).into_owned();
+            let s = String::from_utf8_lossy(unsafe { core::slice::from_raw_parts(out, out_len) })
+                .into_owned();
             unsafe { libc::free(out) };
             s
         };
@@ -98,11 +133,6 @@ impl Context {
         } else {
             Err(text)
         }
-    }
-
-    /// Run queued promise reactions.
-    pub fn run_jobs(&mut self, host: &mut dyn Host) {
-        self.with_host(host, |ctx| unsafe { ejs_run_jobs(ctx) });
     }
 
     fn with_host<R>(&mut self, host: &mut dyn Host, f: impl FnOnce(*mut c_void) -> R) -> R {
@@ -175,6 +205,52 @@ unsafe extern "C" fn everos_js_native(
         }
     }
     kind
+}
+
+/// A malloc'ed, NUL-terminated copy of `s` for C.
+unsafe fn c_string(s: &str) -> *mut u8 {
+    let p = libc::malloc(s.len() + 1);
+    if !p.is_null() {
+        core::ptr::copy_nonoverlapping(s.as_ptr(), p, s.len());
+        *p.add(s.len()) = 0;
+    }
+    p
+}
+
+unsafe fn from_c<'a>(p: *const u8) -> &'a str {
+    if p.is_null() {
+        return "";
+    }
+    let mut n = 0;
+    while *p.add(n) != 0 {
+        n += 1;
+    }
+    core::str::from_utf8(core::slice::from_raw_parts(p, n)).unwrap_or("")
+}
+
+#[no_mangle]
+unsafe extern "C" fn everos_js_resolve_module(base: *const u8, name: *const u8) -> *mut u8 {
+    let Some(host) = HOST else {
+        return null_mut();
+    };
+    match (*host).resolve_module(from_c(base), from_c(name)) {
+        Some(r) => c_string(&r),
+        None => null_mut(),
+    }
+}
+
+#[no_mangle]
+unsafe extern "C" fn everos_js_load_module(name: *const u8, len: *mut usize) -> *mut u8 {
+    let Some(host) = HOST else {
+        return null_mut();
+    };
+    match (*host).load_module(from_c(name)) {
+        Some(src) => {
+            *len = src.len();
+            c_string(&src)
+        }
+        None => null_mut(),
+    }
 }
 
 #[no_mangle]

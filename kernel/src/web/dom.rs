@@ -59,12 +59,41 @@ const RAW: &[&str] = &[
     "script", "style", "title", "textarea", "xmp", "noscript", "iframe", "noembed", "noframes",
 ];
 /// Elements that belong in <head> when they come before the body.
-const HEAD_ONLY: &[&str] = &["title", "meta", "link", "style", "script", "base", "noscript"];
+const HEAD_ONLY: &[&str] = &[
+    "title", "meta", "link", "style", "script", "base", "noscript",
+];
 /// Starting one of these ends an open <p>.
 const CLOSES_P: &[&str] = &[
-    "address", "article", "aside", "blockquote", "details", "div", "dl", "fieldset", "figcaption",
-    "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hgroup", "hr",
-    "main", "menu", "nav", "ol", "p", "pre", "section", "table", "ul",
+    "address",
+    "article",
+    "aside",
+    "blockquote",
+    "details",
+    "div",
+    "dl",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hgroup",
+    "hr",
+    "main",
+    "menu",
+    "nav",
+    "ol",
+    "p",
+    "pre",
+    "section",
+    "table",
+    "ul",
 ];
 
 impl Dom {
@@ -181,6 +210,43 @@ impl Dom {
         false
     }
 
+    /// A copy of a node, with its descendants when `deep`, not in the tree.
+    pub fn clone_node(&mut self, id: NodeId, deep: bool) -> NodeId {
+        let data = match &self.nodes[id].data {
+            NodeData::Text(t) => NodeData::Text(t.clone()),
+            NodeData::Element(e) => NodeData::Element(Element {
+                tag: e.tag.clone(),
+                attrs: e.attrs.clone(),
+            }),
+            NodeData::Document => NodeData::Element(Element {
+                tag: String::from("#fragment"),
+                attrs: Vec::new(),
+            }),
+        };
+        let copy = self.add(data);
+        if deep {
+            for c in self.nodes[id].children.clone() {
+                let cc = self.clone_node(c, true);
+                self.nodes[cc].parent = Some(copy);
+                self.nodes[copy].children.push(cc);
+            }
+        }
+        copy
+    }
+
+    /// Whether a node is in the document.
+    pub fn connected(&self, mut n: NodeId) -> bool {
+        loop {
+            if n == DOCUMENT {
+                return true;
+            }
+            match self.nodes[n].parent {
+                Some(p) => n = p,
+                None => return false,
+            }
+        }
+    }
+
     pub fn remove_children(&mut self, id: NodeId) {
         for c in core::mem::take(&mut self.nodes[id].children) {
             self.nodes[c].parent = None;
@@ -233,7 +299,9 @@ impl Dom {
     }
 
     pub fn find_tag(&self, root: NodeId, tag: &str) -> Option<NodeId> {
-        self.descendants(root).into_iter().find(|&n| self.tag(n) == tag)
+        self.descendants(root)
+            .into_iter()
+            .find(|&n| self.tag(n) == tag)
     }
 
     pub fn by_id(&self, id: &str) -> Option<NodeId> {
@@ -421,7 +489,9 @@ impl TreeBuilder {
                         self.stack.retain(|&n| n != el);
                     }
                     i = match close {
-                        Some(_) => s[content_end..].find('>').map_or(bytes.len(), |e| content_end + e + 1),
+                        Some(_) => s[content_end..]
+                            .find('>')
+                            .map_or(bytes.len(), |e| content_end + e + 1),
                         None => bytes.len(),
                     };
                     text_start = i;

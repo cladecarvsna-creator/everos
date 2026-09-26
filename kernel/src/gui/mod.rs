@@ -19,7 +19,7 @@ mod terminal;
 mod text;
 mod theme;
 #[rustfmt::skip]
-mod web_font_data;
+pub mod webfont;
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
