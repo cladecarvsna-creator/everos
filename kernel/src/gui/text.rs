@@ -1,7 +1,7 @@
 //! Smooth, anti-aliased text. The glyphs are rasterised ahead of time by
 //! scripts/gen-aa-font.py into 8-bit coverage maps (font_data.rs).
 
-pub use super::font_data::{LARGE, MONO, TITLE, UI, UI_BOLD};
+pub use super::font_data::{CLOCK, HEADING, LARGE, MONO, TITLE, UI, UI_BOLD};
 
 #[derive(Clone, Copy)]
 pub struct Glyph {

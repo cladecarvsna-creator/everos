@@ -512,6 +512,72 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Draw a `sw` x `sh` image stretched to `dst`, blended with `alpha`
+    /// (0 to 256). Used for windows and menus that zoom and fade.
+    pub fn blit_scaled(&mut self, dst: Rect, src: &[u32], sw: i32, sh: i32, alpha: i32) {
+        let d = dst.offset(self.ox, self.oy);
+        let area = d.intersect(&self.clip);
+        if area.is_empty() || alpha <= 0 || sw <= 0 || sh <= 0 {
+            return;
+        }
+        // source position per destination pixel in 1/65536 steps
+        let step_x = ((sw as i64) << 16) / d.w as i64;
+        let step_y = ((sh as i64) << 16) / d.h as i64;
+        let a = alpha.min(256) as u32;
+        for y in area.y..area.bottom() {
+            let (x0, x1) = self.span(y);
+            let (x0, x1) = (x0.max(area.x), x1.min(area.right()));
+            if x0 >= x1 {
+                continue;
+            }
+            let sy = ((((y - d.y) as i64 * step_y) >> 16) as usize).min(sh as usize - 1);
+            let src_row = &src[sy * sw as usize..(sy + 1) * sw as usize];
+            let row = y as usize * self.stride;
+            let mut sx = (x0 - d.x) as i64 * step_x;
+            for x in x0..x1 {
+                let p = src_row[((sx >> 16) as usize).min(sw as usize - 1)];
+                let out = &mut self.pixels[row + x as usize];
+                *out = if a >= 256 { p } else { fast_mix(*out, p, a) };
+                sx += step_x;
+            }
+        }
+    }
+
+    /// Like `outline_round`, blended with `alpha` (0 to 256).
+    pub fn outline_round_alpha(&mut self, r: Rect, radius: i32, c: Color, alpha: i32) {
+        if alpha >= 256 {
+            self.outline_round(r, radius, c);
+            return;
+        }
+        let radius = radius.min(r.w / 2).min(r.h / 2).max(1);
+        let b = r.offset(self.ox, self.oy);
+        for x in b.x + radius..b.right() - radius {
+            self.blend(x, b.y, c, alpha);
+            self.blend(x, b.bottom() - 1, c, alpha);
+        }
+        for y in b.y + radius..b.bottom() - radius {
+            self.blend(b.x, y, c, alpha);
+            self.blend(b.right() - 1, y, c, alpha);
+        }
+        let ring = radius * 256 - 128;
+        for (x0, y0) in [
+            (b.x, b.y),
+            (b.right() - radius, b.y),
+            (b.x, b.bottom() - radius),
+            (b.right() - radius, b.bottom() - radius),
+        ] {
+            let cx = if x0 == b.x { b.x + radius } else { x0 };
+            let cy = if y0 == b.y { b.y + radius } else { y0 };
+            for y in y0..y0 + radius {
+                for x in x0..x0 + radius {
+                    let d = distance256(2 * x + 1 - 2 * cx, 2 * y + 1 - 2 * cy);
+                    let cover = (256 - (d - ring).abs()).clamp(0, 256);
+                    self.blend(x, y, c, cover * alpha / 256);
+                }
+            }
+        }
+    }
+
     /// Fill a polygon (even-odd rule, pixel centres), without smoothing.
     pub fn fill_polygon(&mut self, points: &[(i32, i32)], c: Color) {
         let top = points.iter().map(|p| p.1).min().unwrap_or(0);
@@ -539,6 +605,16 @@ impl<'a> Canvas<'a> {
             }
         }
     }
+}
+
+/// `mix` for whole buffers: red and blue share one multiply. `t` goes
+/// from 0 (all `a`) to 256 (all `b`).
+#[inline]
+pub fn fast_mix(a: Color, b: Color, t: u32) -> Color {
+    let s = 256 - t;
+    let rb = ((a & 0xff00ff) * s + (b & 0xff00ff) * t) >> 8;
+    let g = ((a & 0xff00) * s + (b & 0xff00) * t) >> 8;
+    (rb & 0xff00ff) | (g & 0xff00)
 }
 
 const MAX_RADIUS: usize = 16;
@@ -574,4 +650,59 @@ fn isqrt(n: u64) -> u64 {
 /// Width of text in the normal UI font.
 pub fn text_width(s: &str) -> i32 {
     text::UI.width(s)
+}
+
+/// A few rectangles that need drawing again. Changes far apart stay
+/// separate, so a blinking caret and a clock do not repaint everything
+/// between them.
+#[derive(Clone, Copy, Default)]
+pub struct Dirty {
+    rects: [Rect; Dirty::MAX],
+    len: usize,
+}
+
+impl Dirty {
+    const MAX: usize = 8;
+
+    pub fn add(&mut self, r: Rect) {
+        if r.is_empty() {
+            return;
+        }
+        let mut r = r;
+        // swallow every rectangle it touches, then add it
+        let mut i = 0;
+        while i < self.len {
+            let other = self.rects[i];
+            if !r.inset(-8).intersect(&other).is_empty() {
+                r = r.union(&other);
+                self.len -= 1;
+                self.rects[i] = self.rects[self.len];
+                i = 0;
+            } else {
+                i += 1;
+            }
+        }
+        if self.len == Self::MAX {
+            // full: merge into the one that grows least
+            let area = |r: &Rect| r.w as i64 * r.h as i64;
+            let best = (0..self.len)
+                .min_by_key(|&i| area(&self.rects[i].union(&r)) - area(&self.rects[i]))
+                .unwrap_or(0);
+            self.rects[best] = self.rects[best].union(&r);
+            return;
+        }
+        self.rects[self.len] = r;
+        self.len += 1;
+    }
+
+    /// Hand out the rectangles and start again.
+    pub fn take(&mut self) -> ([Rect; Dirty::MAX], usize) {
+        let out = (self.rects, self.len);
+        self.len = 0;
+        out
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }

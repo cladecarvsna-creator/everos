@@ -3,9 +3,15 @@
 //! centred taskbar with a start menu and a clock, and the mouse pointer.
 //!
 //! Everything is drawn into a back buffer in memory and then copied to
-//! the screen, so nothing flickers. Only the area that changed (the
-//! "dirty" rectangle) is redrawn and copied.
+//! the screen, so nothing flickers. Only the areas that changed (the
+//! "dirty" rectangles) are redrawn and copied.
+//!
+//! Before the desktop comes the sign-in screen (login.rs). Windows zoom
+//! and fade when they open and close and fly to the taskbar when
+//! minimised, the start menu slides up, and highlights fade in and out.
+//! Animations follow the timer, and each frame redraws only what moves.
 
+mod anim;
 mod browser;
 mod calc;
 mod canvas;
@@ -13,27 +19,32 @@ mod demo;
 #[rustfmt::skip]
 mod font_data;
 mod icons;
+mod login;
 mod paint;
 mod start;
 mod terminal;
 mod text;
 mod theme;
+mod tray;
 #[rustfmt::skip]
 pub mod webfont;
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use canvas::{mix, rgb, Canvas, Rect};
+use anim::{lerp, Fader, Tween, ONE};
+use canvas::{fast_mix, mix, rgb, Canvas, Dirty, Rect};
 use icons::{draw_icon, Icons};
+use login::Login;
 use start::StartMenu;
+use tray::{Panel, Tray};
 
 use crate::framebuffer::Framebuffer;
 use crate::interrupts::{self, KEYBOARD_BYTES, MOUSE_BYTES};
 use crate::keyboard::{Key, Keyboard, Layout};
 use crate::multiboot::BootInfo;
 use crate::sync::{ByteQueue, StaticBuffer};
-use crate::{console::CONSOLE, port, ps2, rtc, serial, vmmouse, StackString};
+use crate::{console::CONSOLE, port, ps2, rtc, serial, users, vmmouse, StackString};
 
 const MAX_W: usize = 1920;
 const MAX_H: usize = 1200;
@@ -43,12 +54,20 @@ static WALLPAPER: StaticBuffer<{ MAX_W * MAX_H }> = StaticBuffer::new();
 /// Window contents. Each app draws into its own part only when its content
 /// changes, so moving a window just copies pixels.
 static SURFACES: StaticBuffer<{ 6 * 1024 * 1024 }> = StaticBuffer::new();
+/// The blurred wallpaper behind the sign-in panel.
+static BACKDROP: StaticBuffer<{ MAX_W * MAX_H }> = StaticBuffer::new();
+/// The screen being faded away when signing in or locking.
+static SNAPSHOT: StaticBuffer<{ MAX_W * MAX_H }> = StaticBuffer::new();
+/// Where a zooming window or the sliding start menu is drawn before it
+/// is scaled and blended onto the screen.
+static SCRATCH: StaticBuffer<{ MAX_W * 1000 }> = StaticBuffer::new();
 
 /// Whether the desktop is running (the shell asks before opening apps).
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Apps to open or close, sent from the shell.
 static REQUESTS: ByteQueue = ByteQueue::new();
 const CLOSE: u8 = 0x80;
+const LOCK: u8 = 0x40;
 
 const TASKBAR_H: i32 = 48;
 const TITLE_H: i32 = 32;
@@ -124,6 +143,12 @@ pub fn request_address(address: &str) {
     browser::request_address(address);
 }
 
+/// Ask the desktop to show the lock screen.
+pub fn request_lock() -> bool {
+    REQUESTS.push(LOCK);
+    ACTIVE.load(Ordering::Relaxed)
+}
+
 /// Ask the desktop to close an app's window.
 pub fn request_close(app: App) -> bool {
     REQUESTS.push(CLOSE | app.index() as u8);
@@ -148,17 +173,38 @@ pub enum MouseKind {
     Up,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Motion {
+    /// Opening or closing: grow or shrink a little and fade.
+    Zoom,
+    /// Flying to or from the taskbar button.
+    Minimize,
+}
+
+#[derive(Clone, Copy)]
+struct WindowAnim {
+    motion: Motion,
+    /// 0 is gone, ONE is fully there.
+    tween: Tween,
+}
+
 #[derive(Clone, Copy)]
 struct Window {
     /// Outer frame, including the title bar and border.
     rect: Rect,
     open: bool,
     minimized: bool,
+    anim: Option<WindowAnim>,
 }
 
 impl Window {
     fn visible(&self) -> bool {
         self.open && !self.minimized
+    }
+
+    /// Whether it is on the screen, also while it animates away.
+    fn drawn(&self) -> bool {
+        self.visible() || self.anim.is_some()
     }
 
     fn client(&self) -> Rect {
@@ -184,23 +230,42 @@ impl Window {
 
     /// Everything the window draws on, shadow included.
     fn bounds(&self) -> Rect {
-        Rect::new(
-            self.rect.x - SPREAD,
-            self.rect.y - SPREAD,
-            self.rect.w + 2 * SPREAD,
-            self.rect.h + 2 * SPREAD + SHADOW_DROP,
-        )
+        shadow_bounds(self.rect)
     }
+}
+
+/// A frame and its shadow.
+fn shadow_bounds(r: Rect) -> Rect {
+    Rect::new(
+        r.x - SPREAD,
+        r.y - SPREAD,
+        r.w + 2 * SPREAD,
+        r.h + 2 * SPREAD + SHADOW_DROP,
+    )
+}
+
+/// What the screen shows.
+#[derive(Clone, Copy)]
+enum Phase {
+    /// The lock screen or the sign-in panel.
+    Login,
+    /// The sign-in screen (in SNAPSHOT) fading into the desktop.
+    Unlocking(Tween),
+    /// The desktop (in SNAPSHOT) fading into the lock screen.
+    Locking(Tween),
+    Desktop,
 }
 
 /// What is under the mouse and lights up.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Hover {
-    None,
     Minimize(App),
     Close(App),
     /// A taskbar button: 0 is Start, then the apps.
     Slot(usize),
+    /// A tray button: the layout, quick settings or the clock.
+    Tray(usize),
+    Quick(tray::Target),
 }
 
 pub struct Desktop<'a> {
@@ -227,8 +292,27 @@ pub struct Desktop<'a> {
     drag: Option<(App, i32, i32)>,
     /// App that got the button press and gets the moves until release.
     capture: Option<App>,
-    hover: Hover,
+    hover: Fader<Hover>,
     start: StartMenu,
+    /// How far the start menu is open, for its slide.
+    menu: Tween,
+    menu_moving: bool,
+    tray: Tray,
+    /// The open tray flyout, and the one last shown for its slide.
+    panel: Option<Panel>,
+    panel_shown: Panel,
+    panel_anim: Tween,
+    panel_moving: bool,
+    /// The quick settings slider being dragged.
+    slider: Option<tray::Slider>,
+    /// Asks the main loop to switch the keyboard layout.
+    toggle_layout: bool,
+    /// Copy the whole back buffer to the screen next frame (brightness).
+    present_all: bool,
+    phase: Phase,
+    login: Login,
+    /// Who the open windows belong to.
+    session_user: Option<usize>,
     /// Mouse buttons as the PS/2 mouse and the vmmouse last reported them.
     ps2_buttons: (bool, bool),
     vm_buttons: (bool, bool),
@@ -239,8 +323,11 @@ pub struct Desktop<'a> {
 
     layout: Layout,
     clock: StackString<16>,
+    date: StackString<16>,
     cursor_on: bool,
-    dirty: Rect,
+    dirty: Dirty,
+    snapshot: &'static mut [u32],
+    scratch: &'static mut [u32],
     surfaces: [&'static mut [u32]; APPS.len()],
     /// Apps whose surface must be drawn again.
     stale: [bool; APPS.len()],
@@ -259,6 +346,7 @@ impl<'a> Desktop<'a> {
             rect: Rect::default(),
             open: false,
             minimized: false,
+            anim: None,
         }; APPS.len()];
         for app in APPS {
             let (w, h) = app.client_size();
@@ -277,6 +365,7 @@ impl<'a> Desktop<'a> {
         });
         let wallpaper = WALLPAPER.take();
         draw_wallpaper(&mut Canvas::new(wallpaper, width as usize, height as usize));
+        let login = Login::new(wallpaper, BACKDROP.take(), width, height);
         Self {
             fb,
             back: BACK_BUFFER.take(),
@@ -296,8 +385,21 @@ impl<'a> Desktop<'a> {
             right: false,
             drag: None,
             capture: None,
-            hover: Hover::None,
+            hover: Fader::new(anim::ms(120)),
             start: StartMenu::new(),
+            menu: Tween::new(0, 0, 1),
+            menu_moving: false,
+            tray: Tray::new(),
+            panel: None,
+            panel_shown: Panel::Quick,
+            panel_anim: Tween::new(0, 0, 1),
+            panel_moving: false,
+            slider: None,
+            toggle_layout: false,
+            present_all: false,
+            phase: Phase::Login,
+            login,
+            session_user: None,
             ps2_buttons: (false, false),
             vm_buttons: (false, false),
             vm_position: (0, 0),
@@ -305,8 +407,11 @@ impl<'a> Desktop<'a> {
             last_click: (0, usize::MAX),
             layout: Layout::Us,
             clock: StackString::new(),
+            date: StackString::new(),
             cursor_on: true,
-            dirty: Rect::default(),
+            dirty: Dirty::default(),
+            snapshot: SNAPSHOT.take(),
+            scratch: SCRATCH.take(),
             surfaces,
             stale: [true; APPS.len()],
             terminal: terminal::Terminal::new(),
@@ -321,13 +426,212 @@ impl<'a> Desktop<'a> {
     }
 
     fn damage(&mut self, r: Rect) {
-        self.dirty = self.dirty.union(&r);
+        self.dirty.add(r.intersect(&self.screen()));
     }
 
     fn damage_window(&mut self, app: App) {
         let w = self.windows[app.index()];
         if w.visible() {
             self.damage(w.bounds());
+        }
+    }
+
+    // ---- animations -------------------------------------------------------
+
+    /// Start a window moving towards `to` (0 gone, ONE there). An
+    /// animation already running the same way turns around smoothly.
+    fn animate(&mut self, app: App, motion: Motion, to: i32) {
+        let duration = match (motion, to) {
+            (Motion::Zoom, ONE) => anim::ms(200),
+            (Motion::Zoom, _) => anim::ms(150),
+            (Motion::Minimize, _) => anim::ms(260),
+        };
+        let w = &mut self.windows[app.index()];
+        match &mut w.anim {
+            Some(a) if a.motion == motion => a.tween.retarget(to, duration),
+            _ => {
+                let tween = Tween::new(ONE - to, to, duration);
+                w.anim = Some(WindowAnim { motion, tween });
+            }
+        }
+        self.damage(self.anim_envelope(app));
+    }
+
+    /// Where a window minimises to: a small frame over its taskbar button.
+    fn minimized_rect(&self, app: App) -> Rect {
+        let r = self.windows[app.index()].rect;
+        let slot = self.slot_rect(app.index() + 1);
+        let (w, h) = (r.w / 6, r.h / 6);
+        Rect::new(
+            slot.x + slot.w / 2 - w / 2,
+            self.height - TASKBAR_H - h / 2,
+            w,
+            h,
+        )
+    }
+
+    /// The frame of an animating window now, and how opaque it is.
+    fn anim_frame(&self, app: App) -> Option<(Rect, i32)> {
+        let w = &self.windows[app.index()];
+        let a = w.anim?;
+        let p = a.tween.value();
+        let r = w.rect;
+        Some(match a.motion {
+            Motion::Zoom => {
+                let scale = lerp(ONE * 92 / 100, ONE, p);
+                let (nw, nh) = (r.w * scale / ONE, r.h * scale / ONE);
+                let frame = Rect::new(r.x + (r.w - nw) / 2, r.y + (r.h - nh) / 2, nw, nh);
+                (frame, p)
+            }
+            Motion::Minimize => {
+                let t = self.minimized_rect(app);
+                let frame = Rect::new(
+                    lerp(t.x, r.x, p),
+                    lerp(t.y, r.y, p),
+                    lerp(t.w, r.w, p),
+                    lerp(t.h, r.h, p),
+                );
+                // stay solid for most of the way
+                (frame, (p * 2).min(ONE))
+            }
+        })
+    }
+
+    /// Everything an animating window may cover on its way.
+    fn anim_envelope(&self, app: App) -> Rect {
+        let w = &self.windows[app.index()];
+        match w.anim {
+            Some(a) if a.motion == Motion::Minimize => {
+                w.bounds().union(&shadow_bounds(self.minimized_rect(app)))
+            }
+            _ => w.bounds(),
+        }
+    }
+
+    /// Move every animation on by the time that has passed and mark
+    /// what it changes.
+    fn tick(&mut self) {
+        match self.phase {
+            Phase::Unlocking(t) | Phase::Locking(t) if t.done() => {
+                self.phase = match self.phase {
+                    Phase::Locking(_) => Phase::Login,
+                    _ => Phase::Desktop,
+                };
+                self.damage(self.screen());
+            }
+            _ => {}
+        }
+        self.login.tick();
+        let (rects, n) = self.login.dirty.take();
+        if matches!(self.phase, Phase::Login | Phase::Locking(_)) {
+            for r in &rects[..n] {
+                self.damage(*r);
+            }
+        }
+
+        for app in APPS {
+            let Some(a) = self.windows[app.index()].anim else {
+                continue;
+            };
+            self.damage(self.anim_envelope(app));
+            if a.tween.done() {
+                let w = &mut self.windows[app.index()];
+                w.anim = None;
+                if a.motion == Motion::Zoom && !w.open {
+                    self.remove_from_order(app);
+                }
+            }
+        }
+        // one more frame once it stops, to draw where it ended
+        let menu_moving = !self.menu.done();
+        let menu_was_moving = core::mem::replace(&mut self.menu_moving, menu_moving);
+        if menu_moving || menu_was_moving || self.start.tick() {
+            let r = self.menu_rect();
+            self.damage(r.union(&r.offset(0, 48)));
+        }
+        let panel_moving = !self.panel_anim.done();
+        let panel_was_moving = core::mem::replace(&mut self.panel_moving, panel_moving);
+        if panel_moving || panel_was_moving {
+            let r = self.panel_rect(self.panel_shown).inset(-SPREAD);
+            self.damage(r.union(&r.offset(0, 48)));
+        }
+        if self.hover.tick() {
+            for h in self.hover.lit().into_iter().flatten() {
+                self.damage(self.hover_rect(h));
+            }
+        }
+    }
+
+    // ---- signing in and out -----------------------------------------------
+
+    /// Keep what the screen shows now, without the pointer, to fade from.
+    fn take_snapshot(&mut self) {
+        let mut back = core::mem::take(&mut self.back);
+        let mut scratch = core::mem::take(&mut self.scratch);
+        {
+            let mut c = Canvas::new(back, self.width as usize, self.height as usize);
+            self.draw_scene(&mut c, scratch);
+        }
+        let n = (self.width * self.height) as usize;
+        self.snapshot[..n].copy_from_slice(&back[..n]);
+        core::mem::swap(&mut self.back, &mut back);
+        core::mem::swap(&mut self.scratch, &mut scratch);
+    }
+
+    fn signed_in(&mut self) {
+        self.take_snapshot();
+        let user = users::current();
+        if self.session_user != user {
+            // someone else: start a fresh session
+            self.close_all();
+            self.session_user = user;
+        }
+        self.phase = Phase::Unlocking(Tween::new(0, ONE, anim::ms(450)));
+        self.damage(self.screen());
+        if self.order_len == 0 {
+            self.open(App::Terminal);
+        }
+    }
+
+    fn lock(&mut self, sign_out: bool) {
+        if !matches!(self.phase, Phase::Desktop) {
+            return;
+        }
+        self.start.open = false;
+        self.menu = Tween::new(0, 0, 1);
+        self.panel = None;
+        self.panel_anim = Tween::new(0, 0, 1);
+        self.slider = None;
+        self.drag = None;
+        self.capture = None;
+        self.take_snapshot();
+        if sign_out {
+            users::sign_out();
+            self.close_all();
+            self.session_user = None;
+        }
+        self.login.lock();
+        self.phase = Phase::Locking(Tween::new(0, ONE, anim::ms(450)));
+        self.damage(self.screen());
+    }
+
+    /// Close every window at once, without animations.
+    fn close_all(&mut self) {
+        for w in &mut self.windows {
+            w.open = false;
+            w.minimized = false;
+            w.anim = None;
+        }
+        self.order_len = 0;
+        self.focused = None;
+    }
+
+    fn login_outcome(&mut self, outcome: login::Outcome) {
+        match outcome {
+            login::Outcome::None => {}
+            login::Outcome::SignedIn => self.signed_in(),
+            login::Outcome::Restart => restart(),
+            login::Outcome::ShutDown => shut_down(),
         }
     }
 
@@ -346,15 +650,17 @@ impl<'a> Desktop<'a> {
         let w = &mut self.windows[app.index()];
         if !w.open {
             w.open = true;
-            self.order[self.order_len] = app;
-            self.order_len += 1;
+            w.minimized = false;
             // for the boot test, which only sees the serial port
             serial::write_str("\ndesktop: opened ");
             serial::write_str(app.title());
             serial::write_str("\n");
             self.start.note_opened(app);
+            self.animate(app, Motion::Zoom, ONE);
+        } else if w.minimized {
+            w.minimized = false;
+            self.animate(app, Motion::Minimize, ONE);
         }
-        w.minimized = false;
         if app == App::Browser {
             self.browser.start();
         }
@@ -367,8 +673,9 @@ impl<'a> Desktop<'a> {
             return;
         }
         self.damage_window(app);
+        // it stays in the stacking order until it has faded out
         self.windows[app.index()].open = false;
-        self.remove_from_order(app);
+        self.animate(app, Motion::Zoom, 0);
         if self.focused == Some(app) {
             self.focus_top();
         }
@@ -378,6 +685,7 @@ impl<'a> Desktop<'a> {
     fn minimize(&mut self, app: App) {
         self.damage_window(app);
         self.windows[app.index()].minimized = true;
+        self.animate(app, Motion::Minimize, 0);
         if self.focused == Some(app) {
             self.focus_top();
         }
@@ -447,9 +755,26 @@ impl<'a> Desktop<'a> {
     // ---- input -------------------------------------------------------------
 
     fn on_key(&mut self, key: Key) {
+        match self.phase {
+            Phase::Login => {
+                let outcome = self.login.on_key(key);
+                self.login_outcome(outcome);
+                return;
+            }
+            Phase::Locking(_) => return,
+            // typing can start while the desktop fades in
+            Phase::Unlocking(_) | Phase::Desktop => {}
+        }
         if let Key::LayoutChanged = key {
             self.damage_taskbar();
+            self.damage_panel();
             return;
+        }
+        if self.panel.is_some() {
+            if let Key::Escape = key {
+                self.close_panel();
+                return;
+            }
         }
         if self.start.open {
             match self.start.on_key(key) {
@@ -502,6 +827,7 @@ impl<'a> Desktop<'a> {
         }
         self.pointer(x, y);
         if ev.wheel != 0
+            && matches!(self.phase, Phase::Desktop)
             && self.window_at(self.mouse_x, self.mouse_y) == Some(App::Browser)
             && self.browser.on_wheel(ev.wheel)
         {
@@ -523,6 +849,19 @@ impl<'a> Desktop<'a> {
         let (was_left, was_right) = (self.left, self.right);
         self.left = self.ps2_buttons.0 || self.vm_buttons.0;
         self.right = self.ps2_buttons.1 || self.vm_buttons.1;
+
+        match self.phase {
+            Phase::Desktop => {}
+            Phase::Login => {
+                self.login.on_move(self.mouse_x, self.mouse_y);
+                if self.left && !was_left {
+                    let outcome = self.login.on_click(self.mouse_x, self.mouse_y);
+                    self.login_outcome(outcome);
+                }
+                return;
+            }
+            Phase::Unlocking(_) | Phase::Locking(_) => return,
+        }
 
         if self.left && !was_left {
             self.press(false);
@@ -549,15 +888,14 @@ impl<'a> Desktop<'a> {
     /// Light up whatever is under the mouse now.
     fn update_hover(&mut self) {
         let hover = if self.drag.is_some() {
-            Hover::None
+            None
         } else {
             self.hover_at(self.mouse_x, self.mouse_y)
         };
-        if hover != self.hover {
-            let (old, new) = (self.hover_rect(self.hover), self.hover_rect(hover));
-            self.hover = hover;
-            self.damage(old);
-            self.damage(new);
+        if self.hover.set(hover) {
+            for h in self.hover.lit().into_iter().flatten() {
+                self.damage(self.hover_rect(h));
+            }
         }
         if self.start.open
             && self
@@ -568,37 +906,45 @@ impl<'a> Desktop<'a> {
         }
     }
 
-    fn hover_at(&self, x: i32, y: i32) -> Hover {
+    fn hover_at(&self, x: i32, y: i32) -> Option<Hover> {
         if self.start.open && self.menu_panel().contains(x, y) {
-            return Hover::None;
+            return None;
+        }
+        if let Some(panel) = self.panel {
+            let r = self.panel_rect(panel);
+            if r.contains(x, y) {
+                return match panel {
+                    Panel::Quick => self.tray.target_at(r, x, y).map(Hover::Quick),
+                    Panel::Calendar => None,
+                };
+            }
         }
         if y >= self.height - TASKBAR_H {
-            return match (0..=APPS.len()).find(|&i| self.slot_rect(i).contains(x, y)) {
-                Some(i) => Hover::Slot(i),
-                None => Hover::None,
-            };
-        }
-        match self.window_at(x, y) {
-            Some(app) => {
-                let w = self.windows[app.index()];
-                if w.close_button().contains(x, y) {
-                    Hover::Close(app)
-                } else if w.minimize_button().contains(x, y) {
-                    Hover::Minimize(app)
-                } else {
-                    Hover::None
-                }
+            if let Some(i) = (0..3).find(|&i| self.tray_rect(i).contains(x, y)) {
+                return Some(Hover::Tray(i));
             }
-            None => Hover::None,
+            return (0..=APPS.len())
+                .find(|&i| self.slot_rect(i).contains(x, y))
+                .map(Hover::Slot);
+        }
+        let app = self.window_at(x, y)?;
+        let w = self.windows[app.index()];
+        if w.close_button().contains(x, y) {
+            Some(Hover::Close(app))
+        } else if w.minimize_button().contains(x, y) {
+            Some(Hover::Minimize(app))
+        } else {
+            None
         }
     }
 
     fn hover_rect(&self, hover: Hover) -> Rect {
         match hover {
-            Hover::None => Rect::default(),
             Hover::Minimize(app) => self.windows[app.index()].minimize_button(),
             Hover::Close(app) => self.windows[app.index()].close_button(),
             Hover::Slot(i) => self.slot_rect(i),
+            Hover::Tray(i) => self.tray_rect(i),
+            Hover::Quick(_) => self.panel_rect(Panel::Quick),
         }
     }
 
@@ -616,6 +962,21 @@ impl<'a> Desktop<'a> {
             let on_start = self.slot_rect(0).contains(x, y);
             self.close_menu();
             if on_start {
+                return;
+            }
+        }
+        if let Some(panel) = self.panel {
+            let r = self.panel_rect(panel);
+            if r.contains(x, y) {
+                if !right && panel == Panel::Quick {
+                    self.quick_click(r, x, y);
+                }
+                return;
+            }
+            // a click on the button that opened it only closes it
+            let own = self.tray_rect(if panel == Panel::Quick { 1 } else { 2 });
+            self.close_panel();
+            if own.contains(x, y) {
                 return;
             }
         }
@@ -663,7 +1024,9 @@ impl<'a> Desktop<'a> {
     }
 
     fn held_move(&mut self) {
-        if let Some((app, dx, dy)) = self.drag {
+        if let Some(s) = self.slider {
+            self.drag_slider(s);
+        } else if let Some((app, dx, dy)) = self.drag {
             self.move_window(app, self.mouse_x - dx, self.mouse_y - dy);
         } else if let Some(app) = self.capture {
             self.send_mouse(app, MouseKind::Move);
@@ -675,6 +1038,7 @@ impl<'a> Desktop<'a> {
             return;
         }
         self.drag = None;
+        self.slider = None;
         if let Some(app) = self.capture.take() {
             self.send_mouse(app, MouseKind::Up);
         }
@@ -699,6 +1063,15 @@ impl<'a> Desktop<'a> {
     }
 
     fn taskbar_click(&mut self, x: i32, y: i32) {
+        match (0..3).find(|&i| self.tray_rect(i).contains(x, y)) {
+            Some(0) => {
+                self.toggle_layout = true;
+                return;
+            }
+            Some(1) => return self.open_panel(Panel::Quick),
+            Some(_) => return self.open_panel(Panel::Calendar),
+            None => {}
+        }
         let Some(slot) = (0..=APPS.len()).find(|&i| self.slot_rect(i).contains(x, y)) else {
             return;
         };
@@ -715,10 +1088,97 @@ impl<'a> Desktop<'a> {
         }
     }
 
+    // ---- tray ------------------------------------------------------------------
+
+    /// Tray button `i` from the left: the layout, quick settings, the clock.
+    fn tray_rect(&self, i: usize) -> Rect {
+        let top = self.height - TASKBAR_H + 4;
+        match i {
+            0 => Rect::new(self.width - 240, top, 52, 40),
+            1 => Rect::new(self.width - 184, top, 72, 40),
+            _ => Rect::new(self.width - 108, top, 100, 40),
+        }
+    }
+
+    /// Where a tray flyout sits: above the taskbar, at the right.
+    fn panel_rect(&self, panel: Panel) -> Rect {
+        let (w, h) = panel.size();
+        Rect::new(self.width - 12 - w, self.height - TASKBAR_H - 12 - h, w, h)
+    }
+
+    fn damage_panel(&mut self) {
+        if self.panel.is_some() {
+            self.damage(self.panel_rect(self.panel_shown));
+        }
+    }
+
+    fn open_panel(&mut self, panel: Panel) {
+        self.close_menu();
+        if self.panel.is_some() {
+            self.damage(self.panel_rect(self.panel_shown).inset(-SPREAD));
+        }
+        if self.panel_shown != panel {
+            // a different flyout slides in from the start
+            self.panel_anim = Tween::new(0, 0, 1);
+        }
+        self.panel = Some(panel);
+        self.panel_shown = panel;
+        if panel == Panel::Quick {
+            self.tray.update_net();
+        }
+        self.panel_anim.retarget(ONE, anim::ms(220));
+        self.damage(self.panel_rect(panel).inset(-SPREAD));
+        self.damage_taskbar();
+    }
+
+    fn close_panel(&mut self) {
+        if self.panel.take().is_some() {
+            self.slider = None;
+            self.panel_anim.retarget(0, anim::ms(160));
+            self.damage(self.panel_rect(self.panel_shown).inset(-SPREAD));
+            self.damage_taskbar();
+        }
+    }
+
+    fn quick_click(&mut self, r: Rect, x: i32, y: i32) {
+        match self.tray.target_at(r, x, y) {
+            Some(tray::Target::LayoutTile) => self.toggle_layout = true,
+            Some(tray::Target::NetworkTile) => {
+                // start the network if nothing has yet
+                crate::net::init();
+                self.tray.update_net();
+                self.damage(r);
+            }
+            Some(tray::Target::Slider(s)) => {
+                self.slider = Some(s);
+                self.drag_slider(s);
+            }
+            None => {}
+        }
+    }
+
+    fn drag_slider(&mut self, s: tray::Slider) {
+        let r = self.panel_rect(Panel::Quick);
+        if self.tray.drag(r, s, self.mouse_x) {
+            self.damage(r);
+            if s == tray::Slider::Brightness {
+                self.present_all = true;
+            } else {
+                self.damage_tray();
+            }
+        }
+    }
+
+    fn damage_tray(&mut self) {
+        self.damage(self.tray_rect(0).union(&self.tray_rect(2)));
+    }
+
     fn open_menu(&mut self) {
+        self.close_panel();
         self.start.show();
         self.start
             .set_hover(self.menu_panel(), self.mouse_x, self.mouse_y);
+        self.menu.retarget(ONE, anim::ms(220));
         self.damage(self.menu_rect());
         self.damage_taskbar();
     }
@@ -726,6 +1186,7 @@ impl<'a> Desktop<'a> {
     fn close_menu(&mut self) {
         if self.start.open {
             self.start.open = false;
+            self.menu.retarget(0, anim::ms(160));
             self.damage(self.menu_rect());
             self.damage_taskbar();
         }
@@ -742,6 +1203,8 @@ impl<'a> Desktop<'a> {
             }
             start::Action::Restart => restart(),
             start::Action::ShutDown => shut_down(),
+            start::Action::Lock => self.lock(false),
+            start::Action::SignOut => self.lock(true),
         }
     }
 
@@ -769,15 +1232,43 @@ impl<'a> Desktop<'a> {
     // ---- drawing -----------------------------------------------------------
 
     fn render(&mut self) {
-        let dirty = self.dirty.intersect(&self.screen());
-        self.dirty = Rect::default();
-        if dirty.is_empty() {
+        let fading = match self.phase {
+            Phase::Unlocking(t) | Phase::Locking(t) => Some(t),
+            _ => None,
+        };
+        if self.dirty.is_empty() && fading.is_none() && !self.present_all {
             return;
         }
-        // bring stale window contents up to date first
+        self.update_surfaces();
+        let (rects, n) = self.dirty.take();
+        let mut back = core::mem::take(&mut self.back);
+        let mut scratch = core::mem::take(&mut self.scratch);
+        for r in &rects[..n] {
+            let mut c = Canvas::new(back, self.width as usize, self.height as usize);
+            c.clip_to(*r);
+            self.draw_scene(&mut c, scratch);
+            self.pointer_image.draw(&mut c, self.mouse_x, self.mouse_y);
+        }
+        core::mem::swap(&mut self.back, &mut back);
+        core::mem::swap(&mut self.scratch, &mut scratch);
+        match fading {
+            // the old screen over the new one, fading out
+            Some(t) => self.present_fade((ONE - t.value()) as u32),
+            None if self.present_all => self.present(self.screen()),
+            None => {
+                for r in &rects[..n] {
+                    self.present(*r);
+                }
+            }
+        }
+        self.present_all = false;
+    }
+
+    /// Bring stale window contents up to date.
+    fn update_surfaces(&mut self) {
         let surfaces = core::mem::take(&mut self.surfaces);
         for app in APPS {
-            if self.stale[app.index()] && self.windows[app.index()].visible() {
+            if self.stale[app.index()] && self.windows[app.index()].drawn() {
                 self.stale[app.index()] = false;
                 let (w, h) = app.client_size();
                 let mut c = Canvas::new(surfaces[app.index()], w as usize, h as usize);
@@ -792,36 +1283,36 @@ impl<'a> Desktop<'a> {
             }
         }
         self.surfaces = surfaces;
+    }
 
-        let back = core::mem::take(&mut self.back);
-        {
-            let mut c = Canvas::new(back, self.width as usize, self.height as usize);
-            c.clip_to(dirty);
-            c.blit(
-                0,
-                0,
-                self.width,
-                self.height,
-                self.wallpaper,
-                self.width as usize,
-            );
-            self.draw_icons(&mut c);
-            for i in 0..self.order_len {
-                let app = self.order[i];
-                if self.windows[app.index()].visible() {
-                    self.draw_window(&mut c, app);
-                }
-            }
-            self.draw_taskbar(&mut c);
-            if self.start.open {
-                let blink = self.cursor_on;
-                self.start
-                    .draw(&mut c, self.menu_panel(), &self.icons, blink);
-            }
-            self.pointer_image.draw(&mut c, self.mouse_x, self.mouse_y);
+    /// Draw everything but the pointer inside the canvas's clip.
+    fn draw_scene(&self, c: &mut Canvas, scratch: &mut [u32]) {
+        if matches!(self.phase, Phase::Login | Phase::Locking(_)) {
+            self.login.draw(c, self.wallpaper);
+            return;
         }
-        self.back = back;
-        self.present(dirty);
+        c.blit(
+            0,
+            0,
+            self.width,
+            self.height,
+            self.wallpaper,
+            self.width as usize,
+        );
+        self.draw_icons(c);
+        for i in 0..self.order_len {
+            let app = self.order[i];
+            if self.windows[app.index()].drawn() {
+                self.draw_window(c, app, scratch);
+            }
+        }
+        self.draw_taskbar(c);
+        if self.start.open || self.menu.value() > 0 {
+            self.draw_menu(c, scratch);
+        }
+        if self.panel.is_some() || self.panel_anim.value() > 0 {
+            self.draw_panel(c, scratch);
+        }
     }
 
     /// Copy part of the back buffer to the screen.
@@ -830,8 +1321,15 @@ impl<'a> Desktop<'a> {
         let stride = self.width as usize;
         let native = fb.bytes_per_pixel == 4
             && (fb.red.position, fb.green.position, fb.blue.position) == (16, 8, 0);
+        let dim = self.dim();
+        let mut dimmed = [0u32; MAX_W];
         for y in r.y as usize..r.bottom() as usize {
-            let row = &self.back[y * stride + r.x as usize..y * stride + r.right() as usize];
+            let mut row = &self.back[y * stride + r.x as usize..y * stride + r.right() as usize];
+            if dim > 0 {
+                let out = &mut dimmed[..row.len()];
+                fade_row(out, row, &BLACK[..row.len()], dim);
+                row = out;
+            }
             if native {
                 unsafe {
                     let dst = fb.base.add(y * fb.pitch + r.x as usize * 4) as *mut u32;
@@ -839,9 +1337,41 @@ impl<'a> Desktop<'a> {
                 }
             } else {
                 for (i, &p) in row.iter().enumerate() {
-                    let color =
-                        crate::framebuffer::Rgb::new((p >> 16) as u8, (p >> 8) as u8, p as u8);
-                    fb.put_raw(r.x as usize + i, y, fb.encode(color));
+                    put_pixel(fb, r.x as usize + i, y, p);
+                }
+            }
+        }
+    }
+
+    /// How much to darken the picture for the brightness setting, 0 to 256.
+    fn dim(&self) -> u32 {
+        ((100 - self.tray.brightness.clamp(tray::MIN_BRIGHTNESS, 100)) * 256 / 100) as u32
+    }
+
+    /// Show the snapshot blended over the back buffer with `alpha` (0 to
+    /// 256), for the fade between the sign-in screen and the desktop.
+    fn present_fade(&self, alpha: u32) {
+        let fb = &self.fb;
+        let (w, h) = (self.width as usize, self.height as usize);
+        let native = fb.bytes_per_pixel == 4
+            && (fb.red.position, fb.green.position, fb.blue.position) == (16, 8, 0);
+        let mut row = [0u32; MAX_W];
+        let dim = self.dim();
+        for y in 0..h {
+            let (back, snap) = (&self.back[y * w..][..w], &self.snapshot[y * w..][..w]);
+            fade_row(&mut row[..w], back, snap, alpha);
+            if dim > 0 {
+                let faded = row;
+                fade_row(&mut row[..w], &faded[..w], &BLACK[..w], dim);
+            }
+            if native {
+                unsafe {
+                    let dst = fb.base.add(y * fb.pitch) as *mut u32;
+                    core::ptr::copy_nonoverlapping(row.as_ptr(), dst, w);
+                }
+            } else {
+                for (x, &p) in row[..w].iter().enumerate() {
+                    put_pixel(fb, x, y, p);
                 }
             }
         }
@@ -864,69 +1394,177 @@ impl<'a> Desktop<'a> {
         }
     }
 
-    fn draw_window(&self, c: &mut Canvas, app: App) {
+    fn draw_window(&self, c: &mut Canvas, app: App, scratch: &mut [u32]) {
         let w = self.windows[app.index()];
-        if !c.visible(w.bounds()) {
-            return;
-        }
-        let r = w.rect;
         let focused = self.focused == Some(app);
         let strength = if focused { 120 } else { 70 };
-        c.shadow(r, WINDOW_RADIUS, SPREAD, SHADOW_DROP, strength);
-
-        {
-            let mut win = c.sub(Rect::new(0, 0, c.width, c.height));
-            win.clip_round(r, WINDOW_RADIUS);
-            let title_face = if focused {
-                rgb(0xee, 0xf1, 0xf8)
-            } else {
-                theme::FACE
-            };
-            win.fill(w.title_bar(), title_face);
-            self.icons.draw_small(&mut win, app, r.x + 12, r.y + 8);
-            let text = if focused {
-                theme::TEXT
-            } else {
-                theme::TEXT_DIM
-            };
-            win.draw_text(r.x + 38, r.y + 8, app.title(), text);
-
-            // caption buttons: flat until the mouse is over them
-            let min = w.minimize_button();
-            if self.hover == Hover::Minimize(app) {
-                win.fill(min, mix(title_face, theme::TEXT, 25));
-            }
-            let (mx, my) = (min.x + 18, min.y + 16);
-            win.fill_rect(mx, my, 10, 1, text);
-
-            let close = w.close_button();
-            let close_glyph = if self.hover == Hover::Close(app) {
-                win.fill(close, rgb(0xc4, 0x2b, 0x1c));
-                0xffffff
-            } else {
-                text
-            };
-            let (cx, cy) = (close.x + 18, close.y + 11);
-            win.line(cx, cy, cx + 9, cy + 9, close_glyph);
-            win.line(cx + 9, cy, cx, cy + 9, close_glyph);
-
-            let client = w.client();
-            let surface = &self.surfaces[app.index()];
-            win.blit(
-                client.x,
-                client.y,
-                client.w,
-                client.h,
-                surface,
-                client.w as usize,
-            );
-        }
         let border = if focused {
             rgb(0x8c, 0x90, 0x9c)
         } else {
             rgb(0xb4, 0xb4, 0xb8)
         };
-        c.outline_round(r, WINDOW_RADIUS, border);
+        let r = w.rect;
+        let size = (r.w * r.h) as usize;
+        let Some((frame, alpha)) = self.anim_frame(app).filter(|_| size <= scratch.len()) else {
+            if !c.visible(w.bounds()) || !w.visible() {
+                return;
+            }
+            c.shadow(r, WINDOW_RADIUS, SPREAD, SHADOW_DROP, strength);
+            {
+                let mut win = c.sub(Rect::new(0, 0, c.width, c.height));
+                win.clip_round(r, WINDOW_RADIUS);
+                self.draw_window_body(&mut win, app, r);
+            }
+            c.outline_round(r, WINDOW_RADIUS, border);
+            return;
+        };
+        // moving: draw it at full size on the side, then scale and blend
+        if frame.w <= 0 || frame.h <= 0 || !c.visible(shadow_bounds(frame)) {
+            return;
+        }
+        c.shadow(
+            frame,
+            WINDOW_RADIUS,
+            SPREAD,
+            SHADOW_DROP,
+            strength * alpha / ONE,
+        );
+        {
+            let mut side = Canvas::new(scratch, r.w as usize, r.h as usize);
+            self.draw_window_body(&mut side, app, Rect::new(0, 0, r.w, r.h));
+        }
+        {
+            let mut win = c.sub(Rect::new(0, 0, c.width, c.height));
+            win.clip_round(frame, WINDOW_RADIUS);
+            win.blit_scaled(frame, scratch, r.w, r.h, alpha);
+        }
+        c.outline_round_alpha(frame, WINDOW_RADIUS, border, alpha);
+    }
+
+    /// The title bar and contents of a window whose frame is `r` on `win`.
+    fn draw_window_body(&self, win: &mut Canvas, app: App, r: Rect) {
+        let focused = self.focused == Some(app);
+        let title_face = if focused {
+            rgb(0xee, 0xf1, 0xf8)
+        } else {
+            theme::FACE
+        };
+        let title_bar = Rect::new(r.x, r.y, r.w, TITLE_H);
+        win.fill(title_bar, title_face);
+        self.icons.draw_small(win, app, r.x + 12, r.y + 8);
+        let text = if focused {
+            theme::TEXT
+        } else {
+            theme::TEXT_DIM
+        };
+        win.draw_text(r.x + 38, r.y + 8, app.title(), text);
+
+        // caption buttons: flat until the mouse is over them
+        let close = Rect::new(r.right() - 46, r.y, 46, TITLE_H);
+        let min = close.offset(-46, 0);
+        let lit = self.hover.level(Hover::Minimize(app)) as u32;
+        if lit > 0 {
+            win.fill(min, mix(title_face, theme::TEXT, 25 * lit / 256));
+        }
+        let (mx, my) = (min.x + 18, min.y + 16);
+        win.fill_rect(mx, my, 10, 1, text);
+
+        let lit = self.hover.level(Hover::Close(app)) as u32;
+        if lit > 0 {
+            win.fill(
+                close,
+                mix(title_face, rgb(0xc4, 0x2b, 0x1c), lit * 255 / 256),
+            );
+        }
+        let close_glyph = mix(text, 0xffffff, lit * 255 / 256);
+        let (cx, cy) = (close.x + 18, close.y + 11);
+        win.line(cx, cy, cx + 9, cy + 9, close_glyph);
+        win.line(cx + 9, cy, cx, cy + 9, close_glyph);
+
+        let client = Rect::new(
+            r.x + BORDER,
+            r.y + TITLE_H,
+            r.w - 2 * BORDER,
+            r.h - TITLE_H - BORDER,
+        );
+        let surface = &self.surfaces[app.index()];
+        win.blit(
+            client.x,
+            client.y,
+            client.w,
+            client.h,
+            surface,
+            client.w as usize,
+        );
+    }
+
+    /// The start menu, sliding up and fading in while it opens.
+    fn draw_menu(&self, c: &mut Canvas, scratch: &mut [u32]) {
+        let blink = self.cursor_on && self.start.open;
+        self.draw_sliding(c, scratch, self.menu_panel(), self.menu.value(), |c, p| {
+            self.start.draw(c, p, &self.icons, blink)
+        });
+    }
+
+    fn draw_panel(&self, c: &mut Canvas, scratch: &mut [u32]) {
+        let panel = self.panel_shown;
+        let hover = match self.hover.lit()[0] {
+            Some(Hover::Quick(t)) => Some(t),
+            _ => None,
+        };
+        let r = self.panel_rect(panel);
+        let shown = self.panel_anim.value() >= ONE;
+        if shown {
+            // in place: the shadow and frame the sliding version adds
+            c.shadow(r, 8, SPREAD, 4, 120);
+        }
+        self.draw_sliding(c, scratch, r, self.panel_anim.value(), |c, p| {
+            let mut m = c.sub(Rect::new(0, 0, c.width, c.height));
+            m.clip_round(p, 8);
+            if panel == Panel::Quick {
+                self.tray.draw_quick(&mut m, p, self.layout, hover);
+            } else {
+                Tray::draw_calendar(&mut m, p);
+            }
+        });
+        if shown {
+            c.outline_round(r, 8, rgb(0xc8, 0xca, 0xd2));
+        }
+    }
+
+    /// A flyout `panel` that is `p` of the way in (ONE is fully shown):
+    /// lower down and see-through while it slides up from the taskbar.
+    fn draw_sliding(
+        &self,
+        c: &mut Canvas,
+        scratch: &mut [u32],
+        panel: Rect,
+        p: i32,
+        draw: impl Fn(&mut Canvas, Rect),
+    ) {
+        if p >= ONE {
+            draw(c, panel);
+            return;
+        }
+        let r = panel.inset(-SPREAD);
+        if !c.visible(r.union(&r.offset(0, 48))) || p <= 0 {
+            return;
+        }
+        let frame = panel.offset(0, (ONE - p) * 48 / ONE);
+        // it rises from behind the taskbar
+        let mut m = c.sub(Rect::new(0, 0, c.width, c.height));
+        m.clip_to(Rect::new(0, 0, self.width, self.height - TASKBAR_H));
+        m.shadow(frame, 8, SPREAD, 4, 120 * p / ONE);
+        {
+            let mut side = Canvas::new(scratch, panel.w as usize, panel.h as usize);
+            draw(&mut side, Rect::new(0, 0, panel.w, panel.h));
+        }
+        {
+            let mut inner = m.sub(Rect::new(0, 0, self.width, self.height));
+            inner.clip_round(frame, 8);
+            inner.blit_scaled(frame, scratch, panel.w, panel.h, p);
+        }
+        m.outline_round_alpha(frame, 8, rgb(0xc8, 0xca, 0xd2), p);
     }
 
     fn draw_taskbar(&self, c: &mut Canvas) {
@@ -949,8 +1587,11 @@ impl<'a> Desktop<'a> {
             if active {
                 c.fill_round_alpha(r, 5, 0xffffff, 200);
                 c.outline_round(r, 5, rgb(0xe0, 0xe2, 0xe8));
-            } else if self.hover == Hover::Slot(i) {
-                c.fill_round_alpha(r, 5, 0xffffff, 140);
+            } else {
+                let lit = self.hover.level(Hover::Slot(i));
+                if lit > 0 {
+                    c.fill_round_alpha(r, 5, 0xffffff, 140 * lit / ONE);
+                }
             }
             match app {
                 None => draw_start_logo(c, r.x + 10, r.y + 8),
@@ -971,11 +1612,34 @@ impl<'a> Desktop<'a> {
             }
         }
 
-        // keyboard layout and clock
-        let clock = Rect::new(self.width - 84, top + 4, 76, 40);
-        c.text_centered(clock, self.clock.as_str(), theme::TEXT);
-        let layout = Rect::new(self.width - 124, top + 12, 34, 24);
-        c.text_centered(layout, self.layout.name(), theme::TEXT);
+        // the tray: layout, network and volume, clock and date
+        for i in 0..3 {
+            let r = self.tray_rect(i);
+            let open = match i {
+                1 => self.panel == Some(Panel::Quick),
+                2 => self.panel == Some(Panel::Calendar),
+                _ => false,
+            };
+            let lit = if open {
+                ONE
+            } else {
+                self.hover.level(Hover::Tray(i))
+            };
+            if lit > 0 {
+                c.fill_round_alpha(r, 5, 0xffffff, 170 * lit / ONE);
+            }
+        }
+        let layout = self.tray_rect(0);
+        c.text_centered(layout, tray::layout_label(self.layout), theme::TEXT);
+        let quick = self.tray_rect(1);
+        let bg = rgb(0xf0, 0xf2, 0xf8);
+        let y = quick.y + 12;
+        tray::network_icon(c, quick.x + 14, y, self.tray.net, theme::TEXT, bg);
+        tray::volume_icon(c, quick.x + 42, y, self.tray.volume, theme::TEXT);
+        let clock = self.tray_rect(2);
+        let line = |i: i32| Rect::new(clock.x, clock.y + 2 + i * 18, clock.w, 18);
+        c.text_centered(line(0), self.clock.as_str(), theme::TEXT);
+        c.text_centered(line(1), self.date.as_str(), theme::TEXT);
     }
 }
 
@@ -1051,6 +1715,37 @@ impl Pointer {
 
 fn pointer_rect(x: i32, y: i32) -> Rect {
     Rect::new(x, y, POINTER_W as i32, POINTER_H as i32)
+}
+
+/// A row of black, to dim towards.
+static BLACK: [u32; MAX_W] = [0; MAX_W];
+
+/// `out = mix(a, b, alpha)` for a row, two pixels per step: each 64-bit
+/// word holds the red and blue (or green) channels of both, so one
+/// multiply blends four channels.
+fn fade_row(out: &mut [u32], a: &[u32], b: &[u32], alpha: u32) {
+    const M: u64 = 0x00ff_00ff_00ff_00ff;
+    let (t, s) = (alpha.min(256) as u64, 256 - alpha.min(256) as u64);
+    let pairs = out.len() / 2;
+    for i in 0..pairs {
+        let pa = a[2 * i] as u64 | (a[2 * i + 1] as u64) << 32;
+        let pb = b[2 * i] as u64 | (b[2 * i + 1] as u64) << 32;
+        let rb = (((pa & M) * s + (pb & M) * t) >> 8) & M;
+        let g = ((((pa >> 8) & M) * s + ((pb >> 8) & M) * t) >> 8) & M;
+        let p = rb | g << 8;
+        out[2 * i] = p as u32 & 0xff_ffff;
+        out[2 * i + 1] = (p >> 32) as u32 & 0xff_ffff;
+    }
+    if out.len() % 2 == 1 {
+        let i = out.len() - 1;
+        out[i] = fast_mix(a[i], b[i], alpha);
+    }
+}
+
+/// Write one pixel to a framebuffer that is not 32-bit XRGB.
+fn put_pixel(fb: &Framebuffer, x: usize, y: usize, p: u32) {
+    let color = crate::framebuffer::Rgb::new((p >> 16) as u8, (p >> 8) as u8, p as u8);
+    fb.put_raw(x, y, fb.encode(color));
 }
 
 /// Deep blue with a soft flower of light in the middle.
@@ -1132,7 +1827,8 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
     ACTIVE.store(true, Ordering::Relaxed);
     crate::print_banner();
     desk.terminal.start();
-    desk.open(App::Terminal);
+    // the lock screen first; the terminal opens after signing in
+    desk.login.lock();
     desk.damage(desk.screen());
 
     let mut keyboard = Keyboard::new();
@@ -1143,6 +1839,8 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
     } else {
         "desktop: PS/2 mouse\n"
     });
+    // bring the network up now, so the taskbar can show it
+    crate::net::init();
     let mut next_blink = 0;
     let mut last_second = u64::MAX;
     loop {
@@ -1164,24 +1862,36 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
         }
         while let Some(request) = REQUESTS.pop() {
             let app = APPS[(request & !CLOSE) as usize % APPS.len()];
-            if request & CLOSE != 0 {
+            if request == LOCK {
+                desk.lock(false);
+            } else if request & CLOSE != 0 {
                 desk.close(app);
             } else {
                 desk.open(app);
             }
         }
 
+        if core::mem::take(&mut desk.toggle_layout) {
+            keyboard.toggle_layout();
+            desk.on_key(Key::LayoutChanged);
+        }
+        desk.layout = keyboard.layout();
+        crate::net::poll();
         if desk.browser.tick() {
             desk.damage_client(App::Browser);
         }
         if CONSOLE.lock().take_changed() {
             desk.damage_client(App::Terminal);
         }
+        desk.login.layout = desk.layout.name();
+        desk.tick();
+        let on_desktop = matches!(desk.phase, Phase::Desktop);
         let now = interrupts::ticks();
         if now >= next_blink {
             next_blink = now + BLINK_TICKS;
             desk.cursor_on = !desk.cursor_on;
-            if desk.start.open {
+            if !on_desktop {
+            } else if desk.start.open {
                 // the caret in the search box
                 desk.damage(desk.menu_rect());
             } else if desk.focused == Some(App::Terminal) {
@@ -1191,15 +1901,25 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
         let second = now / interrupts::TIMER_HZ;
         if second != last_second {
             last_second = second;
-            let (h, m, s) = rtc::time();
-            desk.clock.clear();
-            let _ = write!(desk.clock, "{:02}:{:02}:{:02}", h, m, s);
-            desk.damage(Rect::new(
-                desk.width - 84,
-                desk.height - TASKBAR_H,
-                84,
-                TASKBAR_H,
-            ));
+            let (h, m, _) = rtc::time();
+            let (year, month, day) = rtc::date();
+            let mut clock = StackString::<16>::new();
+            let _ = write!(clock, "{:02}:{:02}", h, m);
+            let changed = clock.as_str() != desk.clock.as_str();
+            desk.clock = clock;
+            desk.date.clear();
+            let _ = write!(desk.date, "{:02}.{:02}.{}", day, month, year);
+            let net_changed = desk.tray.update_net();
+            if on_desktop {
+                if changed || net_changed {
+                    desk.damage_tray();
+                }
+                if net_changed {
+                    desk.damage_panel();
+                }
+            } else {
+                desk.login.update_clock();
+            }
         }
 
         desk.render();

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Boot the ISO in QEMU without a display, wait for the kernel's serial
-# message and the desktop, then type commands on the emulated PS/2
-# keyboard and check that the shell in the terminal window ran them.
+# message, sign in as root on the lock screen, wait for the desktop, then
+# type commands on the emulated PS/2 keyboard and check that the shell in
+# the terminal window ran them.
 # A small web server on the host checks the network card, TCP/IP and
 # HTTP: the guest reaches the host at 10.0.2.2 through QEMU's user network.
 # Exits 0 if everything works, 1 otherwise.
@@ -54,6 +55,14 @@ for key in sys.argv[2:]:
     time.sleep(0.1)
 PY
 }
+
+wait_for "login: lock screen" || fail "the lock screen did not show"
+type_keys ret
+wait_for "login: password prompt" || fail "the sign-in panel did not open"
+# root has no password at first
+type_keys ret
+wait_for "login: signed in as root" || fail "could not sign in as root"
+echo "signed in as root"
 
 wait_for "desktop: opened Terminal" || fail "the desktop did not start"
 echo "desktop started"

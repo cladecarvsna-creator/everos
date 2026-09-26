@@ -22,6 +22,8 @@ FONTS = [
     ("UI_BOLD", "fonts/DejaVuSans-Bold.ttf", 14, LATIN + CYRILLIC + PUNCT),
     ("TITLE", "fonts/DejaVuSans-Bold.ttf", 20, LATIN + CYRILLIC + PUNCT),
     ("LARGE", "fonts/DejaVuSans.ttf", 34, [(0x20, 0x7E), (0xB1, 0xB1), (0xD7, 0xD7), (0xF7, 0xF7)]),
+    ("HEADING", "fonts/DejaVuSans.ttf", 28, LATIN + CYRILLIC + PUNCT),
+    ("CLOCK", "fonts/DejaVuSans.ttf", 128, [(0x30, 0x3A)]),
     ("MONO", "fonts/DejaVuSansMono.ttf", 15, LATIN + CYRILLIC + PUNCT + BOX),
 ]
 

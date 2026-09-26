@@ -4,13 +4,14 @@
 //! Typing while the menu is open searches the apps; Enter starts the
 //! best match.
 
-use super::canvas::{mix, rgb, Canvas, Rect};
+use super::anim::{self, Fader, ONE};
+use super::canvas::{mix, rgb, Canvas, Color, Rect};
 use super::icons::{draw_icon, Icons};
 use super::text::{UI, UI_BOLD};
 use super::theme;
 use super::{App, APPS};
 use crate::keyboard::Key;
-use crate::StackString;
+use crate::{users, StackString};
 
 pub const W: i32 = 640;
 pub const H: i32 = 540;
@@ -29,6 +30,8 @@ pub enum Action {
     Close,
     Restart,
     ShutDown,
+    Lock,
+    SignOut,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -46,6 +49,11 @@ enum Target {
     Power,
     Restart,
     ShutDown,
+    User,
+    Lock,
+    SignOut,
+    /// The Sign out button in the footer.
+    SignOutButton,
 }
 
 pub struct StartMenu {
@@ -53,9 +61,10 @@ pub struct StartMenu {
     view: View,
     search: StackString<32>,
     power_open: bool,
+    user_open: bool,
     /// Most recently opened first.
     recent: [Option<App>; MAX_RECENT],
-    hover: Option<Target>,
+    hover: Fader<Target>,
 }
 
 /// Apps in alphabetical order, for "All apps".
@@ -74,8 +83,9 @@ impl StartMenu {
             view: View::Pinned,
             search: StackString::new(),
             power_open: false,
+            user_open: false,
             recent: [None; MAX_RECENT],
-            hover: None,
+            hover: Fader::new(anim::ms(120)),
         }
     }
 
@@ -89,7 +99,13 @@ impl StartMenu {
         self.view = View::Pinned;
         self.search.clear();
         self.power_open = false;
-        self.hover = None;
+        self.user_open = false;
+        self.hover.jump(None);
+    }
+
+    /// Fade hover highlights. Returns whether the menu must be redrawn.
+    pub fn tick(&mut self) -> bool {
+        self.hover.tick()
     }
 
     /// Remember an app for "Recommended".
@@ -125,6 +141,10 @@ impl StartMenu {
         Rect::new(p.right() - 196, p.bottom() - FOOTER - 92, 180, 88)
     }
 
+    fn user_flyout(p: Rect) -> Rect {
+        Rect::new(p.x + 32, p.bottom() - FOOTER - 92, 180, 88)
+    }
+
     /// Everything clickable, and where it is.
     fn targets(&self, p: Rect) -> ([(Target, Rect); MAX_TARGETS], usize) {
         let mut out = [(Target::Back, Rect::default()); MAX_TARGETS];
@@ -140,10 +160,23 @@ impl StartMenu {
             push(Target::Restart, Rect::new(f.x + 4, f.y + 4, f.w - 8, 38));
             push(Target::ShutDown, Rect::new(f.x + 4, f.y + 46, f.w - 8, 38));
         }
+        if self.user_open {
+            let f = Self::user_flyout(p);
+            push(Target::Lock, Rect::new(f.x + 4, f.y + 4, f.w - 8, 38));
+            push(Target::SignOut, Rect::new(f.x + 4, f.y + 46, f.w - 8, 38));
+        }
         let footer = Self::footer(p);
+        push(
+            Target::User,
+            Rect::new(footer.x + 32, footer.y + 10, 200, 44),
+        );
         push(
             Target::Power,
             Rect::new(footer.right() - 64, footer.y + 12, 40, 40),
+        );
+        push(
+            Target::SignOutButton,
+            Rect::new(footer.right() - 184, footer.y + 12, 112, 40),
         );
 
         if !self.search.as_str().is_empty() {
@@ -202,15 +235,17 @@ impl StartMenu {
     /// Update the hover highlight. Returns whether it changed.
     pub fn set_hover(&mut self, p: Rect, x: i32, y: i32) -> bool {
         let hover = self.target_at(p, x, y);
-        let changed = hover != self.hover;
-        self.hover = hover;
-        changed
+        self.hover.set(hover)
     }
 
     pub fn on_click(&mut self, p: Rect, x: i32, y: i32) -> Action {
         let target = self.target_at(p, x, y);
         if self.power_open && !matches!(target, Some(Target::Restart | Target::ShutDown)) {
             self.power_open = false;
+            return Action::Redraw;
+        }
+        if self.user_open && !matches!(target, Some(Target::Lock | Target::SignOut)) {
+            self.user_open = false;
             return Action::Redraw;
         }
         match target {
@@ -227,8 +262,14 @@ impl StartMenu {
                 self.power_open = true;
                 Action::Redraw
             }
+            Some(Target::User) => {
+                self.user_open = true;
+                Action::Redraw
+            }
             Some(Target::Restart) => Action::Restart,
             Some(Target::ShutDown) => Action::ShutDown,
+            Some(Target::Lock) => Action::Lock,
+            Some(Target::SignOut | Target::SignOutButton) => Action::SignOut,
             None => Action::None,
         }
     }
@@ -236,8 +277,9 @@ impl StartMenu {
     pub fn on_key(&mut self, key: Key) -> Action {
         match key {
             Key::Escape | Key::Super => {
-                if self.power_open {
+                if self.power_open || self.user_open {
                     self.power_open = false;
+                    self.user_open = false;
                     Action::Redraw
                 } else {
                     Action::Close
@@ -254,7 +296,7 @@ impl StartMenu {
             Key::Char(c) if !c.is_control() && self.search.len() + c.len_utf8() < 32 => {
                 let mut buf = [0u8; 4];
                 self.search.push_str(c.encode_utf8(&mut buf));
-                self.hover = None;
+                self.hover.jump(None);
                 Action::Redraw
             }
             _ => Action::None,
@@ -284,10 +326,21 @@ impl StartMenu {
     }
 
     fn highlight(&self, c: &mut Canvas, target: Target, r: Rect) {
-        if self.hover == Some(target) {
-            c.fill_round(r, 6, 0xffffff);
-            c.outline_round(r, 6, theme::STROKE);
+        let level = self.hover.level(target);
+        if level > 0 {
+            c.fill_round_alpha(r, 6, 0xffffff, level);
+            c.outline_round_alpha(r, 6, theme::STROKE, level);
         }
+    }
+
+    /// A button face that lights up to white under the mouse.
+    fn face(&self, target: Target, base: Color) -> Color {
+        mix(base, 0xffffff, self.lit(target))
+    }
+
+    /// Hover level of a target as a `mix` amount.
+    fn lit(&self, target: Target) -> u32 {
+        (self.hover.level(target) * 255 / ONE) as u32
     }
 
     fn draw_search(&self, c: &mut Canvas, p: Rect, blink: bool) {
@@ -348,11 +401,7 @@ impl StartMenu {
         for &(t, r) in &targets[..n] {
             match t {
                 Target::AllApps => {
-                    let face = if self.hover == Some(t) {
-                        0xffffff
-                    } else {
-                        rgb(0xfb, 0xfb, 0xfd)
-                    };
+                    let face = self.face(t, rgb(0xfb, 0xfb, 0xfd));
                     c.fill_round(r, 4, face);
                     c.outline_round(r, 4, theme::STROKE);
                     c.text_centered(r, "All apps  ›", theme::TEXT);
@@ -385,11 +434,7 @@ impl StartMenu {
         for &(t, r) in &targets[..n] {
             match t {
                 Target::Back => {
-                    let face = if self.hover == Some(t) {
-                        0xffffff
-                    } else {
-                        rgb(0xfb, 0xfb, 0xfd)
-                    };
+                    let face = self.face(t, rgb(0xfb, 0xfb, 0xfd));
                     c.fill_round(r, 4, face);
                     c.outline_round(r, 4, theme::STROKE);
                     c.text_centered(r, "‹  Back", theme::TEXT);
@@ -408,30 +453,55 @@ impl StartMenu {
         let f = Self::footer(p);
         c.fill(f, rgb(0xec, 0xee, 0xf4));
         c.fill_rect(f.x, f.y, f.w, 1, theme::STROKE);
-        let avatar = Rect::new(f.x + 48, f.y + 16, 32, 32);
-        c.fill_round(avatar, 16, theme::ACCENT);
-        c.text_centered_in(&UI_BOLD, avatar, "E", 0xffffff);
-        c.draw_text(f.x + 92, f.y + 23, "EverOS", theme::TEXT);
-
         let (targets, n) = self.targets(p);
         for &(t, r) in &targets[..n] {
             match t {
-                Target::Power => {
-                    let bg = if self.hover == Some(t) || self.power_open {
-                        c.fill_round(r, 6, 0xffffff);
-                        0xffffff
+                Target::Power | Target::User => {
+                    let open = if t == Target::Power {
+                        self.power_open
                     } else {
-                        rgb(0xec, 0xee, 0xf4)
+                        self.user_open
                     };
-                    power_symbol(c, r.x + 20, r.y + 20, bg);
+                    let lit = if open { 255 } else { self.lit(t) };
+                    let bg = mix(rgb(0xec, 0xee, 0xf4), 0xffffff, lit);
+                    if lit > 0 {
+                        c.fill_round(r, 6, bg);
+                    }
+                    if t == Target::Power {
+                        power_symbol(c, r.x + 20, r.y + 20, theme::TEXT, bg);
+                    }
                 }
-                Target::Restart | Target::ShutDown => {}
+                Target::SignOutButton => {
+                    let bg = mix(rgb(0xec, 0xee, 0xf4), 0xffffff, self.lit(t));
+                    c.fill_round(r, 6, bg);
+                    c.outline_round(r, 6, theme::STROKE);
+                    sign_out_symbol(c, r.x + 22, r.y + 20);
+                    c.draw_text(r.x + 40, r.y + 11, "Sign out", theme::TEXT);
+                }
                 _ => {}
             }
         }
+        let avatar = Rect::new(f.x + 44, f.y + 16, 32, 32);
+        c.fill_round(avatar, 16, theme::ACCENT);
+        let name = users::current_name().unwrap_or_default();
+        let mut initial = [0u8; 4];
+        let initial = name
+            .as_str()
+            .chars()
+            .next()
+            .unwrap_or('?')
+            .to_ascii_uppercase()
+            .encode_utf8(&mut initial);
+        c.text_centered_in(&UI_BOLD, avatar, initial, 0xffffff);
+        c.draw_text(f.x + 88, f.y + 23, name.as_str(), theme::TEXT);
 
-        if self.power_open {
-            let fl = Self::power_flyout(p);
+        for (open, fl) in [
+            (self.power_open, Self::power_flyout(p)),
+            (self.user_open, Self::user_flyout(p)),
+        ] {
+            if !open {
+                continue;
+            }
             c.shadow(fl, 8, 10, 2, 90);
             c.fill_round(fl, 8, 0xfbfbfd);
             c.outline_round(fl, 8, theme::STROKE);
@@ -439,18 +509,20 @@ impl StartMenu {
                 let label = match t {
                     Target::Restart => "Restart",
                     Target::ShutDown => "Shut down",
+                    Target::Lock => "Lock",
+                    Target::SignOut => "Sign out",
                     _ => continue,
                 };
-                let bg = if self.hover == Some(t) {
-                    c.fill_round(r, 5, mix(theme::ACCENT_LIGHT, 0xffffff, 60));
-                    mix(theme::ACCENT_LIGHT, 0xffffff, 60)
-                } else {
-                    0xfbfbfd
-                };
-                if t == Target::Restart {
-                    restart_symbol(c, r.x + 20, r.y + 19, bg);
-                } else {
-                    power_symbol(c, r.x + 20, r.y + 19, bg);
+                let lit_face = mix(theme::ACCENT_LIGHT, 0xffffff, 60);
+                let bg = mix(0xfbfbfd, lit_face, self.lit(t));
+                if self.lit(t) > 0 {
+                    c.fill_round(r, 5, bg);
+                }
+                match t {
+                    Target::Restart => restart_symbol(c, r.x + 20, r.y + 19, theme::TEXT, bg),
+                    Target::ShutDown => power_symbol(c, r.x + 20, r.y + 19, theme::TEXT, bg),
+                    Target::Lock => lock_symbol(c, r.x + 20, r.y + 19, bg),
+                    _ => sign_out_symbol(c, r.x + 20, r.y + 19),
                 }
                 c.draw_text(r.x + 40, r.y + 10, label, theme::TEXT);
             }
@@ -459,21 +531,43 @@ impl StartMenu {
 }
 
 /// A power symbol centred at (x, y): a ring open at the top and a bar.
-fn power_symbol(c: &mut Canvas, x: i32, y: i32, bg: u32) {
+pub fn power_symbol(c: &mut Canvas, x: i32, y: i32, fg: Color, bg: Color) {
     let ring = Rect::new(x - 8, y - 8, 16, 16);
-    c.outline_round(ring, 8, theme::TEXT);
-    c.outline_round(ring.inset(1), 7, theme::TEXT);
+    c.outline_round(ring, 8, fg);
+    c.outline_round(ring.inset(1), 7, fg);
     c.fill_rect(x - 3, y - 9, 6, 7, bg);
-    c.fill_rect(x - 1, y - 10, 2, 9, theme::TEXT);
+    c.fill_rect(x - 1, y - 10, 2, 9, fg);
 }
 
 /// A circular arrow centred at (x, y).
-fn restart_symbol(c: &mut Canvas, x: i32, y: i32, bg: u32) {
+pub fn restart_symbol(c: &mut Canvas, x: i32, y: i32, fg: Color, bg: Color) {
     let ring = Rect::new(x - 8, y - 8, 16, 16);
-    c.outline_round(ring, 8, theme::TEXT);
-    c.outline_round(ring.inset(1), 7, theme::TEXT);
+    c.outline_round(ring, 8, fg);
+    c.outline_round(ring.inset(1), 7, fg);
     c.fill_rect(x, y - 9, 8, 7, bg);
-    c.fill_round(Rect::new(x + 1, y - 10, 6, 6), 2, theme::TEXT);
+    c.fill_round(Rect::new(x + 1, y - 10, 6, 6), 2, fg);
+}
+
+/// A padlock centred at (x, y).
+fn lock_symbol(c: &mut Canvas, x: i32, y: i32, bg: Color) {
+    let shackle = Rect::new(x - 5, y - 9, 10, 12);
+    c.outline_round(shackle, 5, theme::TEXT);
+    c.outline_round(shackle.inset(1), 4, theme::TEXT);
+    c.fill_rect(x - 3, y - 4, 6, 4, bg);
+    c.fill_round(Rect::new(x - 8, y - 2, 16, 11), 2, theme::TEXT);
+    c.fill_rect(x - 1, y + 2, 2, 3, bg);
+}
+
+/// An arrow leaving a door, centred at (x, y).
+fn sign_out_symbol(c: &mut Canvas, x: i32, y: i32) {
+    c.fill_rect(x - 8, y - 8, 2, 16, theme::TEXT);
+    c.fill_rect(x - 8, y - 8, 8, 2, theme::TEXT);
+    c.fill_rect(x - 8, y + 6, 8, 2, theme::TEXT);
+    c.fill_rect(x - 3, y - 1, 12, 2, theme::TEXT);
+    for i in 0..4 {
+        c.fill_rect(x + 5 - i, y - 4 + i, 2, 1, theme::TEXT);
+        c.fill_rect(x + 5 - i, y + 3 - i, 2, 1, theme::TEXT);
+    }
 }
 
 fn contains_ignore_case(haystack: &str, needle: &str) -> bool {

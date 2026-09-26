@@ -112,6 +112,11 @@ impl Keyboard {
         self.layout
     }
 
+    /// Switch between EN and RU, as Alt+Shift does.
+    pub fn toggle_layout(&mut self) {
+        self.switch_layout();
+    }
+
     fn shift(&self) -> bool {
         self.left_shift || self.right_shift
     }
