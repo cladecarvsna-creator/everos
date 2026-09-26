@@ -11,6 +11,7 @@
 //! minimised, the start menu slides up, and highlights fade in and out.
 //! Animations follow the timer, and each frame redraws only what moves.
 
+mod about;
 mod anim;
 mod browser;
 mod calc;
@@ -24,6 +25,7 @@ mod icons;
 mod login;
 mod notepad;
 mod paint;
+mod settings;
 mod start;
 mod terminal;
 mod text;
@@ -40,7 +42,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use anim::{lerp, Fader, Tween, ONE};
 use canvas::{fast_mix, mix, rgb, Canvas, Dirty, Rect};
-use icons::{draw_icon, Icons};
+use icons::Icons;
 use login::Login;
 use start::StartMenu;
 use tray::{Panel, Tray};
@@ -94,9 +96,11 @@ pub enum App {
     Calculator,
     Demo,
     Browser,
+    Settings,
+    About,
 }
 
-const APPS: [App; 7] = [
+const APPS: [App; 9] = [
     App::Terminal,
     App::Explorer,
     App::Notepad,
@@ -104,6 +108,8 @@ const APPS: [App; 7] = [
     App::Calculator,
     App::Demo,
     App::Browser,
+    App::Settings,
+    App::About,
 ];
 
 impl App {
@@ -120,6 +126,8 @@ impl App {
             App::Calculator => "Calculator",
             App::Demo => "Graphics",
             App::Browser => "Browser",
+            App::Settings => "Settings",
+            App::About => "About EverOS",
         }
     }
 
@@ -132,6 +140,8 @@ impl App {
             App::Calculator => (calc::CLIENT_W, calc::CLIENT_H),
             App::Demo => (demo::CLIENT_W, demo::CLIENT_H),
             App::Browser => (browser::CLIENT_W, browser::CLIENT_H),
+            App::Settings => (settings::CLIENT_W, settings::CLIENT_H),
+            App::About => (about::CLIENT_W, about::CLIENT_H),
         }
     }
 
@@ -144,6 +154,8 @@ impl App {
             App::Calculator => (1440, 90),
             App::Demo => (760, 330),
             App::Browser => (200, 40),
+            App::Settings => (420, 140),
+            App::About => (680, 280),
         }
     }
 }
@@ -305,7 +317,7 @@ pub struct Desktop<'a> {
     width: i32,
     height: i32,
     boot: &'a BootInfo,
-    icons: Icons,
+    icons: &'static Icons,
     pointer_image: Pointer,
 
     windows: [Window; APPS.len()],
@@ -368,6 +380,8 @@ pub struct Desktop<'a> {
     browser: Box<browser::Browser>,
     notepad: Box<notepad::Notepad>,
     explorer: Box<explorer::Explorer>,
+    settings: settings::Settings,
+    about: about::About,
     /// The window the mouse was last over, for hover highlights.
     hover_app: Option<App>,
 }
@@ -407,7 +421,7 @@ impl<'a> Desktop<'a> {
             width,
             height,
             boot,
-            icons: Icons::new(),
+            icons: icons::get(),
             pointer_image: Pointer::new(),
             windows,
             order: APPS,
@@ -454,6 +468,8 @@ impl<'a> Desktop<'a> {
             browser: Box::new(browser::Browser::new()),
             notepad: Box::new(notepad::Notepad::new()),
             explorer: Box::new(explorer::Explorer::new()),
+            settings: settings::Settings::new(),
+            about: about::About::new(),
             hover_app: None,
         }
     }
@@ -872,6 +888,7 @@ impl<'a> Desktop<'a> {
         if let Key::LayoutChanged = key {
             self.damage_taskbar();
             self.damage_panel();
+            self.damage_client(App::Settings);
             return;
         }
         if self.panel.is_some() {
@@ -904,7 +921,7 @@ impl<'a> Desktop<'a> {
             App::Browser => self.browser.on_key(key),
             App::Notepad => self.notepad.on_key(key),
             App::Explorer => self.explorer.on_key(key),
-            App::Paint | App::Demo => false,
+            App::Paint | App::Demo | App::Settings | App::About => false,
         };
         if changed {
             self.cursor_on = true;
@@ -1190,8 +1207,13 @@ impl<'a> Desktop<'a> {
             App::Browser => self.browser.on_mouse(ev),
             App::Notepad => self.notepad.on_mouse(ev),
             App::Explorer => self.explorer.on_mouse(ev),
+            App::Settings => self.settings.on_mouse(ev),
+            App::About => self.about.on_mouse(ev),
             App::Terminal | App::Demo => false,
         };
+        if core::mem::take(&mut self.settings.switch_layout) {
+            self.toggle_layout = true;
+        }
         if changed {
             self.cursor_on = true;
             self.app_changed(app);
@@ -1400,6 +1422,21 @@ impl<'a> Desktop<'a> {
         self.present_all = false;
     }
 
+    /// Facts about the system for Settings and About.
+    fn system_info(&self) -> settings::Info<'_> {
+        settings::Info {
+            screen: (self.width, self.height),
+            memory_mib: self.boot.upper_memory_kib / 1024 + 1,
+            bootloader: self.boot.bootloader,
+            net: self.tray.net,
+            address: self.tray.address.as_str(),
+            layout: self.layout,
+            clock: self.clock.as_str(),
+            date: self.date.as_str(),
+            uptime_minutes: interrupts::ticks() / interrupts::TIMER_HZ / 60,
+        }
+    }
+
     /// Bring stale window contents up to date.
     fn update_surfaces(&mut self) {
         let surfaces = core::mem::take(&mut self.surfaces);
@@ -1417,6 +1454,8 @@ impl<'a> Desktop<'a> {
                     App::Browser => self.browser.draw(&mut c),
                     App::Notepad => self.notepad.draw(&mut c, focused && self.cursor_on),
                     App::Explorer => self.explorer.draw(&mut c, focused && self.cursor_on),
+                    App::Settings => self.settings.draw(&mut c, &self.system_info()),
+                    App::About => self.about.draw(&mut c, &self.system_info()),
                 }
             }
         }
@@ -1525,7 +1564,7 @@ impl<'a> Desktop<'a> {
                 c.fill_round_alpha(r, 6, rgb(0xb0, 0xd0, 0xff), 90);
                 c.outline_round(r, 6, rgb(0x9c, 0xc4, 0xf4));
             }
-            draw_icon(c, app, r.x + (r.w - 48) / 2, r.y + 6);
+            self.icons.draw_large(c, app, r.x + (r.w - 48) / 2, r.y + 6);
             let label = Rect::new(r.x, r.y + 58, r.w, 16);
             c.text_centered(label.offset(1, 1), app.title(), rgb(0x10, 0x10, 0x20));
             c.text_centered(label, app.title(), 0xffffff);
@@ -1641,7 +1680,7 @@ impl<'a> Desktop<'a> {
     fn draw_menu(&self, c: &mut Canvas, scratch: &mut [u32]) {
         let blink = self.cursor_on && self.start.open;
         self.draw_sliding(c, scratch, self.menu_panel(), self.menu.value(), |c, p| {
-            self.start.draw(c, p, &self.icons, blink)
+            self.start.draw(c, p, self.icons, blink)
         });
     }
 
@@ -2056,6 +2095,7 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
             if on_desktop {
                 if changed || net_changed {
                     desk.damage_tray();
+                    desk.damage_client(App::Settings);
                 }
                 if net_changed {
                     desk.damage_panel();

@@ -40,7 +40,7 @@ impl Net {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Net::NoCard => "No network adapter",
             Net::NoCable => "Cable unplugged",
