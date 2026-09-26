@@ -3,16 +3,17 @@
 use core::fmt::Write;
 
 use super::canvas::{rgb, Canvas, Rect};
+use super::text;
 use super::theme;
 use super::{MouseEvent, MouseKind};
 use crate::keyboard::Key;
 use crate::StackString;
 
-const BUTTON_W: i32 = 52;
-const BUTTON_H: i32 = 38;
-const GAP: i32 = 6;
+const BUTTON_W: i32 = 76;
+const BUTTON_H: i32 = 52;
+const GAP: i32 = 4;
 const MARGIN: i32 = 8;
-const DISPLAY_H: i32 = 52;
+const DISPLAY_H: i32 = 84;
 const KEYS_Y: i32 = MARGIN + DISPLAY_H + 10;
 pub const CLIENT_W: i32 = 2 * MARGIN + 4 * BUTTON_W + 3 * GAP;
 pub const CLIENT_H: i32 = KEYS_Y + 5 * BUTTON_H + 4 * GAP + MARGIN;
@@ -251,7 +252,7 @@ impl Calc {
         draw_big_text(
             c,
             display.right() - 6,
-            display.y + 20,
+            display.bottom(),
             self.entry.as_str(),
             dark,
         );
@@ -270,27 +271,21 @@ impl Calc {
     }
 }
 
-/// Text at twice the font size, right-aligned to `right`, shrinking to
-/// normal size when it would not fit.
-fn draw_big_text(c: &mut Canvas, right: i32, y: i32, text: &str, color: u32) {
-    let n = text.chars().count() as i32;
-    let scale = if n * 16 <= CLIENT_W - 2 * MARGIN - 12 {
-        2
-    } else {
-        1
-    };
-    let mut x = right - n * 8 * scale;
-    let y = if scale == 2 { y - 6 } else { y + 4 };
-    for ch in text.chars() {
-        for (row, bits) in crate::font::glyph(ch).iter().enumerate() {
-            for col in 0..8 {
-                if bits & (0x80 >> col) != 0 {
-                    c.fill_rect(x + col * scale, y + row as i32 * scale, scale, scale, color);
-                }
-            }
-        }
-        x += 8 * scale;
-    }
+/// The entry in the largest font that fits, right-aligned to `right`
+/// with its line bottom at `bottom`.
+fn draw_big_text(c: &mut Canvas, right: i32, bottom: i32, s: &str, color: u32) {
+    let room = CLIENT_W - 2 * MARGIN - 12;
+    let font = [&text::LARGE, &text::TITLE, &text::UI]
+        .into_iter()
+        .find(|f| f.width(s) <= room)
+        .unwrap_or(&text::UI);
+    c.draw_text_in(
+        font,
+        right - font.width(s),
+        bottom - font.line_height,
+        s,
+        color,
+    );
 }
 
 fn parse(s: &str) -> f64 {
