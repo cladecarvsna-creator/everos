@@ -8,7 +8,7 @@
 
 use core::fmt::Write;
 
-use super::canvas::{mix, rgb, Canvas, Color, Rect};
+use super::canvas::{mix, Canvas, Color, Rect};
 use super::text::{UI, UI_BOLD};
 use super::theme;
 use crate::keyboard::Layout;
@@ -18,8 +18,6 @@ pub const QUICK_W: i32 = 360;
 pub const QUICK_H: i32 = 292;
 pub const CALENDAR_W: i32 = 336;
 pub const CALENDAR_H: i32 = 376;
-const PANEL_FACE: Color = rgb(0xf5, 0xf6, 0xfa);
-const FOOTER_FACE: Color = rgb(0xec, 0xee, 0xf4);
 pub const MIN_BRIGHTNESS: i32 = 20;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -182,7 +180,7 @@ impl Tray {
 
     /// The panel's background, shadowless: the desktop adds the shadow.
     fn panel_face(c: &mut Canvas, p: Rect) {
-        c.fill(p, PANEL_FACE);
+        c.fill(p, theme::panel());
     }
 
     pub fn draw_quick(&self, c: &mut Canvas, p: Rect, layout: Layout, hover: Option<Target>) {
@@ -197,18 +195,22 @@ impl Tray {
             let lit = hover == Some(t);
             let (face, ink) = if on {
                 let face = if lit {
-                    mix(theme::ACCENT, 0xffffff, 40)
+                    mix(theme::accent(), theme::on_accent(), 40)
                 } else {
-                    theme::ACCENT
+                    theme::accent()
                 };
-                (face, 0xffffff)
+                (face, theme::on_accent())
             } else {
-                let face = if lit { 0xffffff } else { rgb(0xfb, 0xfb, 0xfd) };
-                (face, theme::TEXT)
+                let face = if lit {
+                    theme::control_lit()
+                } else {
+                    theme::control()
+                };
+                (face, theme::text())
             };
             c.fill_round(r, 5, face);
             if !on {
-                c.outline_round(r, 5, theme::STROKE);
+                c.outline_round(r, 5, theme::stroke());
             }
             let (cx, cy) = (r.x + r.w / 2, r.y + r.h / 2);
             match t {
@@ -218,7 +220,7 @@ impl Tray {
             c.text_centered(
                 Rect::new(r.x - 6, r.bottom() + 4, r.w + 12, 20),
                 label,
-                theme::TEXT,
+                theme::text(),
             );
         }
 
@@ -230,21 +232,21 @@ impl Tray {
             };
             let icon_y = track.y + 2 - 8;
             match s {
-                Slider::Brightness => sun_icon(c, p.x + 24, icon_y, theme::TEXT),
-                Slider::Volume => volume_icon(c, p.x + 24, icon_y, self.volume, theme::TEXT),
+                Slider::Brightness => sun_icon(c, p.x + 24, icon_y, theme::text()),
+                Slider::Volume => volume_icon(c, p.x + 24, icon_y, self.volume, theme::text()),
             }
-            c.fill_round(track, 2, rgb(0x8a, 0x8c, 0x94));
+            c.fill_round(track, 2, theme::thumb());
             let filled = percent * track.w / 100;
             c.fill_round(
                 Rect::new(track.x, track.y, filled, track.h),
                 2,
-                theme::ACCENT,
+                theme::accent(),
             );
             // the thumb: white ring, accent dot that grows under the mouse
             let (tx, ty) = (track.x + filled, track.y + track.h / 2);
             let knob = Rect::new(tx - 10, ty - 10, 20, 20);
-            c.fill_round(knob, 10, 0xffffff);
-            c.outline_round(knob, 10, theme::STROKE);
+            c.fill_round(knob, 10, theme::control_lit());
+            c.outline_round(knob, 10, theme::stroke());
             let dot = if hover == Some(Target::Slider(s)) {
                 6
             } else {
@@ -253,21 +255,28 @@ impl Tray {
             c.fill_round(
                 Rect::new(tx - dot, ty - dot, 2 * dot, 2 * dot),
                 dot,
-                theme::ACCENT,
+                theme::accent(),
             );
             let mut text = StackString::<8>::new();
             let _ = write!(text, "{}%", percent);
             c.text_centered(
                 Rect::new(track.right() + 14, ty - 10, 44, 20),
                 text.as_str(),
-                theme::TEXT,
+                theme::text(),
             );
         }
 
         let f = Self::footer(p);
-        c.fill(f, FOOTER_FACE);
-        c.fill_rect(f.x, f.y, f.w, 1, theme::STROKE);
-        network_icon(c, f.x + 24, f.y + 18, self.net, theme::TEXT, FOOTER_FACE);
+        c.fill(f, theme::footer());
+        c.fill_rect(f.x, f.y, f.w, 1, theme::stroke());
+        network_icon(
+            c,
+            f.x + 24,
+            f.y + 18,
+            self.net,
+            theme::text(),
+            theme::footer(),
+        );
         let mut status = StackString::<48>::new();
         status.push_str(self.net.label());
         if !self.address.as_str().is_empty() {
@@ -277,7 +286,7 @@ impl Tray {
             f.x + 52,
             f.y + (f.h - UI.line_height) / 2,
             status.as_str(),
-            theme::TEXT,
+            theme::text(),
         );
     }
 
@@ -293,11 +302,11 @@ impl Tray {
             MONTHS[month as usize - 1],
             day
         );
-        c.draw_text_in(&UI_BOLD, p.x + 24, p.y + 20, text.as_str(), theme::TEXT);
-        c.fill_rect(p.x, p.y + 56, p.w, 1, theme::STROKE);
+        c.draw_text_in(&UI_BOLD, p.x + 24, p.y + 20, text.as_str(), theme::text());
+        c.fill_rect(p.x, p.y + 56, p.w, 1, theme::stroke());
         text.clear();
         let _ = write!(text, "{} {}", MONTHS[month as usize - 1], year);
-        c.draw_text_in(&UI_BOLD, p.x + 24, p.y + 72, text.as_str(), theme::TEXT);
+        c.draw_text_in(&UI_BOLD, p.x + 24, p.y + 72, text.as_str(), theme::text());
 
         let cell = 40;
         let x0 = p.x + (p.w - 7 * cell) / 2;
@@ -306,7 +315,7 @@ impl Tray {
             .enumerate()
         {
             let r = Rect::new(x0 + i as i32 * cell, p.y + 104, cell, 24);
-            c.text_centered(r, name, theme::TEXT_DIM);
+            c.text_centered(r, name, theme::text_dim());
         }
         // Monday first
         let first = (rtc::weekday(year, month, 1) as i32 + 6) % 7;
@@ -317,10 +326,10 @@ impl Tray {
             let mut label = StackString::<4>::new();
             let _ = write!(label, "{}", d);
             if d == day as i32 {
-                c.fill_round(r.inset(3), (cell - 6) / 2, theme::ACCENT);
-                c.text_centered(r, label.as_str(), 0xffffff);
+                c.fill_round(r.inset(3), (cell - 6) / 2, theme::accent());
+                c.text_centered(r, label.as_str(), theme::on_accent());
             } else {
-                c.text_centered(r, label.as_str(), theme::TEXT);
+                c.text_centered(r, label.as_str(), theme::text());
             }
         }
     }

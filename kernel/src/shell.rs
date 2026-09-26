@@ -121,6 +121,9 @@ impl Shell {
                 println!("  notepad open Notepad (notepad <file> opens a file)");
                 println!("  explorer open File Explorer (explorer <folder>)");
                 println!("  settings open Settings; 'about' shows About EverOS");
+                println!("  theme   theme light | theme dark");
+                println!("  wallpaper <picture> or 'wallpaper next' changes the background");
+                println!("  restart restart the computer; 'shutdown' turns it off");
                 println!("  colors  show the text colours");
                 println!("  panic   test the kernel panic screen");
                 println!("Keys: Alt+Shift switches EN/RU, Up recalls the last command.");
@@ -209,6 +212,30 @@ impl Shell {
             "lock" => {
                 if !gui::request_lock() {
                     println!("There is no lock screen in text mode.");
+                }
+            }
+            "theme" => match args.trim() {
+                "dark" => gui::set_theme(true),
+                "light" => gui::set_theme(false),
+                _ => println!("usage: theme light | theme dark"),
+            },
+            "wallpaper" => match args.trim() {
+                "" => println!("usage: wallpaper <picture> | wallpaper next"),
+                "next" => gui::next_wallpaper(),
+                file => {
+                    if !gui::set_wallpaper(&self.path(file)) {
+                        error("not a PNG, JPEG or BMP picture");
+                    }
+                }
+            },
+            "restart" | "reboot" => {
+                if !gui::request_power(true) {
+                    println!("Restart works on the desktop.");
+                }
+            }
+            "shutdown" | "poweroff" => {
+                if !gui::request_power(false) {
+                    println!("Shut down works on the desktop.");
                 }
             }
             "panic" => panic!("panic requested from the shell"),

@@ -8,7 +8,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
-use super::canvas::{rgb, Canvas, Rect};
+use super::canvas::{Canvas, Rect};
 use super::filedialog::{self, FileDialog, Mode};
 use super::text::{MONO, UI};
 use super::theme;
@@ -1243,7 +1243,7 @@ impl Notepad {
     // ---- drawing --------------------------------------------------------------
 
     pub fn draw(&mut self, c: &mut Canvas, caret: bool) {
-        let bg = theme::LIGHT;
+        let bg = theme::light();
         c.fill(client(), bg);
         self.draw_menu_bar(c);
         self.draw_text(c, caret && self.dialog.is_none() && self.menu.is_none());
@@ -1261,10 +1261,7 @@ impl Notepad {
         let width = self.content_width();
         let a = area();
         widgets::draw_scrollbar(c, htrack(), false, width, a.w, self.scroll_x);
-        c.fill(
-            Rect::new(a.right(), a.bottom(), SB, SB),
-            rgb(0xf6, 0xf6, 0xf8),
-        );
+        c.fill(Rect::new(a.right(), a.bottom(), SB, SB), theme::track());
 
         if let Some((kind, r)) = self.menu {
             let items = self.menu_items(kind);
@@ -1280,8 +1277,8 @@ impl Notepad {
 
     fn draw_menu_bar(&self, c: &mut Canvas) {
         let bar = Rect::new(0, 0, CLIENT_W, MENU_H);
-        c.fill(bar, theme::FACE);
-        c.fill_rect(0, MENU_H - 1, CLIENT_W, 1, theme::STROKE);
+        c.fill(bar, theme::face());
+        c.fill_rect(0, MENU_H - 1, CLIENT_W, 1, theme::stroke());
         for (i, label) in ["File", "Edit"].into_iter().enumerate() {
             let b = Self::menu_button(i);
             let open = match self.menu {
@@ -1290,9 +1287,9 @@ impl Notepad {
                 _ => false,
             };
             if open {
-                c.fill_round(b, 4, rgb(0xe2, 0xe4, 0xea));
+                c.fill_round(b, 4, theme::hover());
             }
-            c.text_centered(b, label, theme::TEXT);
+            c.text_centered(b, label, theme::text());
         }
     }
 
@@ -1314,7 +1311,7 @@ impl Notepad {
                     // the line end counts as a little space
                     let extra = if k < e.line { cw / 32 } else { 0 };
                     let (xa, xb) = (x_of(from), x_of(to) + extra);
-                    t.fill(Rect::new(xa, y, xb - xa, LINE_H), widgets::SELECTION);
+                    t.fill(Rect::new(xa, y, xb - xa, LINE_H), theme::selection());
                 }
             }
             let text_y = y + (LINE_H - MONO.line_height) / 2;
@@ -1333,33 +1330,33 @@ impl Notepad {
                 if ch == '\t' || ch == ' ' || x + 16 < a.x {
                     continue;
                 }
-                if !t.draw_glyph(&MONO, x, text_y, ch, theme::TEXT) {
-                    t.draw_glyph(&MONO, x, text_y, '?', theme::TEXT_DIM);
+                if !t.draw_glyph(&MONO, x, text_y, ch, theme::text()) {
+                    t.draw_glyph(&MONO, x, text_y, '?', theme::text_dim());
                 }
             }
             if caret && k == self.cur.line {
                 let x = x_of(self.cur.col);
-                t.fill_rect(x, y + 1, 2, LINE_H - 2, theme::TEXT);
+                t.fill_rect(x, y + 1, 2, LINE_H - 2, theme::text());
             }
         }
     }
 
     fn draw_status(&self, c: &mut Canvas) {
         let r = Rect::new(0, CLIENT_H - STATUS_H, CLIENT_W, STATUS_H);
-        c.fill(r, theme::FACE);
-        c.fill_rect(0, r.y, CLIENT_W, 1, theme::STROKE);
+        c.fill(r, theme::face());
+        c.fill_rect(0, r.y, CLIENT_W, 1, theme::stroke());
         let ty = r.y + (STATUS_H - UI.line_height) / 2;
         let mut s = String::new();
         let col = visual_col(&self.lines[self.cur.line], self.cur.col) + 1;
         let _ = write!(s, "Ln {}, Col {}", self.cur.line + 1, col);
-        c.draw_text(r.x + 12, ty, &s, theme::TEXT);
+        c.draw_text(r.x + 12, ty, &s, theme::text());
         s.clear();
         let chars: usize = self.lines.iter().map(|l| l.len()).sum::<usize>() + self.lines.len() - 1;
         let _ = write!(s, "{} characters", chars);
-        c.draw_text(r.x + 170, ty, &s, theme::TEXT);
+        c.draw_text(r.x + 170, ty, &s, theme::text());
         if fs::storage() != fs::Storage::Disk {
             let warn = "No disk: files are lost on restart";
-            c.draw_text(r.x + 340, ty, warn, rgb(0xb0, 0x5a, 0x00));
+            c.draw_text(r.x + 340, ty, warn, theme::warning());
         }
         let right = [
             self.encoding,
@@ -1373,9 +1370,9 @@ impl Notepad {
         for label in right {
             let w = UI.width(label);
             x -= w;
-            c.draw_text(x, ty, label, theme::TEXT);
+            c.draw_text(x, ty, label, theme::text());
             x -= 20;
-            c.fill_rect(x + 10, r.y + 6, 1, STATUS_H - 12, theme::STROKE);
+            c.fill_rect(x + 10, r.y + 6, 1, STATUS_H - 12, theme::stroke());
         }
     }
 }

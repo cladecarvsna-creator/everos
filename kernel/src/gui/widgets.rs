@@ -4,7 +4,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::canvas::{mix, rgb, Canvas, Color, Rect};
+use super::canvas::{mix, rgb, Canvas, Rect};
 use super::text::UI;
 use super::theme;
 use crate::keyboard::{self, Key};
@@ -22,9 +22,6 @@ pub fn copy(text: &str) {
 pub fn paste() -> String {
     CLIPBOARD.lock().clone()
 }
-
-pub const SELECTION: Color = rgb(0xb8, 0xd8, 0xfa);
-pub const HOVER: Color = rgb(0xe8, 0xf1, 0xfb);
 
 // ---- one-line text box --------------------------------------------------------
 
@@ -195,10 +192,10 @@ impl TextField {
 
     /// Draw it in `r`. The caret shows when `caret` is set.
     pub fn draw(&mut self, c: &mut Canvas, r: Rect, focused: bool, caret: bool) {
-        c.fill_round(r, 4, theme::LIGHT);
-        c.outline_round(r, 4, theme::STROKE);
+        c.fill_round(r, 4, theme::light());
+        c.outline_round(r, 4, theme::stroke());
         if focused {
-            c.fill_rect(r.x + 1, r.bottom() - 2, r.w - 2, 2, theme::ACCENT);
+            c.fill_rect(r.x + 1, r.bottom() - 2, r.w - 2, 2, theme::accent());
         }
         // keep the caret in view
         let inner = r.w - 16;
@@ -216,12 +213,15 @@ impl TextField {
         let (a, b) = self.range();
         if focused && a != b {
             let (xa, xb) = (self.width_to(a), self.width_to(b));
-            t.fill(Rect::new(x0 + xa, y, xb - xa, UI.line_height), SELECTION);
+            t.fill(
+                Rect::new(x0 + xa, y, xb - xa, UI.line_height),
+                theme::selection(),
+            );
         }
         let s: String = self.text.iter().collect();
-        t.draw_text(x0, y, &s, theme::TEXT);
+        t.draw_text(x0, y, &s, theme::text());
         if focused && caret {
-            t.fill_rect(x0 + caret_x, y, 1, UI.line_height, theme::TEXT);
+            t.fill_rect(x0 + caret_x, y, 1, UI.line_height, theme::text());
         }
     }
 }
@@ -265,25 +265,29 @@ pub fn menu_item_at(r: Rect, items: &[Item], x: i32, y: i32) -> Option<usize> {
 
 pub fn draw_menu(c: &mut Canvas, r: Rect, items: &[Item], hover: Option<usize>) {
     c.shadow(r, 8, 10, 3, 90);
-    c.fill_round(r, 8, rgb(0xf9, 0xf9, 0xfb));
-    c.outline_round(r, 8, rgb(0xd0, 0xd2, 0xd8));
+    c.fill_round(r, 8, theme::menu());
+    c.outline_round(r, 8, theme::frame());
     let mut top = r.y + 4;
     for (i, item) in items.iter().enumerate() {
         if item.0.is_empty() {
-            c.fill_rect(r.x + 1, top + 4, r.w - 2, 1, theme::STROKE);
+            c.fill_rect(r.x + 1, top + 4, r.w - 2, 1, theme::stroke());
             top += 9;
             continue;
         }
         let row = Rect::new(r.x + 4, top, r.w - 8, MENU_ROW);
         if hover == Some(i) {
-            c.fill_round(row, 4, rgb(0xe6, 0xe8, 0xee));
+            c.fill_round(row, 4, theme::hover());
         }
-        let color = if item.2 { theme::TEXT } else { theme::TEXT_DIM };
+        let color = if item.2 {
+            theme::text()
+        } else {
+            theme::text_dim()
+        };
         let ty = top + (MENU_ROW - UI.line_height) / 2;
         c.draw_text(row.x + 14, ty, item.0, color);
         if !item.1.is_empty() {
             let w = UI.width(item.1);
-            c.draw_text(row.right() - 12 - w, ty, item.1, theme::TEXT_DIM);
+            c.draw_text(row.right() - 12 - w, ty, item.1, theme::text_dim());
         }
         top += MENU_ROW;
     }
@@ -305,18 +309,24 @@ pub fn draw_message(
     c.fill_round_alpha(area, 0, rgb(0x20, 0x20, 0x28), 60);
     let r = message_rect(area, lines, buttons);
     c.shadow(r, 8, 16, 4, 120);
-    c.fill_round(r, 8, theme::LIGHT);
-    c.outline_round(r, 8, rgb(0xc8, 0xca, 0xd2));
-    c.draw_text_in(&super::text::TITLE, r.x + 24, r.y + 20, title, theme::TEXT);
+    c.fill_round(r, 8, theme::light());
+    c.outline_round(r, 8, theme::frame());
+    c.draw_text_in(
+        &super::text::TITLE,
+        r.x + 24,
+        r.y + 20,
+        title,
+        theme::text(),
+    );
     for (i, line) in lines.iter().enumerate() {
-        c.draw_text(r.x + 24, r.y + 60 + i as i32 * 22, line, theme::TEXT);
+        c.draw_text(r.x + 24, r.y + 60 + i as i32 * 22, line, theme::text());
     }
     let footer = Rect::new(r.x, r.bottom() - 72, r.w, 72);
     {
         let mut f = c.sub(Rect::new(0, 0, c.width, c.height));
         f.clip_round(r, 8);
-        f.fill(footer, theme::FACE);
-        f.fill_rect(footer.x, footer.y, footer.w, 1, theme::STROKE);
+        f.fill(footer, theme::face());
+        f.fill_rect(footer.x, footer.y, footer.w, 1, theme::stroke());
     }
     let rects = message_buttons(r, buttons.len());
     for (i, (b, label)) in rects.iter().zip(buttons).enumerate() {
@@ -400,12 +410,12 @@ pub fn draw_scrollbar(
     view: i32,
     pos: i32,
 ) {
-    c.fill(track, rgb(0xf6, 0xf6, 0xf8));
+    c.fill(track, theme::track());
     if total <= view {
         return;
     }
     let t = thumb(track, vertical, total, view, pos).inset(3);
-    c.fill_round(t, 3, rgb(0x9a, 0x9c, 0xa4));
+    c.fill_round(t, 3, theme::thumb());
 }
 
 // ---- icons --------------------------------------------------------------------
@@ -436,7 +446,7 @@ pub fn file_icon(c: &mut Canvas, x: i32, y: i32, s: i32) {
     let fold = s / 4;
     let page = Rect::new(px, y, w, s);
     let edge = rgb(0x88, 0x8c, 0x98);
-    c.fill_round(page, (s / 16).max(1), theme::LIGHT);
+    c.fill_round(page, (s / 16).max(1), 0xffffff);
     c.outline_round(page, (s / 16).max(1), edge);
     // the folded corner
     c.fill(
@@ -451,12 +461,6 @@ pub fn file_icon(c: &mut Canvas, x: i32, y: i32, s: i32) {
             break;
         }
         let lw = if i == lines - 1 { w / 2 } else { w - w / 3 };
-        c.fill_rect(
-            px + w / 6,
-            ly,
-            lw,
-            (s / 32).max(1),
-            mix(edge, theme::LIGHT, 80),
-        );
+        c.fill_rect(px + w / 6, ly, lw, (s / 32).max(1), mix(edge, 0xffffff, 80));
     }
 }

@@ -11,7 +11,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::canvas::{rgb, Canvas, Rect};
+use super::canvas::{mix, rgb, Canvas, Rect};
 use super::icons::{Pic, LARGE};
 use super::popup::{Builder, Cmd};
 use super::text::UI;
@@ -205,7 +205,7 @@ impl Desktop<'_> {
     }
 
     /// The path of a file or folder icon.
-    fn icon_path(&self, i: usize) -> Option<String> {
+    pub(super) fn icon_path(&self, i: usize) -> Option<String> {
         match &self.desk_icons.items[i] {
             DeskItem::Entry { name, .. } => Some(fs::join(&desktop_dir()?, name)),
             _ => None,
@@ -525,8 +525,9 @@ impl Desktop<'_> {
                 .item("Task View", Cmd::TaskView)
                 .item("New desktop", Cmd::NewDesktop)
                 .sep()
-                .item("Display settings", Cmd::Open(App::Settings))
-                .item("Personalize", Cmd::Open(App::Settings))
+                .item("Next desktop background", Cmd::NextBackground)
+                .item("Display settings", Cmd::DisplaySettings)
+                .item("Personalize", Cmd::Personalize)
                 .at(x, y, false, screen);
         };
         let several = self.selected_icons().len() > 1;
@@ -545,11 +546,18 @@ impl Desktop<'_> {
                     b.item("Pin to taskbar", Cmd::Pin(*a))
                 }
             }
-            DeskItem::Entry { .. } => b.sep().maybe("Rename", Cmd::RenameIcon(i), !several).keyed(
-                "Delete",
-                "Del",
-                Cmd::DeleteIcons,
-            ),
+            DeskItem::Entry { name, dir } => {
+                let b = if !dir && super::picture::is_picture(name) && !several {
+                    b.item("Set as desktop background", Cmd::SetBackground(i))
+                } else {
+                    b
+                };
+                b.sep().maybe("Rename", Cmd::RenameIcon(i), !several).keyed(
+                    "Delete",
+                    "Del",
+                    Cmd::DeleteIcons,
+                )
+            }
         }
         .at(x, y, false, screen)
     }
@@ -566,10 +574,11 @@ impl Desktop<'_> {
             }
             let target = dragging.is_some_and(|d| d.target == Some(i));
             if icons.selected[i] || target {
-                c.fill_round_alpha(r, 4, rgb(0x9c, 0xc8, 0xf4), 96);
-                c.outline_round_alpha(r, 4, rgb(0xb8, 0xdc, 0xff), 180);
+                let a = theme::accent_base();
+                c.fill_round_alpha(r, 4, mix(a, 0xffffff, 150), 96);
+                c.outline_round_alpha(r, 4, mix(a, 0xffffff, 190), 180);
             } else if icons.hover == Some(i) {
-                c.fill_round_alpha(r, 4, rgb(0xc0, 0xdc, 0xf8), 56);
+                c.fill_round_alpha(r, 4, mix(theme::accent_base(), 0xffffff, 180), 56);
             }
             self.draw_desk_icon(c, item, r.x + (r.w - 48) / 2, r.y + 6);
             if icons.renaming.as_ref().is_some_and(|(k, _)| *k == i) {
@@ -584,8 +593,8 @@ impl Desktop<'_> {
         }
         if let Some(band) = &icons.band {
             let r = band.rect;
-            c.fill_round_alpha(r, 0, rgb(0x00, 0x5c, 0xc4), 104);
-            let edge = rgb(0x33, 0x99, 0xff);
+            c.fill_round_alpha(r, 0, theme::accent_base(), 104);
+            let edge = mix(theme::accent_base(), 0xffffff, 80);
             c.fill_rect(r.x, r.y, r.w, 1, edge);
             c.fill_rect(r.x, r.bottom() - 1, r.w, 1, edge);
             c.fill_rect(r.x, r.y, 1, r.h, edge);
@@ -624,9 +633,9 @@ impl Desktop<'_> {
             };
             let w = UI.width(&verb) + 20;
             let r = Rect::new(self.mouse_x + 16, self.mouse_y + 24, w, 26);
-            c.fill_round(r, 4, rgb(0xfa, 0xfa, 0xfc));
-            c.outline_round(r, 4, theme::STROKE);
-            c.text_centered(r, &verb, theme::TEXT);
+            c.fill_round(r, 4, theme::menu());
+            c.outline_round(r, 4, theme::stroke());
+            c.text_centered(r, &verb, theme::text());
         }
     }
 

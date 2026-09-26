@@ -1,8 +1,9 @@
-//! App icons. Most come from the 150x150 BMP pictures in
-//! `kernel/assets/icons/`: their white background is made transparent,
-//! they are cropped to the picture and shrunk with alpha to 48, 24 and
-//! 16 pixels. Apps without a picture are drawn with shapes at 48 pixels
-//! and shrunk the same way.
+//! App icons. Most come from the 150x150 pictures in
+//! `kernel/assets/icons/`: BMPs have their white background made
+//! transparent, PNGs bring their own transparency. They are cropped to
+//! the picture and shrunk with alpha to 48, 24 and 16 pixels. Apps
+//! without a picture are drawn with shapes at 48 pixels and shrunk the
+//! same way.
 
 use alloc::boxed::Box;
 use alloc::vec;
@@ -50,7 +51,8 @@ pub fn get() -> &'static Icons {
     unsafe { &*p }
 }
 
-fn bmp(app: App) -> Option<&'static [u8]> {
+/// The picture file of an app's icon, BMP or PNG.
+fn file(app: App) -> Option<&'static [u8]> {
     Some(match app {
         App::Terminal => include_bytes!("../../assets/icons/terminal.bmp"),
         App::Explorer => include_bytes!("../../assets/icons/explorer.bmp"),
@@ -58,8 +60,9 @@ fn bmp(app: App) -> Option<&'static [u8]> {
         App::Paint => include_bytes!("../../assets/icons/paint.bmp"),
         App::Settings => include_bytes!("../../assets/icons/settings.bmp"),
         App::About => include_bytes!("../../assets/icons/about.bmp"),
-        App::Browser => include_bytes!("../../assets/icons/browser.bmp"),
-        App::Calculator | App::Demo => return None,
+        App::Calculator => include_bytes!("../../assets/icons/calculator.png"),
+        App::Browser => include_bytes!("../../assets/icons/browser.png"),
+        App::Demo => return None,
     })
 }
 
@@ -68,7 +71,7 @@ impl Icons {
         let mut loaded = 0;
         let apps = APPS
             .iter()
-            .map(|&app| match bmp(app).and_then(Picture::from_bmp) {
+            .map(|&app| match file(app).and_then(Picture::from_file) {
                 Some(p) => {
                     loaded += 1;
                     p.set()
@@ -81,7 +84,7 @@ impl Icons {
                 }
             })
             .collect();
-        let mut pic = |data: &[u8]| match Picture::from_bmp(data) {
+        let mut pic = |data: &[u8]| match Picture::from_file(data) {
             Some(p) => {
                 loaded += 1;
                 p.set()
@@ -91,8 +94,8 @@ impl Icons {
         let pics = [
             pic(include_bytes!("../../assets/icons/computer.bmp")),
             pic(include_bytes!("../../assets/icons/drives.bmp")),
-            recycle_bin(false),
-            recycle_bin(true),
+            pic(include_bytes!("../../assets/icons/recycle-bin.png")),
+            recycle_full(include_bytes!("../../assets/icons/recycle-bin.png")),
         ];
         // for the boot test
         let mut line = crate::StackString::<40>::new();
@@ -141,109 +144,59 @@ impl Set {
 
 const TRANSPARENT: u32 = 0xffc8_c8c8;
 
-/// The Recycle Bin, drawn at 4x and shrunk so it is smooth: a glassy
-/// blue bin with the recycling arrows, and paper in it when `full`.
-fn recycle_bin(full: bool) -> Set {
-    const S: i32 = 192;
-    let mut big = vec![TRANSPARENT; (S * S) as usize];
-    let mut c = Canvas::new(&mut big, S as usize, S as usize);
-    if full {
-        // crumpled paper sticking out of the top
-        c.fill_polygon(
-            &[(44, 40), (84, 10), (112, 30), (100, 52), (48, 52)],
-            0xf4f4f0,
-        );
-        c.fill_polygon(&[(90, 36), (136, 12), (156, 46), (116, 56)], 0xe4e2da);
-        c.fill_polygon(&[(60, 26), (76, 16), (84, 40), (66, 46)], 0xffffff);
-        c.fill_polygon(&[(124, 22), (134, 18), (144, 40), (128, 44)], 0xd0cec4);
-    }
-    // the body narrows to the bottom
-    c.fill_polygon(
-        &[(26, 44), (166, 44), (150, 186), (42, 186)],
-        rgb(0x1c, 0x5a, 0xa6),
-    );
-    c.fill_polygon(
-        &[(33, 52), (159, 52), (144, 179), (48, 179)],
-        rgb(0x5a, 0xa2, 0xe6),
-    );
-    // glass shine on the left
-    c.fill_polygon(
-        &[(38, 54), (70, 54), (66, 176), (52, 176)],
-        rgb(0x9c, 0xcc, 0xf4),
-    );
-    // the rim
-    c.fill_round(Rect::new(18, 32, 156, 22), 10, rgb(0x16, 0x4c, 0x92));
-    c.fill_round(Rect::new(23, 35, 146, 12), 6, rgb(0x6c, 0xac, 0xe8));
-    // three arrows chasing each other round a triangle
-    let (cx, cy, r) = (98, 118, 44);
-    let corner = |k: i32| {
-        let (s, co) = sin_cos(k * 120 - 90);
-        (cx + co * r / 1000, cy + s * r / 1000)
+/// The full Recycle Bin: the bin picture with crumpled paper sticking
+/// out from under its lid.
+fn recycle_full(data: &[u8]) -> Set {
+    let Some(img) = super::picture::decode(data) else {
+        return Set::empty();
     };
-    let green = rgb(0x12, 0x8a, 0x3a);
-    for k in 0..3 {
-        let (a, b) = (corner(k), corner(k + 1));
-        // from a bit after one corner to a bit before the next
-        let at = |t: i32| (a.0 + (b.0 - a.0) * t / 100, a.1 + (b.1 - a.1) * t / 100);
-        let (p0, p1) = (at(14), at(66));
-        thick_line(&mut c, p0, p1, 7, green);
-        // the arrowhead, pointing at the next corner
-        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-        let len = super::canvas::isqrt((dx * dx + dy * dy) as u64) as i32;
-        let (nx, ny) = (-dy * 16 / len, dx * 16 / len);
-        let tip = at(88);
-        c.fill_polygon(
-            &[tip, (p1.0 + nx, p1.1 + ny), (p1.0 - nx, p1.1 - ny)],
-            green,
-        );
+    let (w, h) = (img.width, img.height);
+    // the paper, drawn first so the bin covers its lower part
+    let mut paper = vec![TRANSPARENT; w * h];
+    {
+        let mut c = Canvas::new(&mut paper, w, h);
+        let (sx, sy) = (w as i32, h as i32);
+        let p = |x: i32, y: i32| (x * sx / 150, y * sy / 150);
+        let outline = rgb(0x2a, 0x2a, 0x30);
+        c.fill_polygon(&[p(38, 34), p(60, 6), p(84, 16), p(80, 40)], outline);
+        c.fill_polygon(&[p(42, 32), p(61, 10), p(80, 19), p(77, 36)], 0xf4f4f0);
+        c.fill_polygon(&[p(70, 36), p(96, 4), p(118, 22), p(106, 40)], outline);
+        c.fill_polygon(&[p(74, 34), p(96, 8), p(114, 23), p(103, 36)], 0xfffdf2);
+        c.fill_polygon(&[p(88, 18), p(98, 10), p(104, 20)], rgb(0xd8, 0xd6, 0xcc));
     }
-    Picture::from_drawing(&big, S as usize).set()
-}
-
-/// A line `w` pixels either side of the one from `a` to `b`.
-fn thick_line(c: &mut Canvas, a: (i32, i32), b: (i32, i32), w: i32, color: u32) {
-    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-    let len = super::canvas::isqrt((dx * dx + dy * dy) as u64).max(1) as i32;
-    let (nx, ny) = (-dy * w / len, dx * w / len);
-    c.fill_polygon(
-        &[
-            (a.0 + nx, a.1 + ny),
-            (b.0 + nx, b.1 + ny),
-            (b.0 - nx, b.1 - ny),
-            (a.0 - nx, a.1 - ny),
-        ],
-        color,
-    );
-}
-
-/// sin and cos of a whole number of degrees, times 1000.
-fn sin_cos(deg: i32) -> (i32, i32) {
-    const SIN: [i32; 91] = {
-        let mut t = [0; 91];
-        let mut i = 0;
-        while i <= 90 {
-            // a Bhaskara approximation, good to about 0.2%
-            let x = i as i64;
-            t[i] = (4000 * x * (180 - x) / (40500 - x * (180 - x))) as i32;
-            i += 1;
+    let pixels: Vec<[u32; 4]> = img
+        .pixels
+        .iter()
+        .zip(paper.iter())
+        .map(|(&p, &under)| {
+            let a = p >> 24;
+            let rgb_of = |c: u32| [(c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff];
+            if under == TRANSPARENT || a >= 255 {
+                let c = rgb_of(p);
+                [c[0], c[1], c[2], a]
+            } else {
+                // the bin over the paper
+                let (top, back) = (rgb_of(p), rgb_of(under));
+                let m = |k: usize| (top[k] * a + back[k] * (255 - a)) / 255;
+                [m(0), m(1), m(2), 255]
+            }
+        })
+        .collect();
+    let (mut left, mut top, mut right, mut bottom) = (w, h, 0, 0);
+    for y in 0..h {
+        for x in 0..w {
+            if pixels[y * w + x][3] > 8 {
+                left = left.min(x);
+                top = top.min(y);
+                right = right.max(x + 1);
+                bottom = bottom.max(y + 1);
+            }
         }
-        t
-    };
-    let d = deg.rem_euclid(360);
-    let s = match d {
-        0..=90 => SIN[d as usize],
-        91..=180 => SIN[(180 - d) as usize],
-        181..=270 => -SIN[(d - 180) as usize],
-        _ => -SIN[(360 - d) as usize],
-    };
-    let dc = (d + 90).rem_euclid(360);
-    let co = match dc {
-        0..=90 => SIN[dc as usize],
-        91..=180 => SIN[(180 - dc) as usize],
-        181..=270 => -SIN[(dc - 180) as usize],
-        _ => -SIN[(360 - dc) as usize],
-    };
-    (s, co)
+    }
+    if right <= left {
+        return Set::empty();
+    }
+    Picture::square(&pixels, w, h, (left, top, right, bottom)).set()
 }
 
 /// A square picture with straight (not premultiplied) alpha.
@@ -266,6 +219,67 @@ impl Picture {
             })
             .collect();
         Picture { size, pixels }
+    }
+
+    fn from_file(data: &[u8]) -> Option<Self> {
+        if data.starts_with(b"\x89PNG") {
+            Self::from_png(data)
+        } else {
+            Self::from_bmp(data)
+        }
+    }
+
+    /// A PNG with its own transparency, cropped to what is not clear.
+    fn from_png(data: &[u8]) -> Option<Self> {
+        let img = super::picture::decode(data)?;
+        let (w, h) = (img.width, img.height);
+        let pixels: Vec<[u32; 4]> = img
+            .pixels
+            .iter()
+            .map(|&p| [(p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff, p >> 24])
+            .collect();
+        let (mut left, mut top, mut right, mut bottom) = (w, h, 0, 0);
+        for y in 0..h {
+            for x in 0..w {
+                if pixels[y * w + x][3] > 8 {
+                    left = left.min(x);
+                    top = top.min(y);
+                    right = right.max(x + 1);
+                    bottom = bottom.max(y + 1);
+                }
+            }
+        }
+        if right <= left {
+            return None;
+        }
+        Some(Self::square(&pixels, w, h, (left, top, right, bottom)))
+    }
+
+    /// Crop `pixels` to a square around `bounds` (left, top, right,
+    /// bottom), with a thin margin.
+    fn square(
+        pixels: &[[u32; 4]],
+        w: usize,
+        h: usize,
+        (left, top, right, bottom): (usize, usize, usize, usize),
+    ) -> Self {
+        let side = (right - left).max(bottom - top);
+        let side = side + side / 24 * 2;
+        let (cx, cy) = ((left + right) / 2, (top + bottom) / 2);
+        let (ox, oy) = (cx as i32 - side as i32 / 2, cy as i32 - side as i32 / 2);
+        let mut square = vec![[0u32; 4]; side * side];
+        for y in 0..side {
+            for x in 0..side {
+                let (sx, sy) = (ox + x as i32, oy + y as i32);
+                if sx >= 0 && sy >= 0 && (sx as usize) < w && (sy as usize) < h {
+                    square[y * side + x] = pixels[sy as usize * w + sx as usize];
+                }
+            }
+        }
+        Picture {
+            size: side,
+            pixels: square,
+        }
     }
 
     /// Read an uncompressed 24 or 32 bit BMP. The white around the
@@ -386,24 +400,7 @@ impl Picture {
             return None;
         }
 
-        // crop to a square around the picture, with a thin margin
-        let side = (right - left).max(bottom - top);
-        let side = side + side / 24 * 2;
-        let (cx, cy) = ((left + right) / 2, (top + bottom) / 2);
-        let (ox, oy) = (cx as i32 - side as i32 / 2, cy as i32 - side as i32 / 2);
-        let mut square = vec![[0u32; 4]; side * side];
-        for y in 0..side {
-            for x in 0..side {
-                let (sx, sy) = (ox + x as i32, oy + y as i32);
-                if sx >= 0 && sy >= 0 && (sx as usize) < w && (sy as usize) < h {
-                    square[y * side + x] = pixels[sy as usize * w + sx as usize];
-                }
-            }
-        }
-        Some(Picture {
-            size: side,
-            pixels: square,
-        })
+        Some(Self::square(&pixels, w, h, (left, top, right, bottom)))
     }
 
     fn set(&self) -> Set {
@@ -537,7 +534,29 @@ pub fn draw_icon(c: &mut Canvas, app: App, x: i32, y: i32) {
             c.fill_round(Rect::new(x + 33, y + 31, 6, 6), 3, rgb(0xff, 0x70, 0x70));
             c.outline_round(tile, 8, rgb(0x10, 0x10, 0x30));
         }
+        App::Browser => {
+            // a globe on a blue tile
+            {
+                let mut s = c.sub(Rect::new(0, 0, c.width, c.height));
+                s.clip_round(tile, 8);
+                s.vertical_gradient(tile, rgb(0x3c, 0x9c, 0xff), rgb(0x10, 0x5c, 0xd8));
+            }
+            let (cx, cy) = (x + 24, y + 24);
+            c.fill_round(
+                Rect::new(cx - 14, cy - 14, 28, 28),
+                14,
+                rgb(0xf4, 0xf8, 0xff),
+            );
+            let line = rgb(0x1c, 0x6c, 0xe0);
+            c.outline_round(Rect::new(cx - 14, cy - 14, 28, 28), 14, line);
+            c.outline_round(Rect::new(cx - 6, cy - 14, 12, 28), 6, line);
+            c.fill_rect(cx, cy - 13, 1, 26, line);
+            c.fill_rect(cx - 13, cy, 26, 1, line);
+            c.fill_rect(cx - 11, cy - 7, 22, 1, line);
+            c.fill_rect(cx - 11, cy + 7, 22, 1, line);
+            c.outline_round(tile, 8, rgb(0x0c, 0x40, 0xa0));
+        }
         // these have pictures, so they are never drawn
-        App::Settings | App::About | App::Browser => c.fill_round(tile, 8, rgb(0x80, 0x80, 0x88)),
+        App::Settings | App::About => c.fill_round(tile, 8, rgb(0x80, 0x80, 0x88)),
     }
 }

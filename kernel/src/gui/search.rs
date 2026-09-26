@@ -12,7 +12,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
-use super::canvas::{rgb, Canvas, Rect};
+use super::canvas::{Canvas, Rect};
 use super::icons::{Icons, LARGE, MEDIUM};
 use super::text::{UI, UI_BOLD};
 use super::theme;
@@ -447,7 +447,7 @@ impl Search {
 
     fn highlight(&self, c: &mut Canvas, t: Target, r: Rect) {
         if self.hover == Some(t) {
-            c.fill_round(r, 6, rgb(0xe8, 0xeb, 0xf2));
+            c.fill_round(r, 6, theme::hover());
         }
     }
 
@@ -458,29 +458,29 @@ impl Search {
             m.clip_round(p, RADIUS);
             self.draw_inside(&mut m, p, icons, top, pins);
         }
-        c.outline_round(p, RADIUS, rgb(0xc8, 0xca, 0xd2));
+        c.outline_round(p, RADIUS, theme::frame());
     }
 
     fn draw_inside(&self, m: &mut Canvas, p: Rect, icons: &Icons, top: &[App], pins: &[App]) {
-        m.fill(p, rgb(0xf5, 0xf6, 0xfa));
+        m.fill(p, theme::panel());
         for (t, label, r) in Self::tab_rects(p) {
             self.highlight(m, Target::Tab(t), r);
             let on = t == self.tab;
-            let color = if on { theme::TEXT } else { theme::TEXT_DIM };
+            let color = if on { theme::text() } else { theme::text_dim() };
             m.text_centered_in(if on { &UI_BOLD } else { &UI }, r, label, color);
             if on {
                 let w = UI.width(label);
                 let bar = Rect::new(r.x + (r.w - w) / 2, r.bottom() - 3, w, 3);
-                m.fill_round(bar, 1, theme::ACCENT);
+                m.fill_round(bar, 1, theme::accent());
             }
         }
-        m.fill_rect(p.x, p.y + 52, p.w, 1, theme::STROKE);
+        m.fill_rect(p.x, p.y + 52, p.w, 1, theme::stroke());
 
         if self.query.trim().is_empty() {
             self.draw_start(m, p, icons, top);
         } else if self.results.is_empty() {
             let r = Rect::new(p.x, p.y + 200, p.w, 24);
-            m.text_centered(r, "No results. Try other words.", theme::TEXT_DIM);
+            m.text_centered(r, "No results. Try other words.", theme::text_dim());
         } else {
             self.draw_results(m, p, icons);
             self.draw_detail(m, p, icons, pins);
@@ -488,30 +488,35 @@ impl Search {
     }
 
     fn draw_start(&self, c: &mut Canvas, p: Rect, icons: &Icons, top: &[App]) {
-        c.draw_text_in(&UI_BOLD, p.x + 40, p.y + 76, "Top apps", theme::TEXT);
+        c.draw_text_in(&UI_BOLD, p.x + 40, p.y + 76, "Top apps", theme::text());
         for (i, r) in Self::top_apps(p, top) {
             self.highlight(c, Target::Top(i), r);
             icons.draw(c, top[i], LARGE, r.x + (r.w - 48) / 2, r.y + 12);
             let label = Rect::new(r.x, r.y + 68, r.w, 20);
-            c.text_centered(label, top[i].title(), theme::TEXT);
+            c.text_centered(label, top[i].title(), theme::text());
         }
         let card = Rect::new(p.x + 32, p.y + 240, p.w - 64, 120);
-        c.fill_round(card, 8, 0xffffff);
-        c.outline_round(card, 8, theme::STROKE);
-        magnifier(c, card.x + 36, card.y + 44, 2, theme::ACCENT);
+        c.fill_round(card, 8, theme::light());
+        c.outline_round(card, 8, theme::stroke());
+        magnifier(c, card.x + 36, card.y + 44, 2, theme::accent());
         c.draw_text_in(
             &UI_BOLD,
             card.x + 84,
             card.y + 34,
             "Search apps, files and folders",
-            theme::TEXT,
+            theme::text(),
         );
         let lines = [
             "Type a name. Russian names of apps work too, like \"блокнот\".",
             "Tab switches between All, Apps, Documents and Folders.",
         ];
         for (k, l) in lines.into_iter().enumerate() {
-            c.draw_text(card.x + 84, card.y + 60 + k as i32 * 22, l, theme::TEXT_DIM);
+            c.draw_text(
+                card.x + 84,
+                card.y + 60 + k as i32 * 22,
+                l,
+                theme::text_dim(),
+            );
         }
     }
 
@@ -526,31 +531,31 @@ impl Search {
     fn draw_results(&self, c: &mut Canvas, p: Rect, icons: &Icons) {
         for (i, r, heading) in self.rows(p) {
             if let Some(h) = heading {
-                c.draw_text_in(&UI_BOLD, r.x + 12, r.y - 26, h, theme::TEXT);
+                c.draw_text_in(&UI_BOLD, r.x + 12, r.y - 26, h, theme::text());
             }
             let hit = &self.results[i];
             if i == self.selected {
-                c.fill_round(r, 6, theme::ACCENT_LIGHT);
-                c.fill_round(Rect::new(r.x, r.y + 10, 3, r.h - 20), 1, theme::ACCENT);
+                c.fill_round(r, 6, theme::accent_light());
+                c.fill_round(Rect::new(r.x, r.y + 10, 3, r.h - 20), 1, theme::accent());
             } else {
                 self.highlight(c, Target::Result(i), r);
             }
             let name = fit(&hit.name(), r.w - 70);
             if i == 0 {
                 Self::draw_icon(c, icons, hit, 48, r.x + 12, r.y + 8);
-                c.draw_text_in(&UI_BOLD, r.x + 72, r.y + 12, &name, theme::TEXT);
-                c.draw_text(r.x + 72, r.y + 34, hit.type_name(), theme::TEXT_DIM);
+                c.draw_text_in(&UI_BOLD, r.x + 72, r.y + 12, &name, theme::text());
+                c.draw_text(r.x + 72, r.y + 34, hit.type_name(), theme::text_dim());
             } else {
                 Self::draw_icon(c, icons, hit, 24, r.x + 14, r.y + 8);
-                c.draw_text(r.x + 50, r.y + 10, &name, theme::TEXT);
+                c.draw_text(r.x + 50, r.y + 10, &name, theme::text());
             }
         }
     }
 
     fn draw_detail(&self, c: &mut Canvas, p: Rect, icons: &Icons, pins: &[App]) {
         let d = Self::detail_area(p);
-        c.fill_round(d, 8, 0xffffff);
-        c.outline_round(d, 8, theme::STROKE);
+        c.fill_round(d, 8, theme::light());
+        c.outline_round(d, 8, theme::stroke());
         let Some(hit) = self.results.get(self.selected) else {
             return;
         };
@@ -558,12 +563,12 @@ impl Search {
         Self::draw_icon(c, icons, hit, big, d.x + (d.w - big) / 2, d.y + 28);
         let name = fit(&hit.name(), d.w - 24);
         let row = |i: i32| Rect::new(d.x, d.y + 96 + i * 24, d.w, 22);
-        c.text_centered_in(&UI_BOLD, row(0), &name, theme::TEXT);
-        c.text_centered(row(1), hit.type_name(), theme::TEXT_DIM);
+        c.text_centered_in(&UI_BOLD, row(0), &name, theme::text());
+        c.text_centered(row(1), hit.type_name(), theme::text_dim());
         if let Some(loc) = hit.location() {
-            c.text_centered(row(2), &fit(&loc, d.w - 24), theme::TEXT_DIM);
+            c.text_centered(row(2), &fit(&loc, d.w - 24), theme::text_dim());
         }
-        c.fill_rect(d.x + 12, d.y + 192, d.w - 24, 1, theme::STROKE);
+        c.fill_rect(d.x + 12, d.y + 192, d.w - 24, 1, theme::stroke());
         for (t, r) in self.actions(p) {
             self.highlight(c, t, r);
             let label = match (t, hit) {
@@ -576,20 +581,20 @@ impl Search {
             match t {
                 Target::Open => {
                     // a box with an arrow out of it
-                    c.outline_round(Rect::new(ix, iy + 2, 14, 14), 2, theme::TEXT);
-                    c.line(ix + 7, iy + 9, ix + 15, iy + 1, theme::ACCENT);
-                    c.line(ix + 10, iy + 1, ix + 15, iy + 1, theme::ACCENT);
-                    c.line(ix + 15, iy + 1, ix + 15, iy + 6, theme::ACCENT);
+                    c.outline_round(Rect::new(ix, iy + 2, 14, 14), 2, theme::text());
+                    c.line(ix + 7, iy + 9, ix + 15, iy + 1, theme::accent());
+                    c.line(ix + 10, iy + 1, ix + 15, iy + 1, theme::accent());
+                    c.line(ix + 15, iy + 1, ix + 15, iy + 6, theme::accent());
                 }
                 Target::Location => widgets::folder_icon(c, ix, iy, 16),
                 _ => {
                     // a pin
-                    c.fill_round(Rect::new(ix + 4, iy, 8, 9), 2, theme::TEXT);
-                    c.fill_rect(ix + 2, iy + 8, 12, 2, theme::TEXT);
-                    c.fill_rect(ix + 7, iy + 10, 2, 6, theme::TEXT);
+                    c.fill_round(Rect::new(ix + 4, iy, 8, 9), 2, theme::text());
+                    c.fill_rect(ix + 2, iy + 8, 12, 2, theme::text());
+                    c.fill_rect(ix + 7, iy + 10, 2, 6, theme::text());
                 }
             }
-            c.draw_text(r.x + 44, r.y + 9, label, theme::TEXT);
+            c.draw_text(r.x + 44, r.y + 9, label, theme::text());
         }
     }
 }
