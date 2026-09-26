@@ -230,17 +230,16 @@ impl Calc {
     pub fn draw(&self, c: &mut Canvas) {
         c.fill_rect(0, 0, CLIENT_W, CLIENT_H, theme::FACE);
 
+        // Windows 11 shows the number straight on the window, no box
         let display = Rect::new(MARGIN, MARGIN, CLIENT_W - 2 * MARGIN, DISPLAY_H);
-        c.fill(display, rgb(0xe8, 0xf4, 0xe0));
-        c.bevel(display, theme::SHADOW, theme::LIGHT, false);
-        let dark = rgb(0x20, 0x30, 0x20);
+        let dark = theme::TEXT;
         let mut pending = StackString::<32>::new();
         if let Some(op) = self.op {
             let mut acc = StackString::<24>::new();
             format_number(&mut acc, self.acc);
             let _ = write!(pending, "{} {}", acc.as_str(), op);
         }
-        let small = rgb(0x60, 0x70, 0x60);
+        let small = theme::TEXT_DIM;
         let w = super::canvas::text_width(pending.as_str());
         c.draw_text(
             display.right() - 6 - w,
@@ -262,11 +261,10 @@ impl Calc {
             let pressed = self.pressed == Some(i);
             match *label {
                 "=" => theme::accent_button(c, r, label, pressed),
-                "C" | "DEL" => theme::colored_button(c, r, label, rgb(0xf0, 0xd0, 0xc8), pressed),
-                "+" | "-" | "×" | "÷" | "%" => {
-                    theme::colored_button(c, r, label, rgb(0xd8, 0xdc, 0xe8), pressed)
+                "C" | "DEL" | "+" | "-" | "×" | "÷" | "%" => {
+                    theme::colored_button(c, r, label, rgb(0xf6, 0xf6, 0xf6), pressed)
                 }
-                _ => theme::colored_button(c, r, label, rgb(0xf8, 0xf8, 0xf8), pressed),
+                _ => theme::colored_button(c, r, label, rgb(0xff, 0xff, 0xff), pressed),
             }
         }
     }

@@ -93,6 +93,9 @@ pub struct Canvas<'a> {
     oy: i32,
     /// Drawable area in buffer coordinates.
     clip: Rect,
+    /// Optional rounded clip: a rectangle in buffer coordinates and, per
+    /// corner row, how many pixels are cut off at each end.
+    round: Option<RoundClip>,
     pub width: i32,
     pub height: i32,
 }
@@ -106,6 +109,7 @@ impl<'a> Canvas<'a> {
             ox: 0,
             oy: 0,
             clip: Rect::new(0, 0, width as i32, height as i32),
+            round: None,
             width: width as i32,
             height: height as i32,
         }
@@ -121,6 +125,7 @@ impl<'a> Canvas<'a> {
             ox: area.x,
             oy: area.y,
             clip: self.clip.intersect(&area),
+            round: self.round,
             width: r.w,
             height: r.h,
         }
@@ -131,6 +136,69 @@ impl<'a> Canvas<'a> {
         self.clip = self.clip.intersect(&r.offset(self.ox, self.oy));
     }
 
+    /// Limit drawing to `r` with its corners rounded by `radius`.
+    pub fn clip_round(&mut self, r: Rect, radius: i32) {
+        self.clip_to(r);
+        let r = r.offset(self.ox, self.oy);
+        let radius = radius.clamp(0, MAX_RADIUS as i32);
+        let mut cut = [0; MAX_RADIUS];
+        for (row, c) in cut.iter_mut().enumerate().take(radius as usize) {
+            // first column whose pixel centre is inside the corner circle
+            let dy2 = 2 * (radius - row as i32) - 1;
+            let mut i = 0;
+            while i < radius {
+                let dx2 = 2 * (radius - i) - 1;
+                if dx2 * dx2 + dy2 * dy2 <= 4 * radius * radius {
+                    break;
+                }
+                i += 1;
+            }
+            *c = i;
+        }
+        self.round = Some(RoundClip {
+            rect: r,
+            radius,
+            cut,
+        });
+    }
+
+    /// The columns `[x0, x1)` a buffer row may draw on.
+    fn span(&self, y: i32) -> (i32, i32) {
+        let (mut x0, mut x1) = (self.clip.x, self.clip.right());
+        if let Some(rc) = &self.round {
+            let row = if y < rc.rect.y + rc.radius {
+                y - rc.rect.y
+            } else if y >= rc.rect.bottom() - rc.radius {
+                rc.rect.bottom() - 1 - y
+            } else {
+                -1
+            };
+            if row >= 0 && row < rc.radius {
+                let cut = rc.cut[row as usize];
+                x0 = x0.max(rc.rect.x + cut);
+                x1 = x1.min(rc.rect.right() - cut);
+            }
+        }
+        (x0, x1)
+    }
+
+    /// Mix `c` into a buffer pixel with coverage `a` (0 to 256).
+    fn blend(&mut self, x: i32, y: i32, c: Color, a: i32) {
+        if a <= 0 || y < self.clip.y || y >= self.clip.bottom() {
+            return;
+        }
+        let (x0, x1) = self.span(y);
+        if x < x0 || x >= x1 {
+            return;
+        }
+        let p = &mut self.pixels[y as usize * self.stride + x as usize];
+        *p = if a >= 256 {
+            c
+        } else {
+            mix(*p, c, (a * 255 / 256) as u32)
+        };
+    }
+
     /// Whether anything inside `r` could be drawn.
     pub fn visible(&self, r: Rect) -> bool {
         !self.clip.intersect(&r.offset(self.ox, self.oy)).is_empty()
@@ -139,7 +207,10 @@ impl<'a> Canvas<'a> {
     pub fn pixel(&mut self, x: i32, y: i32, c: Color) {
         let (x, y) = (x + self.ox, y + self.oy);
         if self.clip.contains(x, y) {
-            self.pixels[y as usize * self.stride + x as usize] = c;
+            let (x0, x1) = self.span(y);
+            if x >= x0 && x < x1 {
+                self.pixels[y as usize * self.stride + x as usize] = c;
+            }
         }
     }
 
@@ -149,48 +220,17 @@ impl<'a> Canvas<'a> {
             return;
         }
         for row in r.y..r.bottom() {
-            let start = row as usize * self.stride + r.x as usize;
-            self.pixels[start..start + r.w as usize].fill(c);
+            let (x0, x1) = self.span(row);
+            let (x0, x1) = (x0.max(r.x), x1.min(r.right()));
+            if x0 < x1 {
+                let start = row as usize * self.stride;
+                self.pixels[start + x0 as usize..start + x1 as usize].fill(c);
+            }
         }
     }
 
     pub fn fill(&mut self, r: Rect, c: Color) {
         self.fill_rect(r.x, r.y, r.w, r.h, c);
-    }
-
-    /// Darken what is already drawn in `r`, by `amount` out of 255.
-    pub fn darken(&mut self, r: Rect, amount: u32) {
-        let r = r.offset(self.ox, self.oy).intersect(&self.clip);
-        if r.is_empty() {
-            return;
-        }
-        for row in r.y..r.bottom() {
-            let start = row as usize * self.stride + r.x as usize;
-            for p in &mut self.pixels[start..start + r.w as usize] {
-                *p = mix(*p, 0, amount);
-            }
-        }
-    }
-
-    /// One pixel wide outline.
-    pub fn outline(&mut self, r: Rect, c: Color) {
-        self.fill_rect(r.x, r.y, r.w, 1, c);
-        self.fill_rect(r.x, r.bottom() - 1, r.w, 1, c);
-        self.fill_rect(r.x, r.y, 1, r.h, c);
-        self.fill_rect(r.right() - 1, r.y, 1, r.h, c);
-    }
-
-    /// A raised (or, with `pressed`, sunken) 3D frame.
-    pub fn bevel(&mut self, r: Rect, light: Color, dark: Color, pressed: bool) {
-        let (top, bottom) = if pressed {
-            (dark, light)
-        } else {
-            (light, dark)
-        };
-        self.fill_rect(r.x, r.y, r.w, 1, top);
-        self.fill_rect(r.x, r.y, 1, r.h, top);
-        self.fill_rect(r.x, r.bottom() - 1, r.w, 1, bottom);
-        self.fill_rect(r.right() - 1, r.y, 1, r.h, bottom);
     }
 
     pub fn vertical_gradient(&mut self, r: Rect, top: Color, bottom: Color) {
@@ -199,15 +239,6 @@ impl<'a> Canvas<'a> {
         for y in first..last {
             let t = ((y - r.y) * 255 / r.h.max(1)) as u32;
             self.fill_rect(r.x, y, r.w, 1, mix(top, bottom, t));
-        }
-    }
-
-    pub fn horizontal_gradient(&mut self, r: Rect, left: Color, right: Color) {
-        let first = (self.clip.x - self.ox).max(r.x);
-        let last = (self.clip.right() - self.ox).min(r.right());
-        for x in first..last {
-            let t = ((x - r.x) * 255 / r.w.max(1)) as u32;
-            self.fill_rect(x, r.y, 1, r.h, mix(left, right, t));
         }
     }
 
@@ -288,9 +319,147 @@ impl<'a> Canvas<'a> {
         }
         let (sx, sy) = ((r.x - dst.x) as usize, (r.y - dst.y) as usize);
         for row in 0..r.h as usize {
-            let from = (sy + row) * src_stride + sx;
-            let to = (r.y as usize + row) * self.stride + r.x as usize;
-            self.pixels[to..to + r.w as usize].copy_from_slice(&src[from..from + r.w as usize]);
+            let y = r.y + row as i32;
+            let (x0, x1) = self.span(y);
+            let (x0, x1) = (x0.max(r.x), x1.min(r.right()));
+            if x0 >= x1 {
+                continue;
+            }
+            let skip = (x0 - r.x) as usize;
+            let n = (x1 - x0) as usize;
+            let from = (sy + row) * src_stride + sx + skip;
+            let to = y as usize * self.stride + x0 as usize;
+            self.pixels[to..to + n].copy_from_slice(&src[from..from + n]);
+        }
+    }
+
+    /// Copy pixels with alpha in the top byte (255 is opaque).
+    pub fn blit_alpha(&mut self, x: i32, y: i32, w: i32, h: i32, src: &[u32]) {
+        if !self.visible(Rect::new(x, y, w, h)) {
+            return;
+        }
+        for row in 0..h {
+            for col in 0..w {
+                let p = src[(row * w + col) as usize];
+                let a = (p >> 24) as i32;
+                if a != 0 {
+                    let a = if a == 255 { 256 } else { a };
+                    self.blend(x + col + self.ox, y + row + self.oy, p & 0xff_ffff, a);
+                }
+            }
+        }
+    }
+
+    /// Fill a rectangle with rounded, anti-aliased corners, blended with
+    /// `alpha` (0 to 256).
+    pub fn fill_round_alpha(&mut self, r: Rect, radius: i32, c: Color, alpha: i32) {
+        let radius = radius.min(r.w / 2).min(r.h / 2).max(0);
+        let b = r.offset(self.ox, self.oy);
+        let area = b.intersect(&self.clip);
+        if area.is_empty() {
+            return;
+        }
+        for y in area.y..area.bottom() {
+            // distance into a corner row, if any, and the corner centre row
+            let corner_cy = if y < b.y + radius {
+                Some(b.y + radius)
+            } else if y >= b.bottom() - radius {
+                Some(b.bottom() - radius)
+            } else {
+                None
+            };
+            let Some(cy) = corner_cy else {
+                if alpha >= 256 {
+                    self.fill_rect(area.x - self.ox, y - self.oy, area.w, 1, c);
+                } else {
+                    for x in area.x..area.right() {
+                        self.blend(x, y, c, alpha);
+                    }
+                }
+                continue;
+            };
+            for x in area.x..area.right() {
+                let cx = if x < b.x + radius {
+                    b.x + radius
+                } else if x >= b.right() - radius {
+                    b.right() - radius
+                } else {
+                    self.blend(x, y, c, alpha);
+                    continue;
+                };
+                let d = distance256(2 * x + 1 - 2 * cx, 2 * y + 1 - 2 * cy);
+                let cover = (radius * 256 - d + 128).clamp(0, 256);
+                self.blend(x, y, c, cover * alpha / 256);
+            }
+        }
+    }
+
+    pub fn fill_round(&mut self, r: Rect, radius: i32, c: Color) {
+        self.fill_round_alpha(r, radius, c, 256);
+    }
+
+    /// A one pixel, anti-aliased outline with rounded corners.
+    pub fn outline_round(&mut self, r: Rect, radius: i32, c: Color) {
+        let radius = radius.min(r.w / 2).min(r.h / 2).max(1);
+        self.fill_rect(r.x + radius, r.y, r.w - 2 * radius, 1, c);
+        self.fill_rect(r.x + radius, r.bottom() - 1, r.w - 2 * radius, 1, c);
+        self.fill_rect(r.x, r.y + radius, 1, r.h - 2 * radius, c);
+        self.fill_rect(r.right() - 1, r.y + radius, 1, r.h - 2 * radius, c);
+        let b = r.offset(self.ox, self.oy);
+        let corners = [
+            (b.x, b.y, b.x + radius, b.y + radius),
+            (b.right() - radius, b.y, b.right() - radius, b.y + radius),
+            (b.x, b.bottom() - radius, b.x + radius, b.bottom() - radius),
+            (
+                b.right() - radius,
+                b.bottom() - radius,
+                b.right() - radius,
+                b.bottom() - radius,
+            ),
+        ];
+        let ring = radius * 256 - 128;
+        for (x0, y0, cx, cy) in corners {
+            for y in y0..y0 + radius {
+                for x in x0..x0 + radius {
+                    let d = distance256(2 * x + 1 - 2 * cx, 2 * y + 1 - 2 * cy);
+                    let cover = (256 - (d - ring).abs()).clamp(0, 256);
+                    self.blend(x, y, c, cover);
+                }
+            }
+        }
+    }
+
+    /// A soft shadow around the rounded rectangle `r`, fading out over
+    /// `spread` pixels and shifted down by `drop`.
+    pub fn shadow(&mut self, r: Rect, radius: i32, spread: i32, drop: i32, strength: i32) {
+        let s = r.offset(self.ox, self.oy + drop);
+        let outer = Rect::new(
+            s.x - spread,
+            s.y - spread,
+            s.w + 2 * spread,
+            s.h + 2 * spread,
+        );
+        let area = outer.intersect(&self.clip);
+        let inner = r.offset(self.ox, self.oy).inset(radius);
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                if inner.contains(x, y) {
+                    continue;
+                }
+                // distance from the rounded rectangle, in 1/256 pixels
+                let dx = (s.x + radius - x).max(x - (s.right() - 1 - radius)).max(0);
+                let dy = (s.y + radius - y).max(y - (s.bottom() - 1 - radius)).max(0);
+                let d = distance256(2 * dx, 2 * dy) - radius * 256;
+                let t = 256 - (d.max(0) / spread).min(256);
+                let a = strength * t * t / 65536;
+                if a > 0 {
+                    let (x0, x1) = self.span(y);
+                    if y >= self.clip.y && y < self.clip.bottom() && x >= x0 && x < x1 {
+                        let p = &mut self.pixels[y as usize * self.stride + x as usize];
+                        *p = mix(*p, 0, a as u32);
+                    }
+                }
+            }
         }
     }
 
@@ -305,6 +474,36 @@ impl<'a> Canvas<'a> {
             }
         }
     }
+}
+
+const MAX_RADIUS: usize = 16;
+
+#[derive(Clone, Copy)]
+struct RoundClip {
+    rect: Rect,
+    radius: i32,
+    cut: [i32; MAX_RADIUS],
+}
+
+/// Length of the vector (dx/2, dy/2) in 1/256 pixels. Taking doubled
+/// coordinates lets callers measure from pixel centres.
+fn distance256(dx2: i32, dy2: i32) -> i32 {
+    let (x, y) = (dx2 as i64, dy2 as i64);
+    let squared = (x * x + y * y) as u64 * 16384;
+    isqrt(squared) as i32
+}
+
+fn isqrt(n: u64) -> u64 {
+    if n < 2 {
+        return n;
+    }
+    let mut x = n;
+    let mut y = x.div_ceil(2);
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
 }
 
 pub fn text_width(text: &str) -> i32 {

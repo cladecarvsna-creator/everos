@@ -3,7 +3,7 @@
 //! Left button paints with the chosen colour, right button with white.
 //! Tools: brush, eraser and flood fill, four brush sizes, and Clear.
 
-use super::canvas::{rgb, Canvas, Color, Rect};
+use super::canvas::{mix, rgb, Canvas, Color, Rect};
 use super::theme;
 use super::{MouseEvent, MouseKind};
 use crate::sync::StaticBuffer;
@@ -241,38 +241,32 @@ impl Paint {
 
     pub fn draw(&self, c: &mut Canvas) {
         c.fill_rect(0, 0, CLIENT_W, TOOLBAR_H, theme::FACE);
-        c.fill_rect(0, TOOLBAR_H - 1, CLIENT_W, 1, theme::SHADOW);
+        c.fill_rect(0, TOOLBAR_H - 1, CLIENT_W, 1, theme::STROKE);
 
         // current colour
         let current = Rect::new(8, 7, 36, 36);
-        c.fill(current, self.color);
-        c.outline(current, theme::DARK);
+        c.fill_round(current, 8, self.color);
+        c.outline_round(current, 8, theme::SHADOW);
         for (i, &color) in PALETTE.iter().enumerate() {
             let r = swatch(i);
-            c.fill(r, color);
-            let edge = if color == self.color {
-                theme::ACCENT
-            } else {
-                theme::SHADOW
-            };
-            c.outline(r, edge);
             if color == self.color {
-                c.outline(r.inset(-1), theme::ACCENT);
+                c.fill_round(r.inset(-2), 12, theme::ACCENT);
+                c.fill_round(r, 10, theme::FACE);
             }
+            let dot = r.inset(1);
+            c.fill_round(dot, 9, color);
+            c.outline_round(dot, 9, mix(color, theme::TEXT, 60));
         }
 
         for (i, &(tool, name)) in TOOLS.iter().enumerate() {
-            theme::button(c, tool_button(i), name, self.tool == tool);
+            theme::toggle_button(c, tool_button(i), name, self.tool == tool);
         }
         for (i, &size) in SIZES.iter().enumerate() {
             let r = size_button(i);
-            theme::button(c, r, "", self.size == i);
-            c.fill_circle(
-                r.x + r.w / 2,
-                r.y + r.h / 2,
-                (size - 1).clamp(0, 7),
-                theme::DARK,
-            );
+            theme::toggle_button(c, r, "", self.size == i);
+            let d = (2 * size - 1).clamp(1, 14);
+            let dot = Rect::new(r.x + (r.w - d) / 2, r.y + (r.h - d) / 2, d, d);
+            c.fill_round(dot, d / 2, theme::TEXT);
         }
         theme::button(c, clear_button(), "Clear", false);
 

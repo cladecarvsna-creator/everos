@@ -1,5 +1,6 @@
-//! The graphical desktop: background, icons, windows, a taskbar with a
-//! start menu and a clock, and the mouse pointer.
+//! The graphical desktop in the style of Windows 11: a background with a
+//! bloom, icons, windows with rounded corners and soft shadows, a
+//! centred taskbar with a start menu and a clock, and the mouse pointer.
 //!
 //! Everything is drawn into a back buffer in memory and then copied to
 //! the screen, so nothing flickers. Only the area that changed (the
@@ -15,18 +16,20 @@ mod theme;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use canvas::{mix, rgb, Canvas, Color, Rect};
+use canvas::{mix, rgb, Canvas, Rect};
 
 use crate::framebuffer::Framebuffer;
 use crate::interrupts::{self, KEYBOARD_BYTES, MOUSE_BYTES};
 use crate::keyboard::{Key, Keyboard, Layout};
 use crate::multiboot::BootInfo;
 use crate::sync::{ByteQueue, StaticBuffer};
-use crate::{console::CONSOLE, font, port, ps2, rtc, serial, StackString};
+use crate::{console::CONSOLE, port, ps2, rtc, serial, StackString};
 
 const MAX_W: usize = 1920;
 const MAX_H: usize = 1200;
 static BACK_BUFFER: StaticBuffer<{ MAX_W * MAX_H }> = StaticBuffer::new();
+/// The desktop background, drawn once at start.
+static WALLPAPER: StaticBuffer<{ MAX_W * MAX_H }> = StaticBuffer::new();
 
 /// Whether the desktop is running (the shell asks before opening apps).
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -34,10 +37,13 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static REQUESTS: ByteQueue = ByteQueue::new();
 const CLOSE: u8 = 0x80;
 
-const TASKBAR_H: i32 = 36;
-const TITLE_H: i32 = 26;
-const BORDER: i32 = 3;
-const SHADOW: i32 = 6;
+const TASKBAR_H: i32 = 48;
+const TITLE_H: i32 = 32;
+const BORDER: i32 = 1;
+const WINDOW_RADIUS: i32 = 8;
+/// How far window shadows reach.
+const SPREAD: i32 = 16;
+const SHADOW_DROP: i32 = 4;
 const DOUBLE_CLICK_TICKS: u64 = interrupts::TIMER_HZ / 2;
 const BLINK_TICKS: u64 = interrupts::TIMER_HZ / 2;
 
@@ -77,9 +83,9 @@ impl App {
     fn default_position(self) -> (i32, i32) {
         match self {
             App::Terminal => (150, 40),
-            App::Paint => (250, 110),
+            App::Paint => (250, 100),
             App::Calculator => (760, 60),
-            App::Demo => (380, 180),
+            App::Demo => (380, 170),
         }
     }
 }
@@ -141,20 +147,20 @@ impl Window {
     }
 
     fn close_button(&self) -> Rect {
-        Rect::new(self.rect.right() - 26, self.rect.y + 4, 20, 18)
+        Rect::new(self.rect.right() - 46, self.rect.y, 46, TITLE_H)
     }
 
     fn minimize_button(&self) -> Rect {
-        self.close_button().offset(-24, 0)
+        self.close_button().offset(-46, 0)
     }
 
     /// Everything the window draws on, shadow included.
     fn bounds(&self) -> Rect {
         Rect::new(
-            self.rect.x,
-            self.rect.y,
-            self.rect.w + SHADOW,
-            self.rect.h + SHADOW,
+            self.rect.x - SPREAD,
+            self.rect.y - SPREAD,
+            self.rect.w + 2 * SPREAD,
+            self.rect.h + 2 * SPREAD + SHADOW_DROP,
         )
     }
 }
@@ -174,16 +180,90 @@ const MENU: [MenuItem; 6] = [
     MenuItem::Restart,
     MenuItem::ShutDown,
 ];
-const MENU_W: i32 = 210;
-const MENU_ITEM_H: i32 = 30;
-const MENU_BANNER: i32 = 28;
+const MENU_W: i32 = 520;
+const MENU_H: i32 = 250;
+const MENU_FOOTER: i32 = 64;
+
+/// What is under the mouse and lights up.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hover {
+    None,
+    Minimize(App),
+    Close(App),
+    /// A taskbar button: 0 is Start, then the apps.
+    Slot(usize),
+    Menu(usize),
+}
+
+/// App icons, shrunk from the 48 pixel drawings, with alpha.
+struct Icons {
+    medium: [[u32; 24 * 24]; APPS.len()],
+    small: [[u32; 16 * 16]; APPS.len()],
+}
+
+impl Icons {
+    fn new() -> Self {
+        let mut icons = Icons {
+            medium: [[0; 24 * 24]; APPS.len()],
+            small: [[0; 16 * 16]; APPS.len()],
+        };
+        for app in APPS {
+            // pixels left at the marker value are transparent
+            let mut big = [TRANSPARENT; 48 * 48];
+            draw_icon(&mut Canvas::new(&mut big, 48, 48), app, 0, 0);
+            shrink(&big, 2, &mut icons.medium[app.index()]);
+            shrink(&big, 3, &mut icons.small[app.index()]);
+        }
+        icons
+    }
+
+    fn draw_medium(&self, c: &mut Canvas, app: App, x: i32, y: i32) {
+        c.blit_alpha(x, y, 24, 24, &self.medium[app.index()]);
+    }
+
+    fn draw_small(&self, c: &mut Canvas, app: App, x: i32, y: i32) {
+        c.blit_alpha(x, y, 16, 16, &self.small[app.index()]);
+    }
+}
+
+const TRANSPARENT: u32 = 0xffc8_c8c8;
+
+/// Scale a 48x48 picture down by `k`, averaging the opaque pixels of each
+/// block and turning how many there were into alpha.
+fn shrink(big: &[u32], k: usize, out: &mut [u32]) {
+    let n = 48 / k;
+    for oy in 0..n {
+        for ox in 0..n {
+            let (mut r, mut g, mut b, mut count) = (0, 0, 0, 0);
+            for y in oy * k..oy * k + k {
+                for x in ox * k..ox * k + k {
+                    let p = big[y * 48 + x];
+                    if p != TRANSPARENT {
+                        r += (p >> 16) & 0xff;
+                        g += (p >> 8) & 0xff;
+                        b += p & 0xff;
+                        count += 1;
+                    }
+                }
+            }
+            out[oy * n + ox] = if count == 0 {
+                0
+            } else {
+                let alpha = count * 255 / (k * k) as u32;
+                alpha << 24 | (r / count) << 16 | (g / count) << 8 | (b / count)
+            };
+        }
+    }
+}
 
 pub struct Desktop<'a> {
     fb: Framebuffer,
     back: &'static mut [u32],
+    wallpaper: &'static mut [u32],
     width: i32,
     height: i32,
     boot: &'a BootInfo,
+    icons: Icons,
 
     windows: [Window; APPS.len()],
     /// Open windows from bottom to top.
@@ -199,8 +279,8 @@ pub struct Desktop<'a> {
     drag: Option<(App, i32, i32)>,
     /// App that got the button press and gets the moves until release.
     capture: Option<App>,
+    hover: Hover,
     menu_open: bool,
-    menu_hover: Option<usize>,
     selected_icon: Option<usize>,
     last_click: (u64, usize),
 
@@ -227,16 +307,20 @@ impl<'a> Desktop<'a> {
             let (w, h) = app.client_size();
             let (x, y) = app.default_position();
             // keep windows on small screens
-            let x = x.min(width - w - 2 * BORDER - SHADOW).max(0);
+            let x = x.min(width - w - 2 * BORDER).max(0);
             let y = y.min(height - TASKBAR_H - h - TITLE_H - BORDER).max(0);
             windows[app.index()].rect = Rect::new(x, y, w + 2 * BORDER, h + TITLE_H + BORDER);
         }
+        let wallpaper = WALLPAPER.take();
+        draw_wallpaper(&mut Canvas::new(wallpaper, width as usize, height as usize));
         Self {
             fb,
             back: BACK_BUFFER.take(),
+            wallpaper,
             width,
             height,
             boot,
+            icons: Icons::new(),
             windows,
             order: APPS,
             order_len: 0,
@@ -247,8 +331,8 @@ impl<'a> Desktop<'a> {
             right: false,
             drag: None,
             capture: None,
+            hover: Hover::None,
             menu_open: false,
-            menu_hover: None,
             selected_icon: None,
             last_click: (0, usize::MAX),
             layout: Layout::Us,
@@ -437,12 +521,61 @@ impl<'a> Desktop<'a> {
         if (was_left && !self.left) || (was_right && !self.right) {
             self.release();
         }
-        if moved && self.menu_open {
-            let hover = self.menu_item_at(self.mouse_x, self.mouse_y);
-            if hover != self.menu_hover {
-                self.menu_hover = hover;
-                self.damage(self.menu_rect());
+        self.update_hover();
+    }
+
+    /// Light up whatever is under the mouse now.
+    fn update_hover(&mut self) {
+        let hover = if self.drag.is_some() {
+            Hover::None
+        } else {
+            self.hover_at(self.mouse_x, self.mouse_y)
+        };
+        if hover != self.hover {
+            let (old, new) = (self.hover_rect(self.hover), self.hover_rect(hover));
+            self.hover = hover;
+            self.damage(old);
+            self.damage(new);
+        }
+    }
+
+    fn hover_at(&self, x: i32, y: i32) -> Hover {
+        if self.menu_open {
+            if let Some(i) = self.menu_item_at(x, y) {
+                return Hover::Menu(i);
             }
+            if self.menu_rect().contains(x, y) {
+                return Hover::None;
+            }
+        }
+        if y >= self.height - TASKBAR_H {
+            return match (0..=APPS.len()).find(|&i| self.slot_rect(i).contains(x, y)) {
+                Some(i) => Hover::Slot(i),
+                None => Hover::None,
+            };
+        }
+        match self.window_at(x, y) {
+            Some(app) => {
+                let w = self.windows[app.index()];
+                if w.close_button().contains(x, y) {
+                    Hover::Close(app)
+                } else if w.minimize_button().contains(x, y) {
+                    Hover::Minimize(app)
+                } else {
+                    Hover::None
+                }
+            }
+            None => Hover::None,
+        }
+    }
+
+    fn hover_rect(&self, hover: Hover) -> Rect {
+        match hover {
+            Hover::None => Rect::default(),
+            Hover::Minimize(app) => self.windows[app.index()].minimize_button(),
+            Hover::Close(app) => self.windows[app.index()].close_button(),
+            Hover::Slot(i) => self.slot_rect(i),
+            Hover::Menu(i) => self.menu_item_rect(i),
         }
     }
 
@@ -456,7 +589,10 @@ impl<'a> Desktop<'a> {
                 }
                 return;
             }
-            let on_start = start_button().contains(x, y - (self.height - TASKBAR_H));
+            if self.menu_rect().contains(x, y) {
+                return;
+            }
+            let on_start = self.slot_rect(0).contains(x, y);
             self.close_menu();
             if on_start {
                 return;
@@ -464,7 +600,7 @@ impl<'a> Desktop<'a> {
         }
         if y >= self.height - TASKBAR_H {
             if !right {
-                self.taskbar_click(x, y - (self.height - TASKBAR_H));
+                self.taskbar_click(x, y);
             }
             return;
         }
@@ -541,24 +677,21 @@ impl<'a> Desktop<'a> {
     }
 
     fn taskbar_click(&mut self, x: i32, y: i32) {
-        if start_button().contains(x, y) {
+        let Some(slot) = (0..=APPS.len()).find(|&i| self.slot_rect(i).contains(x, y)) else {
+            return;
+        };
+        if slot == 0 {
             self.menu_open = true;
-            self.menu_hover = None;
             self.damage(self.menu_rect());
             self.damage_taskbar();
             return;
         }
-        let hit = self
-            .open_apps()
-            .enumerate()
-            .find(|&(i, _)| task_button(i).contains(x, y));
-        if let Some((_, app)) = hit {
-            let w = self.windows[app.index()];
-            if w.minimized || self.focused != Some(app) {
-                self.open(app);
-            } else {
-                self.minimize(app);
-            }
+        let app = APPS[slot - 1];
+        let w = self.windows[app.index()];
+        if w.visible() && self.focused == Some(app) {
+            self.minimize(app);
+        } else {
+            self.open(app);
         }
     }
 
@@ -578,28 +711,39 @@ impl<'a> Desktop<'a> {
         }
     }
 
-    fn open_apps(&self) -> impl Iterator<Item = App> + '_ {
-        APPS.into_iter().filter(|a| self.windows[a.index()].open)
+    /// The start menu, with room for its shadow.
+    fn menu_rect(&self) -> Rect {
+        self.menu_panel().inset(-SPREAD)
     }
 
-    fn menu_rect(&self) -> Rect {
-        let h = MENU_BANNER + MENU.len() as i32 * MENU_ITEM_H + 12;
-        Rect::new(2, self.height - TASKBAR_H - h, MENU_W, h + SHADOW)
+    fn menu_panel(&self) -> Rect {
+        Rect::new(
+            (self.width - MENU_W) / 2,
+            self.height - TASKBAR_H - 12 - MENU_H,
+            MENU_W,
+            MENU_H,
+        )
     }
 
     fn menu_item_rect(&self, i: usize) -> Rect {
-        let menu = self.menu_rect();
-        let gap = if i >= 4 { 10 } else { 0 };
-        Rect::new(
-            menu.x + 4,
-            menu.y + MENU_BANNER + 2 + i as i32 * MENU_ITEM_H + gap,
-            MENU_W - 8,
-            MENU_ITEM_H,
-        )
+        let p = self.menu_panel();
+        match MENU[i] {
+            MenuItem::Open(_) => Rect::new(p.x + 28 + i as i32 * 96, p.y + 64, 88, 92),
+            MenuItem::Restart => Rect::new(p.right() - 240, p.bottom() - 50, 108, 36),
+            MenuItem::ShutDown => Rect::new(p.right() - 124, p.bottom() - 50, 108, 36),
+        }
     }
 
     fn menu_item_at(&self, x: i32, y: i32) -> Option<usize> {
         (0..MENU.len()).find(|&i| self.menu_item_rect(i).contains(x, y))
+    }
+
+    /// Taskbar button `i` (0 is Start), centred like Windows 11.
+    fn slot_rect(&self, i: usize) -> Rect {
+        let n = APPS.len() as i32 + 1;
+        let total = n * 44 + (n - 1) * 4;
+        let x0 = (self.width - total) / 2;
+        Rect::new(x0 + i as i32 * 48, self.height - TASKBAR_H + 4, 44, 40)
     }
 
     fn damage_taskbar(&mut self) {
@@ -618,7 +762,14 @@ impl<'a> Desktop<'a> {
         {
             let mut c = Canvas::new(back, self.width as usize, self.height as usize);
             c.clip_to(dirty);
-            self.draw_background(&mut c);
+            c.blit(
+                0,
+                0,
+                self.width,
+                self.height,
+                self.wallpaper,
+                self.width as usize,
+            );
             self.draw_icons(&mut c);
             for i in 0..self.order_len {
                 let app = self.order[i];
@@ -659,47 +810,20 @@ impl<'a> Desktop<'a> {
         }
     }
 
-    fn draw_background(&self, c: &mut Canvas) {
-        let area = Rect::new(0, 0, self.width, self.height - TASKBAR_H);
-        c.vertical_gradient(area, rgb(0x1c, 0x3a, 0x7a), rgb(0x5a, 0x2a, 0x78));
-        // a soft glow and the name in the middle of the desktop
-        let (cx, cy) = (self.width / 2, (self.height - TASKBAR_H) / 2);
-        for i in 0..6 {
-            let r = 150 - i * 20;
-            c.fill_circle(
-                cx,
-                cy,
-                r,
-                mix(rgb(0x3a, 0x3a, 0x88), rgb(0x8a, 0x6a, 0xc8), i as u32 * 40),
-            );
-        }
-        let title = "EverOS";
-        let x = cx - canvas::text_width(title) * 3 / 2;
-        draw_scaled(c, x + 3, cy - 21, title, 3, rgb(0x20, 0x18, 0x48));
-        draw_scaled(c, x, cy - 24, title, 3, rgb(0xf4, 0xf0, 0xff));
-        let hint = "double-click an icon to start an app";
-        c.text_centered(
-            Rect::new(0, cy + 40, self.width, 16),
-            hint,
-            rgb(0xd0, 0xc8, 0xf0),
-        );
-    }
-
     fn draw_icons(&self, c: &mut Canvas) {
         for (i, app) in APPS.into_iter().enumerate() {
             let r = icon_rect(i);
             if !c.visible(r) {
                 continue;
             }
-            let selected = self.selected_icon == Some(i);
-            if selected {
-                c.fill(r, rgb(0x5a, 0x7a, 0xd8));
-                c.outline(r, rgb(0xa8, 0xc0, 0xff));
+            if self.selected_icon == Some(i) {
+                c.fill_round_alpha(r, 6, rgb(0xb0, 0xd0, 0xff), 90);
+                c.outline_round(r, 6, rgb(0x9c, 0xc4, 0xf4));
             }
             draw_icon(c, app, r.x + (r.w - 48) / 2, r.y + 6);
             let label = Rect::new(r.x, r.y + 58, r.w, 16);
             c.text_centered(label.offset(1, 1), app.title(), rgb(0x10, 0x10, 0x20));
-            c.text_centered(label, app.title(), rgb(0xff, 0xff, 0xff));
+            c.text_centered(label, app.title(), 0xffffff);
         }
     }
 
@@ -710,47 +834,60 @@ impl<'a> Desktop<'a> {
         }
         let r = w.rect;
         let focused = self.focused == Some(app);
-        c.darken(Rect::new(r.x + SHADOW, r.bottom(), r.w, SHADOW), 90);
-        c.darken(Rect::new(r.right(), r.y + SHADOW, SHADOW, r.h - SHADOW), 90);
+        let strength = if focused { 120 } else { 70 };
+        c.shadow(r, WINDOW_RADIUS, SPREAD, SHADOW_DROP, strength);
 
-        let (left, right, text) = if focused {
-            (theme::ACCENT, theme::ACCENT_2, rgb(0xff, 0xff, 0xff))
-        } else {
-            (
-                rgb(0x8c, 0x92, 0xa4),
-                rgb(0xa8, 0x9c, 0xb4),
-                rgb(0xe8, 0xe8, 0xf0),
-            )
-        };
-        c.fill(r, left);
-        c.horizontal_gradient(w.title_bar(), left, right);
-        c.fill_rect(r.x, r.y, r.w, 1, mix(left, 0xffffff, 100));
-        c.outline(r, theme::DARK);
-        draw_icon_small(c, app, r.x + 6, r.y + 5);
-        c.draw_text(r.x + 28, r.y + 5, app.title(), text);
+        {
+            let mut win = c.sub(Rect::new(0, 0, c.width, c.height));
+            win.clip_round(r, WINDOW_RADIUS);
+            let title_face = if focused {
+                rgb(0xee, 0xf1, 0xf8)
+            } else {
+                theme::FACE
+            };
+            win.fill(w.title_bar(), title_face);
+            self.icons.draw_small(&mut win, app, r.x + 12, r.y + 8);
+            let text = if focused {
+                theme::TEXT
+            } else {
+                theme::TEXT_DIM
+            };
+            win.draw_text(r.x + 38, r.y + 8, app.title(), text);
 
-        let close_face = if focused {
-            rgb(0xd8, 0x50, 0x58)
-        } else {
-            mix(left, right, 128)
-        };
-        for (button, label, face) in [
-            (w.minimize_button(), "_", mix(left, right, 128)),
-            (w.close_button(), "×", close_face),
-        ] {
-            c.fill(button, face);
-            c.outline(button, mix(face, 0xffffff, 90));
-            c.text_centered(button, label, 0xffffff);
+            // caption buttons: flat until the mouse is over them
+            let min = w.minimize_button();
+            if self.hover == Hover::Minimize(app) {
+                win.fill(min, mix(title_face, theme::TEXT, 25));
+            }
+            let (mx, my) = (min.x + 18, min.y + 16);
+            win.fill_rect(mx, my, 10, 1, text);
+
+            let close = w.close_button();
+            let close_glyph = if self.hover == Hover::Close(app) {
+                win.fill(close, rgb(0xc4, 0x2b, 0x1c));
+                0xffffff
+            } else {
+                text
+            };
+            let (cx, cy) = (close.x + 18, close.y + 11);
+            win.line(cx, cy, cx + 9, cy + 9, close_glyph);
+            win.line(cx + 9, cy, cx, cy + 9, close_glyph);
+
+            let client = w.client();
+            let mut sub = win.sub(client);
+            match app {
+                App::Terminal => self.terminal.draw(&mut sub, focused && self.cursor_on),
+                App::Paint => self.paint.draw(&mut sub),
+                App::Calculator => self.calc.draw(&mut sub),
+                App::Demo => demo::draw(&mut sub),
+            }
         }
-
-        let client = w.client();
-        let mut sub = c.sub(client);
-        match app {
-            App::Terminal => self.terminal.draw(&mut sub, focused && self.cursor_on),
-            App::Paint => self.paint.draw(&mut sub),
-            App::Calculator => self.calc.draw(&mut sub),
-            App::Demo => demo::draw(&mut sub),
-        }
+        let border = if focused {
+            rgb(0x8c, 0x90, 0x9c)
+        } else {
+            rgb(0xb4, 0xb4, 0xb8)
+        };
+        c.outline_round(r, WINDOW_RADIUS, border);
     }
 
     fn draw_taskbar(&self, c: &mut Canvas) {
@@ -759,103 +896,116 @@ impl<'a> Desktop<'a> {
         if !c.visible(bar) {
             return;
         }
-        c.vertical_gradient(bar, rgb(0x2c, 0x30, 0x48), rgb(0x18, 0x1a, 0x28));
-        c.fill_rect(0, top, self.width, 1, rgb(0x6a, 0x70, 0xa0));
+        // see-through, like acrylic
+        c.fill_round_alpha(bar, 0, rgb(0xf0, 0xf2, 0xf8), 220);
+        c.fill_rect(0, top, self.width, 1, rgb(0xd0, 0xd4, 0xdc));
 
-        let mut bar_canvas = c.sub(bar);
-        let c = &mut bar_canvas;
-        let start = start_button();
-        let (a, b) = if self.menu_open {
-            (mix(theme::ACCENT, 0, 60), mix(theme::ACCENT_2, 0, 60))
-        } else {
-            (mix(theme::ACCENT, 0xffffff, 40), theme::ACCENT_2)
-        };
-        c.vertical_gradient(start, a, b);
-        c.outline(start, rgb(0x9a, 0x9c, 0xff));
-        c.fill_circle(start.x + 16, start.y + 14, 7, rgb(0xff, 0xe0, 0x6e));
-        c.fill_circle(start.x + 16, start.y + 14, 3, theme::ACCENT);
-        c.draw_text(start.x + 30, start.y + 6, "Start", 0xffffff);
-
-        for (i, app) in self.open_apps().enumerate() {
-            let r = task_button(i);
-            if r.right() > self.width - 170 {
-                break;
+        for i in 0..=APPS.len() {
+            let r = self.slot_rect(i);
+            let app = if i == 0 { None } else { Some(APPS[i - 1]) };
+            let active = match app {
+                None => self.menu_open,
+                Some(a) => self.focused == Some(a) && self.windows[a.index()].visible(),
+            };
+            if active {
+                c.fill_round_alpha(r, 5, 0xffffff, 200);
+                c.outline_round(r, 5, rgb(0xe0, 0xe2, 0xe8));
+            } else if self.hover == Hover::Slot(i) {
+                c.fill_round_alpha(r, 5, 0xffffff, 140);
             }
-            let w = self.windows[app.index()];
-            let active = self.focused == Some(app) && !w.minimized;
-            let face = if active {
-                rgb(0x50, 0x5a, 0x90)
-            } else {
-                rgb(0x34, 0x38, 0x54)
-            };
-            c.fill(r, face);
-            c.outline(
-                r,
-                if active {
-                    rgb(0x9a, 0xa4, 0xe8)
-                } else {
-                    rgb(0x50, 0x56, 0x78)
-                },
-            );
-            draw_icon_small(c, app, r.x + 6, r.y + 5);
-            let color = if w.minimized {
-                rgb(0xa0, 0xa4, 0xc0)
-            } else {
-                0xffffff
-            };
-            c.draw_text(r.x + 28, r.y + 6, app.title(), color);
+            match app {
+                None => draw_start_logo(c, r.x + 10, r.y + 8),
+                Some(a) => {
+                    self.icons.draw_medium(c, a, r.x + 10, r.y + 7);
+                    let w = self.windows[a.index()];
+                    if w.open {
+                        // a pill under open apps, longer for the active one
+                        let (len, color) = if active {
+                            (16, theme::ACCENT)
+                        } else {
+                            (6, rgb(0x8a, 0x8a, 0x92))
+                        };
+                        let pill = Rect::new(r.x + (r.w - len) / 2, r.bottom() - 4, len, 3);
+                        c.fill_round(pill, 1, color);
+                    }
+                }
+            }
         }
 
         // keyboard layout and clock
-        let clock = Rect::new(self.width - 84, 4, 80, 28);
-        c.text_centered(clock, self.clock.as_str(), 0xffffff);
-        let layout = Rect::new(self.width - 124, 7, 32, 22);
-        c.fill(layout, rgb(0x40, 0x46, 0x6a));
-        c.outline(layout, rgb(0x70, 0x78, 0xb0));
-        c.text_centered(layout, self.layout.name(), 0xffffff);
+        let clock = Rect::new(self.width - 84, top + 4, 76, 40);
+        c.text_centered(clock, self.clock.as_str(), theme::TEXT);
+        let layout = Rect::new(self.width - 124, top + 12, 34, 24);
+        c.text_centered(layout, self.layout.name(), theme::TEXT);
     }
 
     fn draw_menu(&self, c: &mut Canvas) {
-        let menu = self.menu_rect();
-        let r = Rect::new(menu.x, menu.y, menu.w, menu.h - SHADOW);
-        c.darken(Rect::new(r.right(), r.y + SHADOW, SHADOW, r.h), 90);
-        c.fill(r, theme::FACE);
-        c.outline(r, theme::DARK);
-        let banner = Rect::new(r.x + 1, r.y + 1, r.w - 2, MENU_BANNER);
-        c.horizontal_gradient(banner, theme::ACCENT, theme::ACCENT_2);
-        c.draw_text(banner.x + 10, banner.y + 6, "EverOS", 0xffffff);
-        for (i, item) in MENU.into_iter().enumerate() {
-            let ir = self.menu_item_rect(i);
-            let hover = self.menu_hover == Some(i);
-            if hover {
-                c.fill(ir, theme::ACCENT);
+        let p = self.menu_panel();
+        c.shadow(p, WINDOW_RADIUS, SPREAD, SHADOW_DROP, 110);
+        {
+            let mut m = c.sub(Rect::new(0, 0, c.width, c.height));
+            m.clip_round(p, WINDOW_RADIUS);
+            m.fill_round_alpha(p, 0, rgb(0xf6, 0xf7, 0xfb), 250);
+            // "Pinned" in bold, by drawing it twice
+            m.draw_text(p.x + 36, p.y + 26, "Pinned", theme::TEXT);
+            m.draw_text(p.x + 37, p.y + 26, "Pinned", theme::TEXT);
+
+            for (i, item) in MENU.into_iter().enumerate() {
+                let r = self.menu_item_rect(i);
+                let hover = self.hover == Hover::Menu(i);
+                match item {
+                    MenuItem::Open(app) => {
+                        if hover {
+                            m.fill_round_alpha(r, 6, 0xffffff, 230);
+                            m.outline_round(r, 6, theme::STROKE);
+                        }
+                        draw_icon(&mut m, app, r.x + 20, r.y + 10);
+                        let label = Rect::new(r.x, r.y + 64, r.w, 16);
+                        m.text_centered(label, app.title(), theme::TEXT);
+                    }
+                    MenuItem::Restart | MenuItem::ShutDown => {}
+                }
             }
-            let color = if hover { 0xffffff } else { theme::TEXT };
-            let label = match item {
-                MenuItem::Open(app) => {
-                    draw_icon_small(c, app, ir.x + 6, ir.y + 7);
-                    app.title()
+
+            let footer = Rect::new(p.x, p.bottom() - MENU_FOOTER, p.w, MENU_FOOTER);
+            m.fill(footer, rgb(0xec, 0xee, 0xf4));
+            m.fill_rect(p.x, footer.y, p.w, 1, theme::STROKE);
+            let avatar = Rect::new(p.x + 28, footer.y + 16, 32, 32);
+            m.fill_round(avatar, 16, theme::ACCENT);
+            m.text_centered(avatar, "E", 0xffffff);
+            m.draw_text(p.x + 72, footer.y + 24, "EverOS", theme::TEXT);
+
+            for (i, item) in MENU.into_iter().enumerate() {
+                let r = self.menu_item_rect(i);
+                let label = match item {
+                    MenuItem::Restart => "Restart",
+                    MenuItem::ShutDown => "Shut down",
+                    MenuItem::Open(_) => continue,
+                };
+                if self.hover == Hover::Menu(i) {
+                    m.fill_round(r, 5, 0xffffff);
+                    m.outline_round(r, 5, theme::STROKE);
                 }
-                MenuItem::Restart => {
-                    c.fill_circle(ir.x + 14, ir.y + 15, 7, rgb(0x40, 0xa0, 0x60));
-                    c.fill_circle(
-                        ir.x + 14,
-                        ir.y + 15,
-                        4,
-                        if hover { theme::ACCENT } else { theme::FACE },
-                    );
-                    "Restart"
+                // a power symbol: a ring with a gap and a bar
+                let (cx, cy) = (r.x + 18, r.y + 18);
+                let ring = Rect::new(cx - 7, cy - 7, 14, 14);
+                m.outline_round(ring, 7, theme::TEXT);
+                m.outline_round(ring.inset(1), 6, theme::TEXT);
+                if let MenuItem::ShutDown = item {
+                    let bg = if self.hover == Hover::Menu(i) {
+                        0xffffff
+                    } else {
+                        rgb(0xec, 0xee, 0xf4)
+                    };
+                    m.fill_rect(cx - 3, cy - 8, 6, 6, bg);
+                    m.fill_rect(cx - 1, cy - 9, 2, 8, theme::TEXT);
+                } else {
+                    m.fill_round(Rect::new(cx + 3, cy - 9, 5, 5), 2, theme::TEXT);
                 }
-                MenuItem::ShutDown => {
-                    c.fill_circle(ir.x + 14, ir.y + 15, 7, rgb(0xd0, 0x40, 0x40));
-                    c.fill_rect(ir.x + 13, ir.y + 9, 3, 7, 0xffffff);
-                    "Shut down"
-                }
-            };
-            c.draw_text(ir.x + 30, ir.y + 7, label, color);
+                m.draw_text(r.x + 32, r.y + 10, label, theme::TEXT);
+            }
         }
-        let sep = self.menu_item_rect(4).y - 6;
-        c.fill_rect(r.x + 8, sep, r.w - 16, 1, theme::SHADOW);
+        c.outline_round(p, WINDOW_RADIUS, rgb(0xc8, 0xca, 0xd2));
     }
 }
 
@@ -863,15 +1013,6 @@ impl<'a> Desktop<'a> {
 
 fn icon_rect(i: usize) -> Rect {
     Rect::new(16, 16 + i as i32 * 92, 88, 80)
-}
-
-/// In taskbar coordinates.
-fn start_button() -> Rect {
-    Rect::new(4, 4, 84, 28)
-}
-
-fn task_button(i: usize) -> Rect {
-    Rect::new(96 + i as i32 * 144, 4, 140, 28)
 }
 
 // ---- pictures ---------------------------------------------------------------
@@ -907,112 +1048,116 @@ fn draw_pointer(c: &mut Canvas, x: i32, y: i32) {
     c.sprite(x, y, &POINTER, &[(b'X', 0x000000), (b'.', 0xffffff)]);
 }
 
-/// A 48x48 desktop icon.
+/// Deep blue with a soft flower of light in the middle.
+fn draw_wallpaper(c: &mut Canvas) {
+    let (w, h) = (c.width, c.height);
+    c.vertical_gradient(
+        Rect::new(0, 0, w, h),
+        rgb(0x0a, 0x2c, 0x74),
+        rgb(0x1c, 0x5c, 0xc0),
+    );
+    let (cx, cy) = (w / 2, (h - TASKBAR_H) / 2 + 20);
+    // unit vectors for eight directions, times 100
+    const DIRS: [(i32, i32); 8] = [
+        (100, 0),
+        (71, 71),
+        (0, 100),
+        (-71, 71),
+        (-100, 0),
+        (-71, -71),
+        (0, -100),
+        (71, -71),
+    ];
+    let petal = h / 5;
+    for (i, (dx, dy)) in DIRS.into_iter().enumerate() {
+        let (px, py) = (cx + dx * petal * 3 / 400, cy + dy * petal * 3 / 400);
+        let color = if i % 2 == 0 {
+            rgb(0x6a, 0xb4, 0xff)
+        } else {
+            rgb(0x9a, 0xcc, 0xff)
+        };
+        let r = Rect::new(px - petal, py - petal, 2 * petal, 2 * petal);
+        c.fill_round_alpha(r, petal, color, 46);
+    }
+    for (radius, alpha) in [(petal * 3 / 4, 50), (petal / 2, 70), (petal / 4, 90)] {
+        let r = Rect::new(cx - radius, cy - radius, 2 * radius, 2 * radius);
+        c.fill_round_alpha(r, radius, rgb(0xe4, 0xf2, 0xff), alpha);
+    }
+}
+
+/// The start button: four rounded squares.
+fn draw_start_logo(c: &mut Canvas, x: i32, y: i32) {
+    for (i, color) in [
+        rgb(0x2a, 0x9c, 0xf4),
+        rgb(0x18, 0x84, 0xe8),
+        rgb(0x10, 0x74, 0xd8),
+        rgb(0x0a, 0x60, 0xc4),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (col, row) = ((i % 2) as i32, (i / 2) as i32);
+        c.fill_round(Rect::new(x + col * 12, y + row * 12, 11, 11), 2, color);
+    }
+}
+
+/// A 48x48 app icon.
 fn draw_icon(c: &mut Canvas, app: App, x: i32, y: i32) {
+    let tile = Rect::new(x + 2, y + 2, 44, 44);
     match app {
         App::Terminal => {
-            c.fill_rect(x + 2, y + 4, 44, 38, rgb(0x20, 0x22, 0x2c));
-            c.fill_rect(x + 2, y + 4, 44, 8, rgb(0x90, 0x98, 0xb0));
-            c.outline(Rect::new(x + 2, y + 4, 44, 38), rgb(0xd0, 0xd4, 0xe0));
-            c.draw_text(x + 8, y + 18, ">_", rgb(0x7c, 0xe0, 0x8c));
+            c.fill_round(tile, 8, rgb(0x2b, 0x2d, 0x36));
+            {
+                let mut s = c.sub(Rect::new(0, 0, c.width, c.height));
+                s.clip_round(tile, 8);
+                s.fill_rect(tile.x, tile.y, tile.w, 10, rgb(0x4a, 0x4e, 0x5c));
+            }
+            c.outline_round(tile, 8, rgb(0x16, 0x18, 0x1e));
+            c.draw_text(x + 10, y + 20, ">_", rgb(0xe8, 0xe8, 0xf0));
         }
         App::Paint => {
-            c.fill_rect(x + 4, y + 4, 40, 40, 0xffffff);
-            c.outline(Rect::new(x + 4, y + 4, 40, 40), rgb(0x60, 0x60, 0x70));
-            c.fill_circle(x + 16, y + 16, 6, rgb(0xed, 0x1c, 0x24));
-            c.fill_circle(x + 30, y + 18, 6, rgb(0x22, 0xb1, 0x4c));
-            c.fill_circle(x + 22, y + 30, 6, rgb(0x00, 0xa2, 0xe8));
-            for i in 0..4 {
+            c.fill_round(tile, 8, rgb(0xfa, 0xfa, 0xfc));
+            c.outline_round(tile, 8, rgb(0xb8, 0xbc, 0xc8));
+            c.fill_round(Rect::new(x + 9, y + 9, 13, 13), 6, rgb(0xe8, 0x3c, 0x3c));
+            c.fill_round(Rect::new(x + 24, y + 10, 13, 13), 6, rgb(0x2c, 0xb8, 0x5c));
+            c.fill_round(Rect::new(x + 14, y + 23, 13, 13), 6, rgb(0x1c, 0x8c, 0xf0));
+            for i in 0..3 {
                 c.line(
-                    x + 26 + i,
-                    y + 44,
-                    x + 44 + i,
-                    y + 26,
-                    rgb(0xa0, 0x60, 0x20),
+                    x + 28 + i,
+                    y + 42,
+                    x + 41 + i,
+                    y + 29,
+                    rgb(0xa8, 0x6a, 0x2c),
                 );
             }
-            c.fill_rect(x + 40, y + 24, 6, 5, rgb(0xc0, 0xc0, 0xc8));
+            c.fill_round(Rect::new(x + 38, y + 25, 6, 6), 2, rgb(0x40, 0x40, 0x48));
         }
         App::Calculator => {
-            c.fill_rect(x + 8, y + 2, 32, 44, rgb(0x50, 0x56, 0x6a));
-            c.outline(Rect::new(x + 8, y + 2, 32, 44), rgb(0xd0, 0xd4, 0xe0));
-            c.fill_rect(x + 12, y + 6, 24, 9, rgb(0xc8, 0xe8, 0xc0));
+            c.fill_round(tile, 8, rgb(0x3a, 0x3e, 0x4c));
+            c.outline_round(tile, 8, rgb(0x20, 0x22, 0x2c));
+            c.fill_round(Rect::new(x + 9, y + 8, 30, 9), 2, rgb(0xd8, 0xe4, 0xf4));
             for row in 0..3 {
                 for col in 0..3 {
                     let color = if (row, col) == (2, 2) {
-                        rgb(0xff, 0x9a, 0x40)
+                        rgb(0x3a, 0x9c, 0xff)
                     } else {
                         rgb(0xe8, 0xe8, 0xf0)
                     };
-                    c.fill_rect(x + 12 + col * 9, y + 19 + row * 9, 6, 6, color);
+                    let r = Rect::new(x + 9 + col * 11, y + 20 + row * 8, 8, 6);
+                    c.fill_round(r, 2, color);
                 }
             }
         }
         App::Demo => {
-            c.vertical_gradient(
-                Rect::new(x + 4, y + 4, 40, 40),
-                rgb(0x10, 0x18, 0x40),
-                rgb(0x50, 0x10, 0x40),
-            );
-            c.fill_circle(x + 24, y + 24, 9, rgb(0xff, 0xc0, 0x40));
-            c.fill_circle(x + 13, y + 14, 4, rgb(0x60, 0xc0, 0xff));
-            c.fill_circle(x + 36, y + 34, 3, rgb(0xff, 0x70, 0x70));
-            c.outline(Rect::new(x + 4, y + 4, 40, 40), rgb(0xd0, 0xd4, 0xe0));
-        }
-    }
-}
-
-/// A 16x16 icon for title bars, the taskbar and the menu.
-fn draw_icon_small(c: &mut Canvas, app: App, x: i32, y: i32) {
-    match app {
-        App::Terminal => {
-            c.fill_rect(x, y + 1, 16, 14, rgb(0x20, 0x22, 0x2c));
-            c.outline(Rect::new(x, y + 1, 16, 14), rgb(0xc0, 0xc4, 0xd0));
-            c.line(x + 3, y + 5, x + 6, y + 8, rgb(0x7c, 0xe0, 0x8c));
-            c.line(x + 6, y + 8, x + 3, y + 11, rgb(0x7c, 0xe0, 0x8c));
-            c.fill_rect(x + 8, y + 11, 5, 1, rgb(0x7c, 0xe0, 0x8c));
-        }
-        App::Paint => {
-            c.fill_rect(x, y, 16, 16, 0xffffff);
-            c.outline(Rect::new(x, y, 16, 16), rgb(0x60, 0x60, 0x70));
-            c.fill_circle(x + 5, y + 5, 2, rgb(0xed, 0x1c, 0x24));
-            c.fill_circle(x + 11, y + 6, 2, rgb(0x22, 0xb1, 0x4c));
-            c.fill_circle(x + 7, y + 11, 2, rgb(0x00, 0xa2, 0xe8));
-        }
-        App::Calculator => {
-            c.fill_rect(x + 2, y, 12, 16, rgb(0x50, 0x56, 0x6a));
-            c.fill_rect(x + 4, y + 2, 8, 3, rgb(0xc8, 0xe8, 0xc0));
-            for row in 0..3 {
-                for col in 0..3 {
-                    c.fill_rect(x + 4 + col * 3, y + 7 + row * 3, 2, 2, 0xffffff);
-                }
+            {
+                let mut s = c.sub(Rect::new(0, 0, c.width, c.height));
+                s.clip_round(tile, 8);
+                s.vertical_gradient(tile, rgb(0x16, 0x20, 0x5c), rgb(0x6a, 0x1c, 0x5c));
             }
-        }
-        App::Demo => {
-            c.fill_rect(x, y, 16, 16, rgb(0x30, 0x14, 0x40));
-            c.fill_circle(x + 8, y + 8, 4, rgb(0xff, 0xc0, 0x40));
-            c.pixel(x + 3, y + 3, 0xffffff);
-            c.pixel(x + 12, y + 12, 0xffffff);
-        }
-    }
-}
-
-/// Text at `scale` times the font size.
-fn draw_scaled(c: &mut Canvas, x: i32, y: i32, text: &str, scale: i32, color: Color) {
-    for (i, ch) in text.chars().enumerate() {
-        let cx = x + i as i32 * font::WIDTH as i32 * scale;
-        for (row, bits) in font::glyph(ch).iter().enumerate() {
-            for col in 0..font::WIDTH as i32 {
-                if bits & (0x80 >> col) != 0 {
-                    c.fill_rect(
-                        cx + col * scale,
-                        y + row as i32 * scale,
-                        scale,
-                        scale,
-                        color,
-                    );
-                }
-            }
+            c.fill_round(Rect::new(x + 15, y + 15, 18, 18), 9, rgb(0xff, 0xc0, 0x40));
+            c.fill_round(Rect::new(x + 9, y + 10, 8, 8), 4, rgb(0x60, 0xc0, 0xff));
+            c.fill_round(Rect::new(x + 33, y + 31, 6, 6), 3, rgb(0xff, 0x70, 0x70));
+            c.outline_round(tile, 8, rgb(0x10, 0x10, 0x30));
         }
     }
 }
