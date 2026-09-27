@@ -23,17 +23,26 @@ const TIMEOUT: u32 = 5_000_000;
 #[derive(Debug)]
 pub struct IoError;
 
+#[derive(Clone)]
 pub struct Ata {
     base: u16,
     control: u16,
     slave: bool,
     sectors: u64,
+    /// The name the drive reports, like "QEMU HARDDISK".
+    model: [u8; 40],
 }
 
 impl Ata {
     /// Find the first ATA hard disk on the two IDE channels. CD drives
     /// (ATAPI) are skipped.
     pub fn find() -> Option<Ata> {
+        Self::all().into_iter().next()
+    }
+
+    /// Every ATA hard disk, the first one first.
+    pub fn all() -> alloc::vec::Vec<Ata> {
+        let mut out = alloc::vec::Vec::new();
         for (base, control) in [(0x1f0, 0x3f6), (0x170, 0x376)] {
             for slave in [false, true] {
                 let mut disk = Ata {
@@ -41,17 +50,29 @@ impl Ata {
                     control,
                     slave,
                     sectors: 0,
+                    model: [b' '; 40],
                 };
                 if disk.identify() {
-                    return Some(disk);
+                    out.push(disk);
                 }
             }
         }
-        None
+        out
     }
 
     pub fn sectors(&self) -> u64 {
         self.sectors
+    }
+
+    pub fn model(&self) -> &str {
+        core::str::from_utf8(&self.model)
+            .unwrap_or("")
+            .trim_matches([' ', '\0'])
+    }
+
+    /// Whether two handles are the same drive.
+    pub fn same(&self, other: &Ata) -> bool {
+        self.base == other.base && self.slave == other.slave
     }
 
     fn status(&self) -> u8 {
@@ -136,6 +157,11 @@ impl Ata {
             let mut id = [0u16; 256];
             for w in id.iter_mut() {
                 *w = inw(self.base);
+            }
+            // two characters per word, the first in the high byte
+            for (i, w) in id[27..47].iter().enumerate() {
+                self.model[2 * i] = (w >> 8) as u8;
+                self.model[2 * i + 1] = *w as u8;
             }
             let lba28 = id[60] as u64 | (id[61] as u64) << 16;
             // only LBA28 commands are used, so stay below 128 GiB

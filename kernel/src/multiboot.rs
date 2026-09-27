@@ -3,17 +3,55 @@
 use crate::framebuffer::{ColorField, Framebuffer};
 
 const TAG_END: u32 = 0;
+const TAG_CMDLINE: u32 = 1;
 const TAG_BOOTLOADER_NAME: u32 = 2;
+const TAG_MODULE: u32 = 3;
 const TAG_BASIC_MEMINFO: u32 = 4;
 const TAG_FRAMEBUFFER: u32 = 8;
 
 const FRAMEBUFFER_TYPE_RGB: u8 = 1;
+const MAX_MODULES: usize = 4;
+
+/// A file GRUB loaded into memory next to the kernel (`module2` in
+/// grub.cfg). The installer gets the files it copies to the disk this way.
+#[derive(Clone, Copy)]
+pub struct Module {
+    pub name: &'static str,
+    pub data: &'static [u8],
+}
 
 pub struct BootInfo {
     pub framebuffer: Option<Framebuffer>,
     pub bootloader: &'static str,
     /// Memory above 1 MiB, in KiB, as reported by the BIOS.
     pub upper_memory_kib: u32,
+    /// What grub.cfg put after the kernel's path: "setup" on the
+    /// installation disc.
+    pub cmdline: &'static str,
+    modules: [Option<Module>; MAX_MODULES],
+}
+
+impl BootInfo {
+    /// Whether EverOS was started from the installation disc.
+    pub fn setup(&self) -> bool {
+        self.cmdline.split(' ').any(|w| w == "setup")
+    }
+
+    /// The module GRUB loaded under this name.
+    pub fn module(&self, name: &str) -> Option<&'static [u8]> {
+        self.modules
+            .iter()
+            .flatten()
+            .find(|m| m.name == name)
+            .map(|m| m.data)
+    }
+}
+
+/// A zero-terminated string inside a tag.
+unsafe fn c_str(addr: usize, max: usize) -> &'static str {
+    let bytes = core::slice::from_raw_parts(addr as *const u8, max);
+    let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    core::str::from_utf8(&bytes[..len]).unwrap_or("")
 }
 
 unsafe fn read<T: Copy>(addr: usize) -> T {
@@ -27,7 +65,10 @@ pub unsafe fn parse(info: usize) -> BootInfo {
         framebuffer: None,
         bootloader: "unknown",
         upper_memory_kib: 0,
+        cmdline: "",
+        modules: [None; MAX_MODULES],
     };
+    let mut modules = 0;
     let total_size = read::<u32>(info) as usize;
     let mut tag = info + 8;
     while tag + 8 <= info + total_size {
@@ -35,10 +76,18 @@ pub unsafe fn parse(info: usize) -> BootInfo {
         let size = read::<u32>(tag + 4) as usize;
         match kind {
             TAG_END => break,
-            TAG_BOOTLOADER_NAME => {
-                let bytes = core::slice::from_raw_parts((tag + 8) as *const u8, size - 8);
-                let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                boot.bootloader = core::str::from_utf8(&bytes[..len]).unwrap_or("unknown");
+            TAG_BOOTLOADER_NAME => boot.bootloader = c_str(tag + 8, size - 8),
+            TAG_CMDLINE => boot.cmdline = c_str(tag + 8, size - 8),
+            TAG_MODULE if modules < MAX_MODULES && size > 16 => {
+                let start = read::<u32>(tag + 8) as usize;
+                let end = read::<u32>(tag + 12) as usize;
+                if end > start {
+                    boot.modules[modules] = Some(Module {
+                        name: c_str(tag + 16, size - 16),
+                        data: core::slice::from_raw_parts(start as *const u8, end - start),
+                    });
+                    modules += 1;
+                }
             }
             TAG_BASIC_MEMINFO => boot.upper_memory_kib = read::<u32>(tag + 12),
             TAG_FRAMEBUFFER if read::<u8>(tag + 29) == FRAMEBUFFER_TYPE_RGB => {

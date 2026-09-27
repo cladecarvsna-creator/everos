@@ -5,9 +5,12 @@
 # the terminal window ran them.
 # A small web server on the host checks the network card, TCP/IP and
 # HTTP: the guest reaches the host at 10.0.2.2 through QEMU's user network.
-# A blank disk image checks the disk driver and FAT32: EverOS formats it,
-# the shell writes a file, and after starting QEMU again the file is
-# still there.
+# The disc starts the installer. First "Try EverOS" runs it from the
+# disc: a blank disk image checks the disk driver and FAT32 (EverOS
+# formats it, the shell writes a file, and after starting QEMU again the
+# file is still there). Then the installer puts EverOS on a second blank
+# disk, and QEMU starts from that disk alone and signs in to the account
+# the installer made.
 # Exits 0 if everything works, 1 otherwise.
 set -u
 
@@ -26,10 +29,15 @@ echo '<html><head><title>EverOS test page</title></head><body><h1>It works</h1><
 python3 -m http.server 8123 --bind 127.0.0.1 --directory "$dir/www" > /dev/null 2>&1 &
 web=$!
 
-# start QEMU with the disk; the serial log starts empty
+# start QEMU with the disk and the disc, or from the disk alone when $1
+# is "disk"; the serial log starts empty
 boot() {
     rm -f "$log" "$monitor"
-    timeout 90 qemu-system-x86_64 -cdrom "$iso" -boot d -m 512M -display none \
+    local media=(-cdrom "$iso" -boot d)
+    if [ "${1:-}" = disk ]; then
+        media=(-boot c)
+    fi
+    timeout 90 qemu-system-x86_64 "${media[@]}" -m 512M -display none \
         -serial "file:$log" -monitor "unix:$monitor,server,nowait" -no-reboot \
         -drive "file=$disk,format=raw,if=ide,index=0,media=disk" \
         -nic user,model=e1000 2> /dev/null &
@@ -79,6 +87,27 @@ sign_in() {
     echo "signed in as root"
 }
 
+# the installer's first page, then "Try EverOS without installing"
+try_everos() {
+    wait_for "setup: page language" || fail "the installer did not start"
+    type_keys ret
+    wait_for "setup: page start" || fail "the installer's start page did not show"
+    type_keys tab ret
+    wait_for "setup: trying EverOS" || fail "Try EverOS did not start EverOS"
+}
+
+quit_qemu() {
+    python3 - "$monitor" << 'PY'
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+s.sendall(b"quit\n")
+PY
+    wait "$qemu" 2> /dev/null
+}
+
+try_everos
+echo "the installer starts, Try EverOS works"
 wait_for "fs: formatted a blank disk as FAT32" || fail "the blank disk was not formatted"
 echo "disk formatted"
 sign_in
@@ -119,13 +148,7 @@ wait_for "desktop: opened Notepad" || fail "the shell could not open Notepad"
 echo "file written, apps open from the shell"
 
 # start again from the same disk: the file must still be there
-python3 - "$monitor" << 'PY'
-import socket, sys
-s = socket.socket(socket.AF_UNIX)
-s.connect(sys.argv[1])
-s.sendall(b"quit\n")
-PY
-wait "$qemu" 2> /dev/null
+quit_qemu
 if command -v mtype > /dev/null; then
     mtype -i "$disk@@1M" ::/Users/root/saved.txt | grep -q "saved-ok" \
         || fail "mtools could not read the file EverOS wrote"
@@ -140,6 +163,7 @@ fi
 
 boot
 wait_for "fs: mounted FAT32 disk" || fail "the disk was not mounted again"
+try_everos
 sign_in
 wait_for "desktop: opened Terminal" || fail "the desktop did not start again"
 type_keys c a t spc s a v e d dot t x t ret
@@ -164,4 +188,43 @@ wait_for "desktops: switched to Desktop 1" || fail "Win+Ctrl+Left did not switch
 type_keys meta_l-tab
 wait_for "desktops: task view" || fail "Win+Tab did not open Task View"
 echo "virtual desktops and Task View work"
+quit_qemu
+
+# install EverOS on a new blank disk with the installer
+disk="$dir/install.img"
+truncate -s 128M "$disk"
+boot
+wait_for "setup: page language" || fail "the installer did not start"
+# language, Install, accept the license, the disk
+type_keys ret
+wait_for "setup: page start" || fail "the installer's start page did not show"
+type_keys ret
+wait_for "setup: page license" || fail "the license page did not show"
+type_keys spc ret
+wait_for "setup: page disk" || fail "the disk page did not show"
+type_keys ret
+wait_for "setup: page account" || fail "the account page did not show"
+# the account: name, password twice
+type_keys t e s t e r tab p w tab p w ret
+wait_for "setup: page ready" || fail "the account was not accepted"
+type_keys ret
+wait_for "setup: done" || fail "the installation did not finish"
+echo "the installer put EverOS on a blank disk"
+quit_qemu
+if command -v fsck.fat > /dev/null; then
+    part="$dir/part.img"
+    dd if="$disk" of="$part" bs=512 skip=2048 status=none
+    fsck.fat -n "$part" > "$dir/fsck.log" 2>&1 || { cat "$dir/fsck.log"; fail "fsck.fat found errors on the installed disk"; }
+fi
+
+# start from the installed disk alone, without the disc
+boot disk
+wait_for "EverOS: kernel started" || fail "EverOS did not start from the installed disk"
+wait_for "users: loaded 1 from disk" || fail "the installed accounts were not loaded"
+wait_for "login: lock screen" || fail "the lock screen did not show on the installed system"
+type_keys ret
+wait_for "login: password prompt" || fail "the sign-in panel did not open"
+type_keys p w ret
+wait_for "login: signed in as tester" || fail "could not sign in to the installed account"
+echo "EverOS starts from the installed disk and signs in to the new account"
 echo "boot test passed"

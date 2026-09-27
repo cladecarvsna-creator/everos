@@ -2,9 +2,12 @@
 //! login screen checks. At boot there is one user, `root`, with an empty
 //! password; the shell's `useradd` and `passwd` add users and passwords.
 //!
+//! Once EverOS is installed, the table is kept on the disk in
+//! `/EverOS/users.cfg`, so accounts survive a restart.
+//!
 //! Passwords are kept only as salted hashes, never as text. The hash is
-//! FNV-1a stretched over many rounds: fine for a hobby OS whose table
-//! lives in memory, not a real password hash like Argon2.
+//! FNV-1a stretched over many rounds: fine for a hobby OS, not a real
+//! password hash like Argon2.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -31,6 +34,7 @@ pub enum Error {
     Exists,
     Full,
     NoSuchUser,
+    Disk,
 }
 
 impl Error {
@@ -40,6 +44,7 @@ impl Error {
             Error::Exists => "that user already exists",
             Error::Full => "the user table is full",
             Error::NoSuchUser => "no such user",
+            Error::Disk => "the accounts could not be saved on the disk",
         }
     }
 }
@@ -85,6 +90,102 @@ pub fn init() {
     }
 }
 
+/// Where the table is kept on the disk.
+const FILE: &str = "/EverOS/users.cfg";
+
+/// Read the table from the disk, if it is there. Each line is
+/// `name salt hash`, the numbers in hex.
+pub fn load() {
+    let Ok(data) = crate::fs::read(FILE) else {
+        return;
+    };
+    let text = core::str::from_utf8(&data).unwrap_or("");
+    let mut table = Vec::new();
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(name), Some(salt), Some(hash)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let (Ok(salt), Ok(hash)) = (u64::from_str_radix(salt, 16), u64::from_str_radix(hash, 16))
+        else {
+            continue;
+        };
+        if valid_name(name) && table.len() < MAX_USERS {
+            table.push(User {
+                name: String::from(name),
+                salt,
+                hash,
+            });
+        }
+    }
+    if !table.is_empty() {
+        let n = table.len();
+        *USERS.lock() = table;
+        *CURRENT.lock() = None;
+        let mut msg = StackString::<48>::new();
+        let _ =
+            core::fmt::Write::write_fmt(&mut msg, format_args!("users: loaded {} from disk\n", n));
+        crate::serial::write_str(msg.as_str());
+    }
+}
+
+/// Keep the table on the disk, if EverOS is installed on it.
+fn save() {
+    if !crate::fs::exists(crate::fs::INSTALLED) {
+        return;
+    }
+    let _ = write_file();
+}
+
+fn write_file() -> Result<(), crate::fs::Error> {
+    use core::fmt::Write;
+    let mut text = String::new();
+    for u in USERS.lock().iter() {
+        let _ = write!(text, "{} {:016x} {:016x}\r\n", u.name, u.salt, u.hash);
+    }
+    let _ = crate::fs::create_dir("/EverOS");
+    crate::fs::write(FILE, text.as_bytes())
+}
+
+/// The installer's account: `name` with `password`, alone in the table
+/// unless `keep` asks to keep the accounts already there. The table is
+/// written to the disk.
+pub fn install_account(name: &str, password: &str, keep: bool) -> Result<(), Error> {
+    if !valid_name(name) {
+        return Err(Error::BadName);
+    }
+    {
+        let mut users = USERS.lock();
+        if !keep {
+            users.clear();
+        }
+        let salt = new_salt();
+        let user = User {
+            name: String::from(name),
+            salt,
+            hash: hash(salt, password),
+        };
+        match users.iter().position(|u| u.name == name) {
+            Some(i) => users[i] = user,
+            None if users.len() < MAX_USERS => users.push(user),
+            None => return Err(Error::Full),
+        }
+    }
+    *CURRENT.lock() = None;
+    write_file().map_err(|_| Error::Disk)
+}
+
+/// Whether the accounts are kept on the disk.
+pub fn saved() -> bool {
+    crate::fs::exists(FILE)
+}
+
+/// Whether a name can be an account's name.
+pub fn name_ok(name: &str) -> bool {
+    valid_name(name)
+}
+
 pub fn add(name: &str, password: &str) -> Result<(), Error> {
     if !valid_name(name) {
         return Err(Error::BadName);
@@ -102,6 +203,8 @@ pub fn add(name: &str, password: &str) -> Result<(), Error> {
         salt,
         hash: hash(salt, password),
     });
+    drop(users);
+    save();
     Ok(())
 }
 
@@ -113,6 +216,8 @@ pub fn set_password(name: &str, password: &str) -> Result<(), Error> {
         .ok_or(Error::NoSuchUser)?;
     user.salt = new_salt();
     user.hash = hash(user.salt, password);
+    drop(users);
+    save();
     Ok(())
 }
 

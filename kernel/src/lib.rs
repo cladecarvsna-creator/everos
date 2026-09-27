@@ -22,6 +22,7 @@ mod port;
 mod ps2;
 mod rtc;
 mod serial;
+mod setup;
 mod shell;
 mod sync;
 mod tg;
@@ -54,7 +55,10 @@ pub extern "C" fn kernel_main(multiboot_info: usize) -> ! {
     interrupts::init();
     let mouse = ps2::init();
     interrupts::enable();
-    fs::init();
+    // the installation disc leaves a blank disk alone until the user
+    // says what to do with it
+    fs::init(!boot.setup());
+    users::load();
 
     match &boot.framebuffer {
         Some(fb) => println!("Graphics:  {}x{} framebuffer", fb.width, fb.height),
