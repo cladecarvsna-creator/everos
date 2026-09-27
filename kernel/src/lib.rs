@@ -24,6 +24,7 @@ mod rtc;
 mod serial;
 mod shell;
 mod sync;
+mod tg;
 mod users;
 mod vga;
 mod vmmouse;

@@ -39,6 +39,7 @@ mod search;
 mod settings;
 mod start;
 mod taskbar;
+mod telegram;
 mod terminal;
 mod text;
 mod theme;
@@ -80,7 +81,7 @@ static BACK_BUFFER: StaticBuffer<{ MAX_W * MAX_H }> = StaticBuffer::new();
 static WALLPAPER: StaticBuffer<{ MAX_W * MAX_H }> = StaticBuffer::new();
 /// Window contents. Each app draws into its own part only when its content
 /// changes, so moving a window just copies pixels.
-static SURFACES: StaticBuffer<{ 6 * 1024 * 1024 }> = StaticBuffer::new();
+static SURFACES: StaticBuffer<{ 7 * 1024 * 1024 }> = StaticBuffer::new();
 /// The blurred wallpaper behind the sign-in panel.
 static BACKDROP: StaticBuffer<{ MAX_W * MAX_H }> = StaticBuffer::new();
 /// The screen being faded away when signing in or locking.
@@ -119,9 +120,10 @@ pub enum App {
     Browser,
     Settings,
     About,
+    Telegram,
 }
 
-const APPS: [App; 9] = [
+const APPS: [App; 10] = [
     App::Terminal,
     App::Explorer,
     App::Notepad,
@@ -131,6 +133,7 @@ const APPS: [App; 9] = [
     App::Browser,
     App::Settings,
     App::About,
+    App::Telegram,
 ];
 
 impl App {
@@ -149,6 +152,7 @@ impl App {
             App::Browser => "Browser",
             App::Settings => "Settings",
             App::About => "About EverOS",
+            App::Telegram => "Telegram",
         }
     }
 
@@ -163,6 +167,7 @@ impl App {
             App::Browser => (browser::CLIENT_W, browser::CLIENT_H),
             App::Settings => (settings::CLIENT_W, settings::CLIENT_H),
             App::About => (about::CLIENT_W, about::CLIENT_H),
+            App::Telegram => (telegram::CLIENT_W, telegram::CLIENT_H),
         }
     }
 
@@ -178,6 +183,7 @@ impl App {
             App::Browser => "browser",
             App::Settings => "settings",
             App::About => "about",
+            App::Telegram => "telegram",
         }
     }
 
@@ -197,6 +203,7 @@ impl App {
             App::Browser => "web internet browser браузер интернет",
             App::Settings => "control panel options параметры настройки",
             App::About => "about system winver о системе",
+            App::Telegram => "messenger chat телеграм телеграмм мессенджер чат",
         }
     }
 
@@ -211,6 +218,7 @@ impl App {
             App::Browser => (200, 40),
             App::Settings => (420, 140),
             App::About => (680, 280),
+            App::Telegram => (380, 90),
         }
     }
 }
@@ -483,6 +491,7 @@ pub struct Desktop<'a> {
     explorer: Box<explorer::Explorer>,
     settings: settings::Settings,
     about: about::About,
+    telegram: Box<telegram::Telegram>,
     /// The window the mouse was last over, for hover highlights.
     hover_app: Option<App>,
 
@@ -602,6 +611,7 @@ impl<'a> Desktop<'a> {
             explorer: Box::new(explorer::Explorer::new()),
             settings: settings::Settings::new(),
             about: about::About::new(),
+            telegram: Box::new(telegram::Telegram::new()),
             hover_app: None,
             pins: taskbar::DEFAULT_PINS.to_vec(),
             hover_now: None,
@@ -1025,6 +1035,10 @@ impl<'a> Desktop<'a> {
         if app == App::Browser {
             self.browser.start();
         }
+        if app == App::Telegram {
+            self.telegram.start();
+            self.stale[app.index()] = true;
+        }
         if app == App::Explorer {
             self.explorer.start();
             self.stale[app.index()] = true;
@@ -1042,6 +1056,9 @@ impl<'a> Desktop<'a> {
             self.focus(app);
             self.app_changed(app);
             return;
+        }
+        if app == App::Telegram {
+            self.telegram.stop();
         }
         self.damage_window(app);
         // it stays in the stacking order until it has faded out
@@ -1323,6 +1340,7 @@ impl<'a> Desktop<'a> {
             App::Explorer => self.explorer.on_key(key),
             App::Settings => self.settings.on_key(key),
             App::Paint => self.paint.on_key(key),
+            App::Telegram => self.telegram.on_key(key),
             App::Demo | App::About => false,
         };
         if changed {
@@ -1401,6 +1419,7 @@ impl<'a> Desktop<'a> {
                 Some(App::Explorer) => self.explorer.on_wheel(ev.wheel),
                 Some(App::Settings) => self.settings.on_wheel(ev.wheel),
                 Some(App::Paint) => self.paint.on_wheel(ev.wheel),
+                Some(App::Telegram) => self.telegram.on_wheel(ev.wheel),
                 _ => false,
             };
             if let Some(app) = app.filter(|_| changed) {
@@ -1498,6 +1517,7 @@ impl<'a> Desktop<'a> {
             App::Browser => self.browser.on_hover(x, y),
             App::Notepad => self.notepad.on_hover(x, y),
             App::Explorer => self.explorer.on_hover(x, y),
+            App::Telegram => self.telegram.on_hover(x, y),
             _ => false,
         }
     }
@@ -1774,6 +1794,7 @@ impl<'a> Desktop<'a> {
             App::Explorer => self.explorer.on_mouse(ev),
             App::Settings => self.settings.on_mouse(ev),
             App::About => self.about.on_mouse(ev),
+            App::Telegram => self.telegram.on_mouse(ev),
             App::Terminal | App::Demo => false,
         };
         if core::mem::take(&mut self.settings.switch_layout) {
@@ -2002,6 +2023,7 @@ impl<'a> Desktop<'a> {
                     App::Explorer => self.explorer.draw(&mut c, focused && self.cursor_on),
                     App::Settings => self.settings.draw(&mut c, &self.system_info()),
                     App::About => self.about.draw(&mut c, &self.system_info()),
+                    App::Telegram => self.telegram.draw(&mut c, focused, self.cursor_on),
                 }
             }
         }
@@ -2587,6 +2609,9 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
         if desk.browser.tick() {
             desk.damage_client(App::Browser);
         }
+        if desk.telegram.tick() {
+            desk.damage_client(App::Telegram);
+        }
         if CONSOLE.lock().take_changed() {
             desk.damage_client(App::Terminal);
         }
@@ -2608,7 +2633,9 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
             } else if let Some((i, _)) = &desk.desk_icons.renaming {
                 let r = desk.icon_rect(*i).inset(-8);
                 desk.damage(r);
-            } else if let Some(app @ (App::Terminal | App::Notepad | App::Explorer)) = desk.focused
+            } else if let Some(
+                app @ (App::Terminal | App::Notepad | App::Explorer | App::Telegram),
+            ) = desk.focused
             {
                 // the text caret blinks
                 desk.stale[app.index()] = true;
@@ -2642,7 +2669,7 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
 
         desk.render();
         // pages loading in the background keep the loop going
-        let busy = desk.browser.busy();
+        let busy = desk.browser.busy() || desk.telegram.busy();
         interrupts::wait_for_interrupt(|| {
             busy || !KEYBOARD_BYTES.is_empty() || !MOUSE_BYTES.is_empty() || !REQUESTS.is_empty()
         });

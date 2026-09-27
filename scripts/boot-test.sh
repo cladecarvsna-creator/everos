@@ -85,12 +85,17 @@ sign_in
 
 wait_for "desktop: opened Terminal" || fail "the desktop did not start"
 echo "desktop started"
-wait_for "icons: loaded 11 pictures" || fail "the app icons did not load"
+wait_for "icons: loaded 12 pictures" || fail "the app icons did not load"
 echo "app icons loaded"
 
 type_keys e c h o spc k e y b o a r d minus o k ret
 wait_for "keyboard-ok" || fail "the shell did not answer typed input"
 echo "keyboard input works"
+
+# the Telegram client's cryptography against known answers
+type_keys t e l e g r a m spc s e l f t e s t ret
+wait_for "telegram: self-test ok" || fail "the Telegram self-test failed"
+echo "telegram cryptography works"
 
 type_keys f e t c h spc 1 0 dot 0 dot 2 dot 2 shift-semicolon 8 1 2 3 slash ret
 wait_for 'fetch: "EverOS test page"' || fail "the network test page did not load"
