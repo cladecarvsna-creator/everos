@@ -118,7 +118,7 @@ enum PlaceKind {
 
 /// A place in the navigation pane.
 struct Place {
-    label: &'static str,
+    label: String,
     path: String,
     kind: PlaceKind,
 }
@@ -243,36 +243,42 @@ pub fn bin_folder() -> String {
 fn places() -> Vec<Place> {
     let home = home();
     let mut out = vec![Place {
-        label: "Home",
+        label: String::from("Home"),
         path: home.clone(),
         kind: PlaceKind::Home,
     }];
     for lib in fs::LIBRARIES {
         out.push(Place {
-            label: lib,
+            label: String::from(lib),
             path: fs::join(&home, lib),
             kind: PlaceKind::Library,
         });
     }
+    for d in fs::drives() {
+        out.push(Place {
+            label: d.label,
+            path: d.path,
+            kind: PlaceKind::Drive,
+        });
+    }
     out.push(Place {
-        label: "Local Disk (C:)",
-        path: String::from("/"),
-        kind: PlaceKind::Drive,
-    });
-    out.push(Place {
-        label: "Recycle Bin",
+        label: String::from("Recycle Bin"),
         path: bin_folder(),
         kind: PlaceKind::Bin,
     });
     out
 }
 
+/// Where the drives start in the navigation pane: after Home and the
+/// libraries.
+const FIRST_DRIVE: usize = 1 + fs::LIBRARIES.len();
+
 /// Where place `i` is in the navigation pane: a gap before the libraries
-/// and another before the disk and the Recycle Bin.
-fn place_rect(i: usize, n: usize) -> Rect {
+/// and another before the drives and the Recycle Bin.
+fn place_rect(i: usize, _n: usize) -> Rect {
     let gap = if i == 0 {
         0
-    } else if i + 2 >= n {
+    } else if i >= FIRST_DRIVE {
         56
     } else {
         12
@@ -305,13 +311,15 @@ fn type_name(item: &Info) -> String {
 }
 
 /// Sizes as Windows shows them: whole kilobytes, rounded up.
-fn size_text(size: u32) -> String {
+fn size_text(size: u64) -> String {
     let mut s = String::new();
-    let kb = (size as u64).div_ceil(1024);
+    let kb = size.div_ceil(1024);
     if kb < 1024 * 10 {
         let _ = write!(s, "{} KB", kb);
-    } else {
+    } else if kb < 1024 * 1024 * 10 {
         let _ = write!(s, "{} MB", kb.div_ceil(1024));
+    } else {
+        let _ = write!(s, "{} GB", kb.div_ceil(1024 * 1024));
     }
     s
 }
@@ -410,12 +418,7 @@ impl Explorer {
         if self.at_bin() {
             return String::from("Recycle Bin - File Explorer");
         }
-        let name = fs::file_name(&self.path);
-        let mut t = String::from(if name.is_empty() {
-            "Local Disk (C:)"
-        } else {
-            name
-        });
+        let mut t = fs::place_name(&self.path);
         t.push_str(" - File Explorer");
         t
     }
@@ -832,10 +835,11 @@ impl Explorer {
     /// The parts of the address: label, folder and where each is drawn.
     fn crumbs(&self) -> Vec<(String, String, Rect)> {
         let a = address_rect();
-        let mut parts = vec![(String::from("Local Disk (C:)"), String::from("/"))];
-        let mut acc = String::new();
+        let root = fs::drive_root(&self.path);
+        let mut parts = vec![(fs::place_name(&root), root.clone())];
+        let mut acc = if root == "/" { String::new() } else { root };
         let bin = bin_folder();
-        for p in self.path.split('/').filter(|p| !p.is_empty()) {
+        for p in self.path[acc.len()..].split('/').filter(|p| !p.is_empty()) {
             acc.push('/');
             acc.push_str(p);
             if fs::same_name(&acc, &bin) {
@@ -1485,13 +1489,10 @@ impl Explorer {
         self.search.draw(c, s, self.focus == Focus::Search, caret);
         if self.search.text.is_empty() && self.focus != Focus::Search {
             let mut label = String::from("Search ");
-            let name = fs::file_name(&self.path);
-            label.push_str(if self.at_bin() {
-                "Recycle Bin"
-            } else if name.is_empty() {
-                "Local Disk (C:)"
+            label.push_str(&if self.at_bin() {
+                String::from("Recycle Bin")
             } else {
-                name
+                fs::place_name(&self.path)
             });
             let label = fit(&label, s.w - 40);
             c.draw_text(s.x + 10, s.y + 7, &label, theme::text_dim());
@@ -1600,10 +1601,10 @@ impl Explorer {
                     icons::get().draw_pic(c, pic, SMALL, r.x + 12, r.y + 7);
                 }
             }
-            c.draw_text(r.x + 38, r.y + 7, p.label, theme::text());
+            c.draw_text(r.x + 38, r.y + 7, &p.label, theme::text());
         }
         // "This PC" above the disk
-        let disk = place_rect(n - 2, n);
+        let disk = place_rect(FIRST_DRIVE, n);
         c.fill_rect(12, disk.y - 42, SIDE_W - 24, 1, theme::stroke());
         icons::get().draw_pic(c, Pic::Computer, SMALL, 12, disk.y - 30);
         c.draw_text(38, disk.y - 30, "This PC", theme::text_dim());
@@ -1728,10 +1729,10 @@ impl Explorer {
             let bytes: u64 = chosen
                 .iter()
                 .filter(|&&i| !self.items[i].dir)
-                .map(|&i| self.items[i].size as u64)
+                .map(|&i| self.items[i].size)
                 .sum();
             if bytes > 0 {
-                let _ = write!(s, "  {}", size_text(bytes.min(u32::MAX as u64) as u32));
+                let _ = write!(s, "  {}", size_text(bytes));
             }
         } else if let Some(i) = self.single() {
             let _ = write!(s, "      1 item selected");
@@ -1746,6 +1747,21 @@ impl Explorer {
         }
         c.draw_text(12, ty, &s, theme::text());
         s.clear();
+        let drive = fs::drives()
+            .into_iter()
+            .find(|d| d.read_only && fs::same_name(&d.path, &fs::drive_root(&self.path)));
+        if let Some(d) = drive {
+            let _ = write!(
+                s,
+                "{}  {}  {} MB, read only",
+                d.label,
+                d.file_system,
+                d.bytes / (1024 * 1024)
+            );
+            let w = UI.width(&s);
+            c.draw_text(r.right() - 14 - w, ty, &s, theme::text_dim());
+            return;
+        }
         match fs::storage() {
             fs::Storage::Disk => {
                 let _ = write!(

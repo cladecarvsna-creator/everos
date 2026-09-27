@@ -81,7 +81,7 @@ impl Device {
 pub struct Info {
     pub name: String,
     pub dir: bool,
-    pub size: u32,
+    pub size: u64,
     /// Last change: year, month, day, hour, minute.
     pub modified: (u16, u8, u8, u8, u8),
 }
@@ -704,7 +704,7 @@ impl Volume {
                 Info {
                     name: e.name.clone(),
                     dir: e.is_dir(),
-                    size: e.size,
+                    size: e.size as u64,
                     modified: decode_time(u16_at(raw, 24), u16_at(raw, 22)),
                 }
             })

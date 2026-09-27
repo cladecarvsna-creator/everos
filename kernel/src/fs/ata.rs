@@ -23,6 +23,7 @@ const TIMEOUT: u32 = 5_000_000;
 #[derive(Debug)]
 pub struct IoError;
 
+#[derive(Clone)]
 pub struct Ata {
     base: u16,
     control: u16,
@@ -48,6 +49,26 @@ impl Ata {
             }
         }
         None
+    }
+
+    /// Every ATA hard disk on the two IDE channels, the one `find`
+    /// returns first.
+    pub fn find_all() -> alloc::vec::Vec<Ata> {
+        let mut out = alloc::vec::Vec::new();
+        for (base, control) in [(0x1f0, 0x3f6), (0x170, 0x376)] {
+            for slave in [false, true] {
+                let mut disk = Ata {
+                    base,
+                    control,
+                    slave,
+                    sectors: 0,
+                };
+                if disk.identify() {
+                    out.push(disk);
+                }
+            }
+        }
+        out
     }
 
     pub fn sectors(&self) -> u64 {

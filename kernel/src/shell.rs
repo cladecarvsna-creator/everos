@@ -118,6 +118,7 @@ impl Shell {
                 println!("  passwd  set a password: passwd [<name>] <password>");
                 println!("  lock    show the lock screen");
                 println!("  ls      list a folder; cd, pwd, mkdir, rm, cat work with files");
+                println!("  drives  list the disks: C: and NTFS disks (D:, E:, read only)");
                 println!("  echo    echo <text> > <file> writes a file");
                 println!("  notepad open Notepad (notepad <file> opens a file)");
                 println!("  explorer open File Explorer (explorer <folder>)");
@@ -148,6 +149,18 @@ impl Shell {
                 }
             }
             "ls" | "dir" => ls(&self.path(args)),
+            "drives" => {
+                for d in fs::drives() {
+                    println!(
+                        "{}:  {:<24} {:<6} {:>8} MB{}",
+                        d.letter,
+                        d.label,
+                        d.file_system,
+                        d.bytes / (1024 * 1024),
+                        if d.read_only { "  read only" } else { "" }
+                    );
+                }
+            }
             "cat" | "type" => match fs::read(&self.path(args)) {
                 Ok(data) => {
                     let text = String::from_utf8_lossy(&data).replace('\r', "");
@@ -273,7 +286,9 @@ impl Shell {
         } else {
             self.cwd.clone()
         };
-        if arg.starts_with(['/', '\\']) || arg.starts_with("C:") || arg.starts_with("c:") {
+        let b = arg.as_bytes();
+        let drive = b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic();
+        if arg.starts_with(['/', '\\']) || drive {
             fs::parse(arg)
         } else {
             fs::parse(&fs::join(&cwd, arg))

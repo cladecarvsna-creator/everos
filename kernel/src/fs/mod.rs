@@ -7,9 +7,13 @@
 //!
 //! Paths are absolute and use `/`: `/Users/root/Documents/notes.txt`.
 //! The apps show them the Windows way, as `C:\Users\root\...`.
+//!
+//! NTFS disks (a Windows disk, say) are opened read only as D:, E:, ...;
+//! their paths start with the letter: `D:/Windows/notepad.exe`.
 
 pub mod ata;
 mod fat;
+mod ntfs;
 pub mod recycle;
 
 use alloc::string::String;
@@ -33,6 +37,9 @@ pub enum Error {
     Io,
     Unformatted,
     NoDisk,
+    ReadOnly,
+    Unsupported,
+    TooBig,
 }
 
 impl Error {
@@ -47,6 +54,9 @@ impl Error {
             Error::Io => "The disk could not be read or written.",
             Error::Unformatted => "The disk has an unknown format.",
             Error::NoDisk => "There is no disk.",
+            Error::ReadOnly => "This disk is read only: EverOS doesn't change NTFS disks.",
+            Error::Unsupported => "EverOS can't read this file (it is encrypted).",
+            Error::TooBig => "The file is too big to open.",
         }
     }
 }
@@ -62,6 +72,8 @@ pub enum Storage {
 }
 
 static VOLUME: IrqMutex<Option<fat::Volume>> = IrqMutex::new(None);
+/// NTFS volumes, as drives D:, E:, ...
+static DRIVES: IrqMutex<Vec<ntfs::Volume>> = IrqMutex::new(Vec::new());
 /// Counts changes, so File Explorer knows when to read a folder again.
 static CHANGES: AtomicU32 = AtomicU32::new(0);
 
@@ -113,6 +125,147 @@ pub fn init() {
     }
     *VOLUME.lock() = volume;
     *STORAGE.lock() = storage;
+    mount_ntfs();
+}
+
+/// Open the NTFS partitions on every disk, read only.
+fn mount_ntfs() {
+    let mut found = Vec::new();
+    for mut disk in ata::Ata::find_all() {
+        for start in ntfs::find_partitions(&mut disk) {
+            if found.len() >= 8 {
+                break;
+            }
+            match ntfs::Volume::open(disk.clone(), start) {
+                Ok(v) => {
+                    let letter = (b'D' + found.len() as u8) as char;
+                    serial::write_str("fs: mounted NTFS disk ");
+                    serial::write_str(letter.encode_utf8(&mut [0; 4]));
+                    serial::write_str(": (read only) ");
+                    serial::write_str(&v.label);
+                    serial::write_str("\n");
+                    found.push(v);
+                }
+                Err(e) => {
+                    serial::write_str("fs: NTFS partition not usable: ");
+                    serial::write_str(e.message());
+                    serial::write_str("\n");
+                }
+            }
+        }
+    }
+    *DRIVES.lock() = found;
+}
+
+/// A drive as File Explorer lists it.
+pub struct Drive {
+    pub letter: char,
+    /// Its top folder: "/" for C:, "D:" for D:.
+    pub path: String,
+    /// "Local Disk (C:)", "Windows (D:)".
+    pub label: String,
+    pub file_system: &'static str,
+    pub bytes: u64,
+    pub read_only: bool,
+}
+
+/// C: and the NTFS drives.
+pub fn drives() -> Vec<Drive> {
+    let mut out = vec![Drive {
+        letter: 'C',
+        path: String::from("/"),
+        label: String::from("Local Disk (C:)"),
+        file_system: "FAT32",
+        bytes: capacity(),
+        read_only: false,
+    }];
+    for (i, v) in DRIVES.lock().iter().enumerate() {
+        let letter = (b'D' + i as u8) as char;
+        let mut label = if v.label.is_empty() {
+            String::from("Local Disk")
+        } else {
+            v.label.clone()
+        };
+        label.push_str(" (");
+        label.push(letter);
+        label.push_str(":)");
+        let mut path = String::new();
+        path.push(letter);
+        path.push(':');
+        out.push(Drive {
+            letter,
+            path,
+            label,
+            file_system: "NTFS",
+            bytes: v.bytes,
+            read_only: true,
+        });
+    }
+    out
+}
+
+/// The drive letter of a path on an NTFS drive and the path inside it:
+/// `D:/Windows` is ('D', "/Windows"). None for C: paths.
+fn on_drive(path: &str) -> Option<(char, &str)> {
+    let b = path.as_bytes();
+    if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+        let letter = b[0].to_ascii_uppercase() as char;
+        if letter != 'C' {
+            return Some((letter, &path[2..]));
+        }
+    }
+    None
+}
+
+/// Whether a path is on a drive EverOS doesn't write to.
+pub fn read_only(path: &str) -> bool {
+    on_drive(path).is_some()
+}
+
+/// Run `f` on the NTFS volume a path is on, with the path inside it.
+fn with_ntfs<T>(
+    letter: char,
+    f: impl FnOnce(&mut ntfs::Volume) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let i = (letter as u8).wrapping_sub(b'D') as usize;
+    match DRIVES.lock().get_mut(i) {
+        Some(v) => f(v),
+        None => Err(Error::NotFound),
+    }
+}
+
+/// The top folder of the drive a path is on: "/" or "D:".
+pub fn drive_root(path: &str) -> String {
+    match on_drive(path) {
+        Some((letter, _)) => {
+            let mut s = String::new();
+            s.push(letter);
+            s.push(':');
+            s
+        }
+        None => String::from("/"),
+    }
+}
+
+/// Whether a path is the top folder of a drive.
+pub fn is_drive_root(path: &str) -> bool {
+    match on_drive(path) {
+        Some((_, rest)) => rest.trim_matches('/').is_empty(),
+        None => path.trim_matches('/').is_empty(),
+    }
+}
+
+/// What to call a folder: its name, or the drive's label for the top.
+pub fn place_name(path: &str) -> String {
+    if is_drive_root(path) {
+        let root = drive_root(path);
+        drives()
+            .into_iter()
+            .find(|d| same_name(&d.path, &root))
+            .map_or(root, |d| d.label)
+    } else {
+        String::from(file_name(path))
+    }
 }
 
 pub fn storage() -> Storage {
@@ -141,7 +294,10 @@ pub fn list(path: &str) -> Result<Vec<Info>, Error> {
 
 /// Like `list`, hidden items included.
 pub fn list_all(path: &str) -> Result<Vec<Info>, Error> {
-    let mut items = with(|v| v.list(path))?;
+    let mut items = match on_drive(path) {
+        Some((d, inner)) => with_ntfs(d, |v| v.list(inner))?,
+        None => with(|v| v.list(path))?,
+    };
     items.sort_by(|a, b| {
         b.dir.cmp(&a.dir).then_with(|| {
             a.name
@@ -154,29 +310,47 @@ pub fn list_all(path: &str) -> Result<Vec<Info>, Error> {
 }
 
 pub fn read(path: &str) -> Result<Vec<u8>, Error> {
-    with(|v| v.read(path))
+    match on_drive(path) {
+        Some((d, inner)) => with_ntfs(d, |v| v.read(inner)),
+        None => with(|v| v.read(path)),
+    }
+}
+
+/// Fails for paths on read-only drives.
+fn writable(path: &str) -> Result<(), Error> {
+    if read_only(path) {
+        Err(Error::ReadOnly)
+    } else {
+        Ok(())
+    }
 }
 
 /// Create or replace a file.
 pub fn write(path: &str, data: &[u8]) -> Result<(), Error> {
+    writable(path)?;
     changed(with(|v| v.write(path, data)))
 }
 
 pub fn create_dir(path: &str) -> Result<(), Error> {
+    writable(path)?;
     changed(with(|v| v.create_dir(path)))
 }
 
 /// Delete a file, or a folder and everything in it.
 pub fn remove(path: &str) -> Result<(), Error> {
+    writable(path)?;
     changed(with(|v| v.remove(path)))
 }
 
 pub fn rename(path: &str, new_name: &str) -> Result<(), Error> {
+    writable(path)?;
     changed(with(|v| v.rename(path, new_name)))
 }
 
 /// Move a file or folder to a new path, which may be in another folder.
 pub fn move_path(from: &str, to: &str) -> Result<(), Error> {
+    writable(from)?;
+    writable(to)?;
     if !exists(from) {
         return Err(Error::NotFound);
     }
@@ -217,11 +391,17 @@ pub fn hidden(name: &str) -> bool {
 }
 
 pub fn is_dir(path: &str) -> bool {
-    with(|v| Ok(v.is_dir(path))).unwrap_or(false)
+    match on_drive(path) {
+        Some((d, inner)) => with_ntfs(d, |v| Ok(v.is_dir(inner))).unwrap_or(false),
+        None => with(|v| Ok(v.is_dir(path))).unwrap_or(false),
+    }
 }
 
 pub fn exists(path: &str) -> bool {
-    with(|v| Ok(v.exists(path))).unwrap_or(false)
+    match on_drive(path) {
+        Some((d, inner)) => with_ntfs(d, |v| Ok(v.exists(inner))).unwrap_or(false),
+        None => with(|v| Ok(v.exists(path))).unwrap_or(false),
+    }
 }
 
 // ---- paths ------------------------------------------------------------------
@@ -234,8 +414,11 @@ pub fn join(dir: &str, name: &str) -> String {
     s
 }
 
-/// The folder a path is in ("/" for the top).
+/// The folder a path is in ("/" for the top, "D:" for D:'s top).
 pub fn parent(path: &str) -> String {
+    if is_drive_root(path) {
+        return drive_root(path);
+    }
     let (dir, _) = fat::split(path);
     if dir.is_empty() {
         String::from("/")
@@ -251,8 +434,11 @@ pub fn file_name(path: &str) -> &str {
 
 /// A path the Windows way: `C:\Users\root`.
 pub fn display(path: &str) -> String {
-    let mut s = String::from("C:");
-    for part in path.split('/').filter(|p| !p.is_empty()) {
+    let (mut s, rest) = match on_drive(path) {
+        Some((_, rest)) => (drive_root(path), rest),
+        None => (String::from("C:"), path),
+    };
+    for part in rest.split('/').filter(|p| !p.is_empty()) {
         s.push('\\');
         s.push_str(part);
     }
@@ -270,6 +456,12 @@ pub fn parse(text: &str) -> String {
         .or_else(|| text.strip_prefix("c:"))
         .unwrap_or(text);
     let mut s = String::new();
+    let mut text = text;
+    if let Some((letter, rest)) = on_drive(text) {
+        s.push(letter);
+        s.push(':');
+        text = rest;
+    }
     for part in text
         .split(['/', '\\'])
         .filter(|p| !p.is_empty() && *p != ".")
