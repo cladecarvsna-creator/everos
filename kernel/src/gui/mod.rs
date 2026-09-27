@@ -48,6 +48,7 @@ mod wallpaper;
 #[rustfmt::skip]
 pub mod webfont;
 mod widgets;
+mod wifipanel;
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -1310,6 +1311,12 @@ impl<'a> Desktop<'a> {
                 return;
             }
         }
+        if self.panel == Some(Panel::Wifi) && self.tray.wifi.typing() {
+            let action = self.tray.wifi.on_key(key);
+            self.cursor_on = true;
+            self.wifi_action(action);
+            return;
+        }
         if self.search.open {
             let action = self.search.on_key(key);
             self.search_action(action);
@@ -1559,7 +1566,7 @@ impl<'a> Desktop<'a> {
             if r.contains(x, y) {
                 return match panel {
                     Panel::Quick => self.tray.target_at(r, x, y).map(Hover::Quick),
-                    Panel::Calendar => None,
+                    Panel::Calendar | Panel::Wifi => None,
                     Panel::Hidden => (0..tray::HIDDEN_ICONS)
                         .find(|&i| tray::hidden_icon_rect(r, i).contains(x, y))
                         .map(|i| Hover::Hidden(i as usize)),
@@ -1671,6 +1678,10 @@ impl<'a> Desktop<'a> {
                 if !right && panel == Panel::Quick {
                     self.quick_click(r, x, y);
                 }
+                if !right && panel == Panel::Wifi {
+                    let action = self.tray.wifi.click(r, x, y);
+                    self.wifi_action(action);
+                }
                 if !right && panel == Panel::Hidden {
                     if let Some(i) = (0..tray::HIDDEN_ICONS)
                         .find(|&i| tray::hidden_icon_rect(r, i).contains(x, y))
@@ -1682,7 +1693,7 @@ impl<'a> Desktop<'a> {
             }
             // a click on the button that opened it only closes it
             let own = self.tray_rect(match panel {
-                Panel::Quick => 1,
+                Panel::Quick | Panel::Wifi => 1,
                 Panel::Calendar => 2,
                 Panel::Hidden => 3,
             });
@@ -1800,6 +1811,9 @@ impl<'a> Desktop<'a> {
         if core::mem::take(&mut self.settings.switch_layout) {
             self.toggle_layout = true;
         }
+        if core::mem::take(&mut self.settings.show_wifi) {
+            self.open_panel(Panel::Wifi);
+        }
         if changed {
             self.cursor_on = true;
             self.app_changed(app);
@@ -1843,6 +1857,9 @@ impl<'a> Desktop<'a> {
         if panel == Panel::Quick {
             self.tray.update_net();
         }
+        if panel == Panel::Wifi {
+            self.tray.wifi.opened();
+        }
         self.panel_anim.retarget(ONE, anim::ms(220));
         self.damage(self.panel_rect(panel).inset(-SPREAD));
         self.damage_taskbar();
@@ -1860,17 +1877,42 @@ impl<'a> Desktop<'a> {
     fn quick_click(&mut self, r: Rect, x: i32, y: i32) {
         match self.tray.target_at(r, x, y) {
             Some(tray::Target::LayoutTile) => self.toggle_layout = true,
+            Some(tray::Target::NetworkTile) if self.tray.net.is_wifi() => {
+                // the tile turns Wi-Fi on or off, as in Windows
+                let on = self.tray.net != tray::Net::WifiOff;
+                crate::net::wifi::set_on(!on);
+                self.tray.update_net();
+                self.damage(r);
+                self.damage_tray();
+            }
             Some(tray::Target::NetworkTile) => {
                 // start the network if nothing has yet
                 crate::net::init();
                 self.tray.update_net();
                 self.damage(r);
             }
+            Some(tray::Target::WifiArrow) => self.open_panel(Panel::Wifi),
             Some(tray::Target::Slider(s)) => {
                 self.slider = Some(s);
                 self.drag_slider(s);
             }
             None => {}
+        }
+    }
+
+    fn wifi_action(&mut self, action: wifipanel::Action) {
+        match action {
+            wifipanel::Action::None => {}
+            wifipanel::Action::Redraw => {
+                self.tray.update_net();
+                self.damage_panel();
+                self.damage_tray();
+            }
+            wifipanel::Action::Back => self.open_panel(Panel::Quick),
+            wifipanel::Action::OpenSettings => {
+                self.close_panel();
+                self.open_settings(settings::Page::Network);
+            }
         }
     }
 
@@ -2001,6 +2043,7 @@ impl<'a> Desktop<'a> {
             clock: self.clock.as_str(),
             date: self.date.as_str(),
             uptime_minutes: interrupts::ticks() / interrupts::TIMER_HZ / 60,
+            caret: self.cursor_on,
         }
     }
 
@@ -2281,6 +2324,7 @@ impl<'a> Desktop<'a> {
             match panel {
                 Panel::Quick => self.tray.draw_quick(&mut m, p, self.layout, hover),
                 Panel::Calendar => Tray::draw_calendar(&mut m, p),
+                Panel::Wifi => self.tray.wifi.draw(&mut m, p, self.cursor_on),
                 Panel::Hidden => self.draw_hidden_icons(&mut m, p),
             }
         });
@@ -2606,11 +2650,15 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
             desk.refresh_icons();
         }
         crate::net::poll();
+        crate::net::wifi::poll();
         if desk.browser.tick() {
             desk.damage_client(App::Browser);
         }
         if desk.telegram.tick() {
             desk.damage_client(App::Telegram);
+        }
+        if desk.settings.tick() {
+            desk.damage_client(App::Settings);
         }
         if CONSOLE.lock().take_changed() {
             desk.damage_client(App::Terminal);
@@ -2623,6 +2671,8 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
             next_blink = now + BLINK_TICKS;
             desk.cursor_on = !desk.cursor_on;
             if !on_desktop {
+            } else if desk.panel == Some(Panel::Wifi) && desk.tray.wifi.typing() {
+                desk.damage_panel();
             } else if desk.start.open {
                 // the caret in the search box
                 desk.damage(desk.menu_rect());
@@ -2634,7 +2684,8 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
                 let r = desk.icon_rect(*i).inset(-8);
                 desk.damage(r);
             } else if let Some(
-                app @ (App::Terminal | App::Notepad | App::Explorer | App::Telegram),
+                app
+                @ (App::Terminal | App::Notepad | App::Explorer | App::Telegram | App::Settings),
             ) = desk.focused
             {
                 // the text caret blinks
@@ -2653,7 +2704,10 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
             desk.clock = clock;
             desk.date.clear();
             let _ = write!(desk.date, "{:02}.{:02}.{}", day, month, year);
-            let net_changed = desk.tray.update_net();
+            let mut net_changed = desk.tray.update_net();
+            if desk.panel == Some(Panel::Wifi) && desk.tray.wifi.refresh() {
+                net_changed = true;
+            }
             if on_desktop {
                 if changed || net_changed {
                     desk.damage_tray();
@@ -2669,7 +2723,7 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
 
         desk.render();
         // pages loading in the background keep the loop going
-        let busy = desk.browser.busy() || desk.telegram.busy();
+        let busy = desk.browser.busy() || desk.telegram.busy() || desk.settings.busy();
         interrupts::wait_for_interrupt(|| {
             busy || !KEYBOARD_BYTES.is_empty() || !MOUSE_BYTES.is_empty() || !REQUESTS.is_empty()
         });

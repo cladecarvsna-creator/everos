@@ -280,3 +280,18 @@ pub fn accent_button(c: &mut Canvas, r: Rect, label: &str, pressed: bool) {
 pub fn glass() -> Color {
     pick(0xffffff, rgb(0x5c, 0x5c, 0x60))
 }
+
+/// A Windows 11 on/off switch, 40 x 20, drawn in `r`.
+pub fn switch(c: &mut Canvas, r: Rect, on: bool) {
+    let knob = r.h - 10;
+    if on {
+        c.fill_round(r, r.h / 2, accent());
+        let k = Rect::new(r.right() - 5 - knob, r.y + 5, knob, knob);
+        c.fill_round(k, knob / 2, on_accent());
+    } else {
+        c.fill_round(r, r.h / 2, control());
+        c.outline_round(r, r.h / 2, text_dim());
+        let k = Rect::new(r.x + 5, r.y + 5, knob, knob);
+        c.fill_round(k, knob / 2, text_dim());
+    }
+}

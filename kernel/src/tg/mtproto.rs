@@ -97,7 +97,9 @@ pub const TIMEOUT_MS: i64 = 30_000;
 
 impl Transport {
     pub fn connect(ip: Ipv4Address, port: u16) -> Result<Transport> {
-        let mut stream = TcpStream::connect(ip, port).map_err(Error::Net)?;
+        // through the proxy too, if one is set
+        let host = alloc::format!("{}", ip);
+        let mut stream = crate::net::proxy::connect(&host, port).map_err(Error::Net)?;
         stream.write_all(&[0xee; 4]).map_err(Error::Net)?;
         Ok(Transport {
             stream,

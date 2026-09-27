@@ -15,9 +15,14 @@ use super::icons::{self, Pic, SMALL};
 use super::personalize::{self, Background, Prefs, COLORS, FITS};
 use super::text::{TITLE, UI, UI_BOLD};
 use super::tray::{self, Net};
+use super::widgets::{FieldEvent, TextField};
 use super::{picture, theme, wallpaper, App, MouseEvent, MouseKind};
+use crate::fiber::Fiber;
 use crate::fs;
 use crate::keyboard::{Key, Layout};
+use crate::net::config::{self, Proxy, ProxyKind};
+use crate::net::wifi::{self, Adapter, State};
+use alloc::rc::Rc;
 
 pub const CLIENT_W: i32 = 940;
 pub const CLIENT_H: i32 = 620;
@@ -39,6 +44,8 @@ pub struct Info<'a> {
     pub clock: &'a str,
     pub date: &'a str,
     pub uptime_minutes: u64,
+    /// The text caret's blink.
+    pub caret: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -46,15 +53,17 @@ pub enum Page {
     System,
     Personalization,
     Network,
+    Proxy,
     Time,
     Accounts,
     About,
 }
 
-const PAGES: [(Page, &str); 6] = [
+const PAGES: [(Page, &str); 7] = [
     (Page::System, "System"),
     (Page::Personalization, "Personalization"),
     (Page::Network, "Network & internet"),
+    (Page::Proxy, "Proxy"),
     (Page::Time, "Time & language"),
     (Page::Accounts, "Accounts"),
     (Page::About, "About"),
@@ -64,6 +73,7 @@ const PAGES: [(Page, &str); 6] = [
 enum Button {
     SwitchLayout,
     OpenAbout,
+    ShowNetworks,
 }
 
 pub struct Settings {
@@ -77,6 +87,9 @@ pub struct Settings {
     error: Option<&'static str>,
     /// Small pictures of the backgrounds, made when first shown.
     thumbs: RefCell<Thumbs>,
+    /// Asks the desktop to open the list of Wi-Fi networks.
+    pub show_wifi: bool,
+    proxy: RefCell<ProxyForm>,
 }
 
 #[derive(Default)]
@@ -229,16 +242,34 @@ impl Settings {
             dialog: RefCell::new(None),
             error: None,
             thumbs: RefCell::new(Thumbs::default()),
+            show_wifi: false,
+            proxy: RefCell::new(ProxyForm::load()),
         }
+    }
+
+    /// Move the proxy check along. Returns whether the page changed.
+    pub fn tick(&mut self) -> bool {
+        self.proxy.get_mut().tick()
+    }
+
+    /// Whether a proxy check is running.
+    pub fn busy(&self) -> bool {
+        self.proxy.borrow().check.is_some()
     }
 
     /// Show a page, as "Personalize" on the desktop's menu asks.
     pub fn show_page(&mut self, page: Page) {
         self.page = page;
         self.pressed = None;
+        if page == Page::Proxy {
+            *self.proxy.get_mut() = ProxyForm::load();
+        }
     }
 
     pub fn on_key(&mut self, key: Key) -> bool {
+        if self.page == Page::Proxy && self.dialog.get_mut().is_none() {
+            return self.proxy.get_mut().on_key(key);
+        }
         let event = match self.dialog.get_mut() {
             Some(d) => d.on_key(key, dialog_area()),
             None => return false,
@@ -307,6 +338,7 @@ impl Settings {
     fn button(&self) -> Option<(Button, Rect)> {
         match self.page {
             Page::Time => Some((Button::SwitchLayout, row_button(1))),
+            Page::Network if wifi::state().is_some() => Some((Button::ShowNetworks, row_button(0))),
             Page::About => Some((Button::OpenAbout, row_button(4))),
             _ => None,
         }
@@ -327,11 +359,19 @@ impl Settings {
             MouseKind::Down { right: false } => {
                 if let Some(i) = (0..PAGES.len()).find(|&i| nav_rect(i).contains(ev.x, ev.y)) {
                     let changed = self.page != PAGES[i].0;
-                    self.page = PAGES[i].0;
+                    if changed {
+                        self.show_page(PAGES[i].0);
+                    }
                     return changed;
                 }
                 if self.page == Page::Personalization {
                     return self.personalize_click(ev.x, ev.y);
+                }
+                if self.page == Page::Proxy {
+                    return self.proxy.get_mut().click(ev.x, ev.y);
+                }
+                if self.page == Page::Network && self.network_click(ev.x, ev.y) {
+                    return true;
                 }
                 match self.button() {
                     Some((b, r)) if r.contains(ev.x, ev.y) => {
@@ -351,6 +391,7 @@ impl Settings {
                         Button::OpenAbout => {
                             super::request_open(App::About);
                         }
+                        Button::ShowNetworks => self.show_wifi = true,
                     }
                 }
                 true
@@ -400,26 +441,8 @@ impl Settings {
                     ],
                 );
             }
-            Page::Network => {
-                let address = if info.address.is_empty() {
-                    "-"
-                } else {
-                    info.address
-                };
-                let adapter = if info.net == Net::NoCard {
-                    "None found"
-                } else {
-                    "Intel PRO/1000 (e1000)"
-                };
-                self.rows(
-                    c,
-                    &[
-                        ("Ethernet", "Status", info.net.label()),
-                        ("IPv4 address", "Given by DHCP", address),
-                        ("Network adapter", "The card EverOS talks to", adapter),
-                    ],
-                );
-            }
+            Page::Network => self.draw_network(c, info),
+            Page::Proxy => self.proxy.borrow_mut().draw(c, info.caret),
             Page::Time => {
                 let layout = match info.layout {
                     Layout::Us => "English (ENG)",
@@ -512,6 +535,7 @@ impl Settings {
                     };
                     tray::network_icon(c, x, y + 1, info.net, theme::text(), bg);
                 }
+                Page::Proxy => globe_icon(c, x, y, theme::text()),
                 Page::Time => {
                     c.outline_round(Rect::new(x, y, 16, 16), 8, theme::text());
                     c.fill_rect(x + 8, y + 3, 1, 6, theme::text());
@@ -823,4 +847,441 @@ fn avatar(c: &mut Canvas, x: i32, y: i32, size: i32, name: &str) {
     first.extend(name.chars().next().map(|ch| ch.to_ascii_uppercase()));
     let font = if size >= 48 { &TITLE } else { &UI_BOLD };
     c.text_centered_in(font, r, &first, 0xffffff);
+}
+
+/// A globe: a circle with a meridian and the equator, for Proxy.
+fn globe_icon(c: &mut Canvas, x: i32, y: i32, ink: u32) {
+    c.outline_round(Rect::new(x, y, 16, 16), 8, ink);
+    c.outline_round(Rect::new(x + 4, y, 8, 16), 4, ink);
+    c.fill_rect(x + 1, y + 8, 14, 1, ink);
+    c.fill_rect(x + 8, y, 1, 16, ink);
+}
+
+// ---- Network & internet ----------------------------------------------------------
+
+/// The on/off switch at the right end of row `i`.
+fn row_switch(i: usize) -> Rect {
+    let r = row_rect(i);
+    Rect::new(r.right() - 20 - 40, r.y + (ROW_H - 20) / 2, 40, 20)
+}
+
+impl Settings {
+    fn draw_network(&self, c: &mut Canvas, info: &Info) {
+        let address = if info.address.is_empty() {
+            "-"
+        } else {
+            info.address
+        };
+        let adapter = wifi::adapter();
+        let state = wifi::state();
+        let wifi_status = match &state {
+            None => match &adapter {
+                Adapter::Unsupported(_) => String::from("EverOS has no driver for this card yet"),
+                _ => String::from("No Wi-Fi adapter"),
+            },
+            Some(State::Off) => String::from("Off"),
+            Some(State::Disconnected) => String::from("Not connected"),
+            Some(State::Connecting(s)) => format!("Connecting to {}...", s),
+            Some(State::Connected { ssid, signal }) => {
+                format!("Connected to {}, signal {}%", ssid, signal)
+            }
+            Some(State::Failed(s, why)) => format!("{}: {}", s, why),
+        };
+        let adapter_name = match &adapter {
+            Adapter::None => String::from("None found"),
+            Adapter::Unsupported(name) => name.clone(),
+            Adapter::Virtual => String::from("Virtual adapter (test)"),
+        };
+        let ethernet = if adapter == Adapter::Virtual {
+            "Carries the virtual Wi-Fi"
+        } else {
+            info.net.label()
+        };
+        let card = if info.net == Net::NoCard {
+            "None found"
+        } else {
+            "Intel PRO/1000 (e1000)"
+        };
+        let p = config::get().proxy;
+        let proxy = match p.kind {
+            ProxyKind::Off => String::from("Off"),
+            k if p.host.is_empty() => String::from(k.name()),
+            k => format!("{} {}:{}", k.name().to_ascii_uppercase(), p.host, p.port),
+        };
+        self.rows(
+            c,
+            &[
+                ("Wi-Fi", &wifi_status, ""),
+                (
+                    "Wi-Fi adapter",
+                    "The card that talks to the air",
+                    &adapter_name,
+                ),
+                (
+                    "Virtual Wi-Fi adapter",
+                    "For testing in QEMU: pretend networks, traffic goes over the cable",
+                    "",
+                ),
+                ("Ethernet", "Status", ethernet),
+                ("IPv4 address", "Given by DHCP", address),
+                ("Network adapter", "The wired card", card),
+                ("Proxy", "Used by the browser and Telegram", &proxy),
+            ],
+        );
+        if let Some(st) = &state {
+            // Wi-Fi on/off, left of the button
+            let b = row_button(0);
+            let sw = Rect::new(b.x - 16 - 40, b.y + 6, 40, 20);
+            theme::switch(c, sw, *st != State::Off);
+        }
+        self.draw_button(c, Button::ShowNetworks, "Show networks");
+        theme::switch(c, row_switch(2), adapter == Adapter::Virtual);
+    }
+
+    /// A click on the Network page's switches and the proxy row.
+    fn network_click(&mut self, x: i32, y: i32) -> bool {
+        if row_switch(2).contains(x, y) {
+            wifi::set_virtual(wifi::adapter() != Adapter::Virtual);
+            return true;
+        }
+        if let Some(st) = wifi::state() {
+            let b = row_button(0);
+            let sw = Rect::new(b.x - 16 - 40, b.y + 6, 40, 20);
+            if sw.inset(-4).contains(x, y) {
+                wifi::set_on(st == State::Off);
+                return true;
+            }
+        }
+        if row_rect(6).contains(x, y) {
+            self.show_page(Page::Proxy);
+            return true;
+        }
+        false
+    }
+}
+
+// ---- Proxy ----------------------------------------------------------------------------
+
+const FIELDS: usize = 5;
+const F_HOST: usize = 0;
+const F_PORT: usize = 1;
+const F_USER: usize = 2;
+const F_PASS: usize = 3;
+const F_BYPASS: usize = 4;
+
+const FIELD_LABELS: [&str; FIELDS] = [
+    "Proxy IP address or name",
+    "Port",
+    "User name (optional)",
+    "Password",
+    "Don't use the proxy for these addresses (use ; between them, * matches anything)",
+];
+
+/// Where the proxy check's fiber leaves its answer.
+type CheckResult = Rc<RefCell<Option<Result<(), String>>>>;
+
+/// The proxy page: the kind of proxy, where it is, a login, and hosts
+/// reached directly. Nothing changes until Save.
+struct ProxyForm {
+    kind: ProxyKind,
+    fields: [TextField; FIELDS],
+    focus: Option<usize>,
+    /// What the last Save or Check said, and whether it went wrong.
+    note: Option<(String, bool)>,
+    check: Option<(Fiber, CheckResult)>,
+    pressed: Option<ProxyHit>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProxyHit {
+    Kind(ProxyKind),
+    Field(usize),
+    Save,
+    Check,
+}
+
+const KINDS: [(ProxyKind, &str); 3] = [
+    (ProxyKind::Off, "Off"),
+    (ProxyKind::Http, "HTTP"),
+    (ProxyKind::Socks5, "SOCKS5"),
+];
+
+fn kind_card() -> Rect {
+    Rect::new(PAGE_X, 72, PAGE_W, 64)
+}
+
+fn form_card() -> Rect {
+    Rect::new(PAGE_X, 144, PAGE_W, 300)
+}
+
+fn kind_button(i: usize) -> Rect {
+    let r = kind_card();
+    let w = 84;
+    let total = KINDS.len() as i32 * (w + 6) - 6;
+    Rect::new(r.right() - 16 - total + i as i32 * (w + 6), r.y + 16, w, 32)
+}
+
+fn field_rect(i: usize) -> Rect {
+    let r = form_card();
+    let left = r.x + 20;
+    let wide = r.w - 40;
+    match i {
+        F_HOST => Rect::new(left, r.y + 36, wide - 140, 32),
+        F_PORT => Rect::new(left + wide - 120, r.y + 36, 120, 32),
+        F_USER => Rect::new(left, r.y + 106, (wide - 20) / 2, 32),
+        F_PASS => Rect::new(left + (wide + 20) / 2, r.y + 106, (wide - 20) / 2, 32),
+        _ => Rect::new(left, r.y + 176, wide, 32),
+    }
+}
+
+fn save_button() -> Rect {
+    let r = form_card();
+    Rect::new(r.x + 20, r.bottom() - 20 - 32, 110, 32)
+}
+
+fn check_button() -> Rect {
+    let s = save_button();
+    Rect::new(s.right() + 8, s.y, 150, 32)
+}
+
+impl ProxyForm {
+    fn load() -> Self {
+        let p = config::get().proxy;
+        let port = if p.port == 0 {
+            String::new()
+        } else {
+            format!("{}", p.port)
+        };
+        let mut pass = TextField::password();
+        pass.set(&p.pass);
+        ProxyForm {
+            kind: p.kind,
+            fields: [
+                TextField::new(&p.host),
+                TextField::new(&port),
+                TextField::new(&p.user),
+                pass,
+                TextField::new(&p.bypass),
+            ],
+            focus: None,
+            note: None,
+            check: None,
+            pressed: None,
+        }
+    }
+
+    /// The proxy as typed in, or why it can't be one.
+    fn proxy(&self) -> Result<Proxy, String> {
+        let host = String::from(self.fields[F_HOST].string().trim());
+        let port_text = self.fields[F_PORT].string();
+        let port: u16 = match port_text.trim() {
+            "" if self.kind == ProxyKind::Off => 0,
+            t => t
+                .parse()
+                .ok()
+                .filter(|&p| p > 0)
+                .ok_or_else(|| String::from("The port is a number from 1 to 65535"))?,
+        };
+        if self.kind != ProxyKind::Off && host.is_empty() {
+            return Err(String::from("Type the proxy's address"));
+        }
+        Ok(Proxy {
+            kind: self.kind,
+            host,
+            port,
+            user: String::from(self.fields[F_USER].string().trim()),
+            pass: self.fields[F_PASS].string(),
+            bypass: String::from(self.fields[F_BYPASS].string().trim()),
+        })
+    }
+
+    fn save(&mut self) {
+        match self.proxy() {
+            Ok(p) => {
+                config::update(|c| c.proxy = p);
+                crate::web::http::clear_pool();
+                self.note = Some((String::from("Saved"), false));
+            }
+            Err(e) => self.note = Some((e, true)),
+        }
+    }
+
+    fn start_check(&mut self) {
+        if self.check.is_some() {
+            return;
+        }
+        let p = match self.proxy() {
+            Ok(p) => p,
+            Err(e) => {
+                self.note = Some((e, true));
+                return;
+            }
+        };
+        let result = Rc::new(RefCell::new(None));
+        let out = result.clone();
+        let fiber = Fiber::new(move || {
+            let r = crate::net::proxy::check(&p, "example.com", 443);
+            *out.borrow_mut() = Some(r);
+        });
+        self.check = Some((fiber, result));
+        self.note = Some((String::from("Checking..."), false));
+    }
+
+    fn tick(&mut self) -> bool {
+        let Some((fiber, result)) = self.check.as_mut() else {
+            return false;
+        };
+        if !fiber.resume() {
+            return false;
+        }
+        let r = result.borrow_mut().take();
+        self.check = None;
+        self.note = Some(match r {
+            Some(Ok(())) => (String::from("Works: reached example.com"), false),
+            Some(Err(e)) => (e, true),
+            None => (String::from("The check stopped"), true),
+        });
+        true
+    }
+
+    fn hits(&self) -> Vec<(ProxyHit, Rect)> {
+        let mut out = Vec::new();
+        for (i, &(k, _)) in KINDS.iter().enumerate() {
+            out.push((ProxyHit::Kind(k), kind_button(i)));
+        }
+        for i in 0..FIELDS {
+            out.push((ProxyHit::Field(i), field_rect(i)));
+        }
+        out.push((ProxyHit::Save, save_button()));
+        out.push((ProxyHit::Check, check_button()));
+        out
+    }
+
+    fn click(&mut self, x: i32, y: i32) -> bool {
+        let Some((hit, r)) = self.hits().into_iter().find(|(_, r)| r.contains(x, y)) else {
+            let changed = self.focus.is_some();
+            self.focus = None;
+            return changed;
+        };
+        self.focus = None;
+        match hit {
+            ProxyHit::Kind(k) => {
+                self.kind = k;
+                self.note = None;
+            }
+            ProxyHit::Field(i) => {
+                self.focus = Some(i);
+                self.fields[i].click(r, x);
+            }
+            ProxyHit::Save => {
+                self.pressed = Some(hit);
+                self.save();
+            }
+            ProxyHit::Check => {
+                self.pressed = Some(hit);
+                self.start_check();
+            }
+        }
+        true
+    }
+
+    fn on_key(&mut self, key: Key) -> bool {
+        let Some(i) = self.focus else {
+            return false;
+        };
+        if let Key::Char('\t') = key {
+            let back = crate::keyboard::shift_held();
+            self.focus = Some(if back {
+                (i + FIELDS - 1) % FIELDS
+            } else {
+                (i + 1) % FIELDS
+            });
+            let f = &mut self.fields[self.focus.unwrap()];
+            f.select_all();
+            return true;
+        }
+        match self.fields[i].on_key(key) {
+            FieldEvent::None => false,
+            FieldEvent::Changed => true,
+            FieldEvent::Enter => {
+                self.save();
+                true
+            }
+            FieldEvent::Escape => {
+                self.focus = None;
+                true
+            }
+        }
+    }
+
+    fn draw(&mut self, c: &mut Canvas, caret: bool) {
+        self.pressed = None;
+        let r = kind_card();
+        card(c, r);
+        c.draw_text(r.x + 20, r.y + 12, "Use a proxy server", theme::text());
+        c.draw_text(
+            r.x + 20,
+            r.y + 31,
+            "For the browser and Telegram",
+            theme::text_dim(),
+        );
+        for (i, &(k, name)) in KINDS.iter().enumerate() {
+            theme::toggle_button(c, kind_button(i), name, self.kind == k);
+        }
+
+        let r = form_card();
+        card(c, r);
+        let off = self.kind == ProxyKind::Off;
+        for (i, (field, label)) in self.fields.iter_mut().zip(FIELD_LABELS).enumerate() {
+            let f = field_rect(i);
+            let ink = if off {
+                theme::text_dim()
+            } else {
+                theme::text()
+            };
+            c.draw_text(f.x, f.y - 22, label, ink);
+            field.draw(c, f, self.focus == Some(i), caret);
+        }
+        theme::accent_button(c, save_button(), "Save", false);
+        let checking = self.check.is_some();
+        theme::button(
+            c,
+            check_button(),
+            if checking {
+                "Checking..."
+            } else {
+                "Check proxy"
+            },
+            checking,
+        );
+        if let Some((note, bad)) = &self.note {
+            let b = check_button();
+            let color = if *bad {
+                theme::error()
+            } else {
+                theme::text_dim()
+            };
+            let mut text = note.clone();
+            let room = r.right() - 20 - (b.right() + 16);
+            while UI.width(&text) > room && text.pop().is_some() {}
+            c.draw_text(
+                b.right() + 16,
+                b.y + (b.h - UI.line_height) / 2,
+                &text,
+                color,
+            );
+        }
+
+        let r = Rect::new(PAGE_X, 452, PAGE_W, 110);
+        card(c, r);
+        let lines = [
+            "HTTP: pages over https:// and Telegram go through a CONNECT tunnel,",
+            "plain http:// pages are sent to the proxy as whole addresses.",
+            "SOCKS5: everything goes through the proxy; it looks the names up.",
+            "Check proxy asks the proxy to open a connection to example.com.",
+        ];
+        for (i, line) in lines.iter().enumerate() {
+            c.draw_text(r.x + 20, r.y + 12 + i as i32 * 22, line, theme::text_dim());
+        }
+    }
 }
