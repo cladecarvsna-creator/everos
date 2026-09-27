@@ -62,6 +62,7 @@ fn file(app: App) -> Option<&'static [u8]> {
         App::About => include_bytes!("../../assets/icons/about.bmp"),
         App::Calculator => include_bytes!("../../assets/icons/calculator.png"),
         App::Browser => include_bytes!("../../assets/icons/browser.png"),
+        App::Telegram => include_bytes!("../../assets/icons/telegram.png"),
         App::Demo => return None,
     })
 }
@@ -557,6 +558,6 @@ pub fn draw_icon(c: &mut Canvas, app: App, x: i32, y: i32) {
             c.outline_round(tile, 8, rgb(0x0c, 0x40, 0xa0));
         }
         // these have pictures, so they are never drawn
-        App::Settings | App::About => c.fill_round(tile, 8, rgb(0x80, 0x80, 0x88)),
+        App::Settings | App::About | App::Telegram => c.fill_round(tile, 8, rgb(0x80, 0x80, 0x88)),
     }
 }

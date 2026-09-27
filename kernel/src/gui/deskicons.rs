@@ -27,8 +27,9 @@ const CELL_H: i32 = 102;
 const LEFT: i32 = 6;
 const TOP: i32 = 6;
 /// The apps with a shortcut on the desktop.
-const SHORTCUTS: [App; 7] = [
+const SHORTCUTS: [App; 8] = [
     App::Browser,
+    App::Telegram,
     App::Terminal,
     App::Notepad,
     App::Paint,

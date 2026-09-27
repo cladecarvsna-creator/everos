@@ -37,9 +37,10 @@ const SEARCH_W: i32 = 216;
 const TIP_DELAY: u64 = interrupts::TIMER_HZ * 6 / 10;
 
 /// Pinned for a new user.
-pub const DEFAULT_PINS: [App; 5] = [
+pub const DEFAULT_PINS: [App; 6] = [
     App::Explorer,
     App::Browser,
+    App::Telegram,
     App::Terminal,
     App::Notepad,
     App::Settings,

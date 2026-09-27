@@ -110,6 +110,7 @@ impl Shell {
                 println!("  calc    open the calculator");
                 println!("  gfx     graphics demo");
                 println!("  browser open the web browser (browser <address> goes there)");
+                println!("  telegram open Telegram (telegram selftest checks its crypto)");
                 println!("  fetch   download a web page and show its title and links");
                 println!("  exit    close the terminal window");
                 println!("  whoami  show who is signed in; 'users' lists everyone");
@@ -178,6 +179,22 @@ impl Shell {
             "paint" => open(App::Paint),
             "calc" => open(App::Calculator),
             "gfx" => open(App::Demo),
+            "telegram" | "tg" => {
+                if args.trim() == "selftest" {
+                    match crate::tg::self_test() {
+                        Ok(()) => {
+                            println!("Telegram self-test passed.");
+                            crate::serial::write_str("\ntelegram: self-test ok\n");
+                        }
+                        Err(what) => {
+                            println!("Telegram self-test failed: {}", what);
+                            crate::serial::write_str("\ntelegram: self-test FAILED\n");
+                        }
+                    }
+                } else {
+                    open(App::Telegram);
+                }
+            }
             "browser" | "web" => {
                 if !args.trim().is_empty() {
                     gui::request_address(args.trim());
