@@ -59,6 +59,66 @@ pub enum Cmd {
     Send(Peer, String),
     Reload,
     LogOut,
+    /// Look for people, groups and channels by name or username.
+    Search(String),
+    /// Find a username (from @name or a t.me link) and show that chat.
+    Resolve(String),
+    Join(Peer),
+    Leave(Peer),
+    /// Save the file or photo of a message to the Downloads folder.
+    Download(Peer, i64),
+}
+
+/// Where a file is on Telegram's servers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileLoc {
+    pub id: i64,
+    pub access_hash: i64,
+    pub file_reference: Vec<u8>,
+    pub dc: i32,
+    /// A photo, in this size ("x"); otherwise a document.
+    pub photo_size: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Photo {
+    pub loc: FileLoc,
+    pub w: i32,
+    pub h: i32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Document {
+    pub loc: FileLoc,
+    pub name: String,
+    pub size: i64,
+}
+
+/// A link in a message's text, from character `start` to `end`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Link {
+    pub start: usize,
+    pub end: usize,
+    /// An address, or "@name" for a username.
+    pub target: String,
+}
+
+/// A photo, made small enough to show.
+#[derive(Debug)]
+pub struct Picture {
+    pub w: i32,
+    pub h: i32,
+    /// 0xAARRGGBB.
+    pub pixels: Vec<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Download {
+    /// Parts of a thousand done.
+    Going(u32),
+    /// Saved at this path.
+    Done(String),
+    Failed(String),
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +134,14 @@ pub struct Chat {
     /// Our messages up to this one were read.
     pub read_out: i64,
     pub kind: ChatKind,
+    /// Without the @; empty when there is none.
+    pub username: String,
+    /// We are in it (a chat found by search may not be).
+    pub member: bool,
+    /// We may write in it (in channels only admins can).
+    pub can_post: bool,
+    /// Members or subscribers, when known.
+    pub members: i64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -103,6 +171,10 @@ pub struct Message {
     /// Our random id while it is being sent.
     pub random_id: i64,
     pub failed: bool,
+    pub photo: Option<Photo>,
+    /// Something to save: a file, a video, music...
+    pub file: Option<Document>,
+    pub links: Vec<Link>,
 }
 
 #[derive(Default, Debug)]
@@ -134,6 +206,16 @@ pub struct Shared {
     pub tz: i64,
     /// The chat the window shows: new messages there are read at once.
     pub open: Option<Peer>,
+    /// Chats found by searching (people and channels not in the list).
+    pub found: Vec<Chat>,
+    /// What `found` was searched for.
+    pub found_for: String,
+    /// Photos by id; None when one could not be loaded.
+    pub photos: BTreeMap<i64, Option<Picture>>,
+    /// Files being saved or saved, by id.
+    pub downloads: BTreeMap<i64, Download>,
+    /// A chat the window should show (after following a username).
+    pub goto: Option<Peer>,
 }
 
 impl Shared {
@@ -150,6 +232,11 @@ impl Shared {
             version: 1,
             tz: 0,
             open: None,
+            found: Vec::new(),
+            found_for: String::new(),
+            photos: BTreeMap::new(),
+            downloads: BTreeMap::new(),
+            goto: None,
         }
     }
 
@@ -157,8 +244,12 @@ impl Shared {
         self.version += 1;
     }
 
+    /// A chat in the list, or one found by search.
     pub fn chat(&self, peer: Peer) -> Option<&Chat> {
-        self.chats.iter().find(|c| c.peer == peer)
+        self.chats
+            .iter()
+            .chain(self.found.iter())
+            .find(|c| c.peer == peer)
     }
 }
 
