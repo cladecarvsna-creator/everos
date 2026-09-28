@@ -4,7 +4,11 @@
 //! The stack lives in one global. The desktop's main loop polls it, and
 //! blocking calls (connect, read, write) poll it while they wait.
 
+pub mod config;
 pub mod e1000;
+pub mod proxy;
+pub mod wifi;
+pub mod wpa;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -17,6 +21,8 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{
     DnsQueryType, EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr,
 };
+
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::interrupts;
 use crate::sync::IrqMutex;
@@ -39,6 +45,36 @@ struct Stack {
 }
 
 static STACK: IrqMutex<Option<Stack>> = IrqMutex::new(None);
+
+/// No packets in or out: the virtual Wi-Fi adapter (wifi.rs) has not
+/// joined a network.
+static BLOCKED: AtomicBool = AtomicBool::new(false);
+
+/// Stop or start traffic. Starting asks DHCP for an address again, as
+/// on joining a new network.
+pub fn set_blocked(blocked: bool) {
+    if BLOCKED.swap(blocked, Ordering::Relaxed) == blocked {
+        return;
+    }
+    let mut guard = STACK.lock();
+    let Some(s) = guard.as_mut() else {
+        return;
+    };
+    s.configured = false;
+    s.iface.update_ip_addrs(|addrs| addrs.clear());
+    s.iface.routes_mut().remove_default_ipv4_route();
+    s.sockets.get_mut::<dhcpv4::Socket>(s.dhcp).reset();
+    s.started = interrupts::ticks();
+}
+
+pub fn blocked() -> bool {
+    BLOCKED.load(Ordering::Relaxed)
+}
+
+/// The wired card's MAC address.
+pub fn mac() -> Option<[u8; 6]> {
+    STACK.lock().as_ref().map(|s| s.nic.mac)
+}
 
 pub fn now() -> Instant {
     Instant::from_millis((interrupts::ticks() * 1000 / interrupts::TIMER_HZ) as i64)
@@ -75,6 +111,7 @@ pub fn init() -> Option<[u8; 6]> {
         started: interrupts::ticks(),
         next_port: 49152 + (rdtsc() % 8192) as u16,
     });
+    wifi::init();
     Some(mac)
 }
 
@@ -109,6 +146,9 @@ pub fn poll() {
 
 impl Stack {
     fn poll(&mut self) {
+        if blocked() {
+            return;
+        }
         self.iface.poll(now(), &mut self.nic, &mut self.sockets);
         let event = self.sockets.get_mut::<dhcpv4::Socket>(self.dhcp).poll();
         match event {
@@ -258,7 +298,7 @@ fn lookup(host: &str) -> Result<Ipv4Address, String> {
     })
 }
 
-fn parse_ipv4(s: &str) -> Option<Ipv4Address> {
+pub(crate) fn parse_ipv4(s: &str) -> Option<Ipv4Address> {
     let mut parts = [0u8; 4];
     let mut n = 0;
     for part in s.split('.') {

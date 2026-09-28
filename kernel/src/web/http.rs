@@ -20,7 +20,9 @@ use rand_core::{CryptoRng, RngCore};
 use sha2::{Digest, Sha256};
 
 use super::url::Url;
-use crate::net::{self, TcpStream};
+use crate::net::config::{Proxy, ProxyKind};
+use crate::net::proxy::{self, Route};
+use crate::net::TcpStream;
 
 const MAX_BODY: usize = 8 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 8;
@@ -156,8 +158,11 @@ impl Drop for TlsLink {
 
 impl Link {
     fn open(url: &Url) -> Result<Link, String> {
-        let ip = net::resolve(&url.host)?;
-        let stream = TcpStream::connect(ip, url.port)?;
+        let stream = match (forward_proxy(url), url.https) {
+            // plain pages go to an HTTP proxy as whole URLs
+            (Some(p), false) => proxy::connect_to_proxy(&p)?,
+            _ => proxy::connect(&url.host, url.port)?,
+        };
         if !url.https {
             return Ok(Link::Plain(stream));
         }
@@ -223,13 +228,34 @@ const POOL_MAX: usize = 8;
 /// Servers drop idle connections; do not reuse ones older than this.
 const POOL_IDLE_SECS: u64 = 20;
 
+/// The HTTP proxy that plain `http://` requests for `url` go to as
+/// whole URLs, if there is one.
+fn forward_proxy(url: &Url) -> Option<Proxy> {
+    match proxy::route(&url.host) {
+        Route::Via(p) if p.kind == ProxyKind::Http && !url.https => Some(p),
+        _ => None,
+    }
+}
+
 fn pool_key(url: &Url) -> String {
+    // connections made through a proxy are only reused through the same one
+    let via = match proxy::route(&url.host) {
+        Route::Direct => String::new(),
+        Route::Via(p) => format!("{}://{}:{}/", p.kind.name(), p.host, p.port),
+    };
     format!(
-        "{}{}:{}",
+        "{}{}{}:{}",
+        via,
         if url.https { "s:" } else { "" },
         url.host,
         url.port
     )
+}
+
+/// Close every kept connection, as when the proxy changes.
+pub fn clear_pool() {
+    let old = core::mem::take(&mut *POOL.lock());
+    drop(old);
 }
 
 fn pool_take(key: &str) -> Option<Link> {
@@ -275,12 +301,20 @@ fn fetch_raw(method: &str, url: &Url, body: Option<(&str, &[u8])>) -> Result<Vec
     } else {
         format!("{}:{}", url.host, url.port)
     };
+    let via = forward_proxy(url);
+    let target = match &via {
+        Some(_) => url.to_string(),
+        None => url.path.clone(),
+    };
     let mut request = format!(
         "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0 (EverOS; x86_64) EverBrowser/0.3\r\n\
          Accept: text/html,application/xhtml+xml,*/*;q=0.8\r\nAccept-Language: ru,en;q=0.8\r\n\
          Accept-Encoding: identity\r\nConnection: keep-alive\r\n",
-        method, url.path, host
+        method, target, host
     );
+    if let Some(a) = via.as_ref().and_then(proxy::auth_header) {
+        request.push_str(&a);
+    }
     let cookie = cookies(&url.host);
     if !cookie.is_empty() {
         request.push_str(&format!("Cookie: {}\r\n", cookie));

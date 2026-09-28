@@ -81,3 +81,35 @@ pub fn find(ids: &[(u16, u16)]) -> Option<Device> {
     }
     None
 }
+
+/// Every device: its address, vendor and device ids, and class code
+/// (class, subclass).
+pub fn all() -> alloc::vec::Vec<(Device, u16, u16, (u8, u8))> {
+    let mut out = alloc::vec::Vec::new();
+    for bus in 0..=255u8 {
+        for slot in 0..32u8 {
+            for function in 0..8u8 {
+                let dev = Device {
+                    bus,
+                    slot,
+                    function,
+                };
+                let id = dev.read(0);
+                if id & 0xffff == 0xffff {
+                    if function == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                let class = dev.read(8);
+                out.push((
+                    dev,
+                    id as u16,
+                    (id >> 16) as u16,
+                    ((class >> 24) as u8, (class >> 16) as u8),
+                ));
+            }
+        }
+    }
+    out
+}
