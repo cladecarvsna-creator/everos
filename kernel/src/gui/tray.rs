@@ -12,6 +12,7 @@ use super::canvas::{mix, Canvas, Color, Rect};
 use super::text::{UI, UI_BOLD};
 use super::theme;
 use crate::keyboard::Layout;
+use crate::net::wifi::{self, State as WifiState};
 use crate::{net, rtc, StackString};
 
 pub const QUICK_W: i32 = 360;
@@ -20,16 +21,33 @@ pub const CALENDAR_W: i32 = 336;
 pub const CALENDAR_H: i32 = 376;
 pub const MIN_BRIGHTNESS: i32 = 20;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Net {
     NoCard,
     NoCable,
     Connecting,
     Online,
+    /// On a Wi-Fi network, with 1 to 4 bars.
+    Wifi(u8),
+    WifiConnecting,
+    /// Wi-Fi on, but not on a network.
+    WifiNone,
+    WifiOff,
 }
 
 impl Net {
     pub fn now() -> Self {
+        if let Some(state) = wifi::state() {
+            return match state {
+                WifiState::Off => Net::WifiOff,
+                WifiState::Disconnected | WifiState::Failed(..) => Net::WifiNone,
+                WifiState::Connecting(_) => Net::WifiConnecting,
+                WifiState::Connected { signal, .. } if net::configured() => {
+                    Net::Wifi(wifi::bars(signal))
+                }
+                WifiState::Connected { .. } => Net::WifiConnecting,
+            };
+        }
         match net::link() {
             None => Net::NoCard,
             Some(false) => Net::NoCable,
@@ -38,12 +56,21 @@ impl Net {
         }
     }
 
+    pub fn is_wifi(self) -> bool {
+        matches!(
+            self,
+            Net::Wifi(_) | Net::WifiConnecting | Net::WifiNone | Net::WifiOff
+        )
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Net::NoCard => "No network adapter",
             Net::NoCable => "Cable unplugged",
-            Net::Connecting => "Connecting...",
-            Net::Online => "Connected",
+            Net::Connecting | Net::WifiConnecting => "Connecting...",
+            Net::Online | Net::Wifi(_) => "Connected",
+            Net::WifiNone => "Not connected",
+            Net::WifiOff => "Wi-Fi is off",
         }
     }
 }
@@ -51,6 +78,8 @@ impl Net {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
     Quick,
+    /// The list of Wi-Fi networks, opened from the Wi-Fi tile.
+    Wifi,
     Calendar,
     /// The icons behind the ^ button.
     Hidden,
@@ -64,6 +93,7 @@ impl Panel {
     pub fn size(self) -> (i32, i32) {
         match self {
             Panel::Quick => (QUICK_W, QUICK_H),
+            Panel::Wifi => (QUICK_W, super::wifipanel::HEIGHT),
             Panel::Calendar => (CALENDAR_W, CALENDAR_H),
             Panel::Hidden => (HIDDEN_ICONS * HIDDEN_CELL + 16, HIDDEN_CELL + 16),
         }
@@ -85,6 +115,8 @@ pub enum Slider {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     NetworkTile,
+    /// The arrow on the Wi-Fi tile, which opens the list of networks.
+    WifiArrow,
     LayoutTile,
     Slider(Slider),
 }
@@ -96,6 +128,9 @@ pub struct Tray {
     pub brightness: i32,
     pub net: Net,
     pub address: StackString<20>,
+    /// The Wi-Fi network joined, if any.
+    pub ssid: StackString<40>,
+    pub wifi: super::wifipanel::WifiPanel,
 }
 
 impl Tray {
@@ -105,6 +140,8 @@ impl Tray {
             brightness: 100,
             net: Net::NoCard,
             address: StackString::new(),
+            ssid: StackString::new(),
+            wifi: super::wifipanel::WifiPanel::new(),
         }
     }
 
@@ -112,12 +149,19 @@ impl Tray {
     pub fn update_net(&mut self) -> bool {
         let net = Net::now();
         let mut address = StackString::<20>::new();
-        if net == Net::Online {
+        if matches!(net, Net::Online | Net::Wifi(_)) {
             address.push_str(&net::address().unwrap_or_default());
         }
-        let changed = net != self.net || address.as_str() != self.address.as_str();
+        let mut ssid = StackString::<40>::new();
+        if let Some(WifiState::Connected { ssid: name, .. }) = wifi::state() {
+            ssid.push_str(&name);
+        }
+        let changed = net != self.net
+            || address.as_str() != self.address.as_str()
+            || ssid.as_str() != self.ssid.as_str();
         self.net = net;
         self.address = address;
+        self.ssid = ssid;
         changed
     }
 
@@ -139,7 +183,16 @@ impl Tray {
         Rect::new(p.x, p.bottom() - 52, p.w, 52)
     }
 
+    /// The right part of the Wi-Fi tile, with the arrow to the list.
+    fn arrow(p: Rect) -> Rect {
+        let t = Self::tile(p, 0);
+        Rect::new(t.right() - 30, t.y, 30, t.h)
+    }
+
     pub fn target_at(&self, p: Rect, x: i32, y: i32) -> Option<Target> {
+        if self.net.is_wifi() && Self::arrow(p).contains(x, y) {
+            return Some(Target::WifiArrow);
+        }
         let targets = [
             (Target::NetworkTile, Self::tile(p, 0)),
             (Target::LayoutTile, Self::tile(p, 1)),
@@ -185,9 +238,22 @@ impl Tray {
 
     pub fn draw_quick(&self, c: &mut Canvas, p: Rect, layout: Layout, hover: Option<Target>) {
         Self::panel_face(c, p);
-        let online = self.net == Net::Online;
+        let online = matches!(self.net, Net::Online | Net::Wifi(_));
+        let wifi = self.net.is_wifi();
+        let net_label = if !wifi {
+            "Ethernet"
+        } else if self.ssid.as_str().is_empty() {
+            "Wi-Fi"
+        } else {
+            self.ssid.as_str()
+        };
+        let net_on = if wifi {
+            self.net != Net::WifiOff
+        } else {
+            online
+        };
         let tiles = [
-            (Target::NetworkTile, online, "Ethernet"),
+            (Target::NetworkTile, net_on, net_label),
             (Target::LayoutTile, true, "Keyboard"),
         ];
         for (i, (t, on, label)) in tiles.into_iter().enumerate() {
@@ -214,12 +280,32 @@ impl Tray {
             }
             let (cx, cy) = (r.x + r.w / 2, r.y + r.h / 2);
             match t {
+                Target::NetworkTile if wifi => {
+                    // the icon on the left part, an arrow on the right one
+                    let a = Self::arrow(p);
+                    let lit_arrow = hover == Some(Target::WifiArrow);
+                    if lit_arrow {
+                        let mut m = c.sub(Rect::new(0, 0, c.width, c.height));
+                        m.clip_round(r, 5);
+                        m.fill(a, mix(face, ink, 30));
+                    }
+                    c.fill_rect(a.x, a.y + 8, 1, a.h - 16, mix(face, ink, 60));
+                    let (ax, ay) = (a.x + a.w / 2 - 2, a.y + a.h / 2);
+                    c.line(ax, ay - 4, ax + 4, ay, ink);
+                    c.line(ax + 4, ay, ax, ay + 4, ink);
+                    network_icon(c, r.x + (r.w - 30) / 2 - 8, cy - 8, self.net, ink, face);
+                }
                 Target::NetworkTile => network_icon(c, cx - 8, cy - 8, self.net, ink, face),
                 _ => c.text_centered_in(&UI_BOLD, r, layout_label(layout), ink),
             }
+            let mut label = alloc::string::String::from(label);
+            if UI.width(&label) > r.w + 12 {
+                while UI.width(&label) > r.w && label.pop().is_some() {}
+                label.push('…');
+            }
             c.text_centered(
                 Rect::new(r.x - 6, r.bottom() + 4, r.w + 12, 20),
-                label,
+                &label,
                 theme::text(),
             );
         }
@@ -277,8 +363,12 @@ impl Tray {
             theme::text(),
             theme::footer(),
         );
-        let mut status = StackString::<48>::new();
-        status.push_str(self.net.label());
+        let mut status = StackString::<80>::new();
+        if self.ssid.as_str().is_empty() {
+            status.push_str(self.net.label());
+        } else {
+            status.push_str(self.ssid.as_str());
+        }
         if !self.address.as_str().is_empty() {
             let _ = write!(status, " - {}", self.address.as_str());
         }
@@ -379,8 +469,54 @@ fn days_in_month(year: u16, month: u8) -> i32 {
 
 // ---- icons, 16x16 with the top left corner at (x, y) --------------------------
 
-/// A monitor with a cable; crossed out when there is no connection.
+/// A Wi-Fi fan: a dot and three arcs, the first `bars` of the four in
+/// `ink` and the rest faint.
+pub fn wifi_icon(c: &mut Canvas, x: i32, y: i32, bars: u8, ink: Color, bg: Color) {
+    let faint = mix(bg, ink, 70);
+    // centre of the fan, at the bottom middle; distances in quarter pixels
+    let (cx, cy) = (x * 4 + 32, y * 4 + 56);
+    for py in y..y + 16 {
+        for px in x..x + 16 {
+            let (dx, dy) = (px * 4 + 2 - cx, py * 4 + 2 - cy);
+            // only the upward quarter, 45 degrees each side
+            if dy > 0 || dx.abs() > -dy + 2 {
+                continue;
+            }
+            let d = libm::sqrtf((dx * dx + dy * dy) as f32) as i32;
+            let bar = match d {
+                0..=9 => 1,
+                20..=27 => 2,
+                36..=43 => 3,
+                52..=59 => 4,
+                _ => continue,
+            };
+            c.fill_rect(px, py, 1, 1, if bar <= bars { ink } else { faint });
+        }
+    }
+}
+
+/// A monitor with a cable, or the Wi-Fi fan; crossed out when there is
+/// no connection.
 pub fn network_icon(c: &mut Canvas, x: i32, y: i32, net: Net, ink: Color, bg: Color) {
+    match net {
+        Net::Wifi(bars) => return wifi_icon(c, x, y, bars, ink, bg),
+        Net::WifiConnecting => {
+            wifi_icon(c, x, y, 0, ink, bg);
+            for i in 0..3 {
+                c.fill_rect(x + 4 + i * 3, y + 13, 2, 2, ink);
+            }
+            return;
+        }
+        Net::WifiNone | Net::WifiOff => {
+            wifi_icon(c, x, y, 0, ink, bg);
+            let badge = Rect::new(x + 8, y + 6, 10, 10);
+            c.fill_round(badge, 5, bg);
+            c.line(x + 10, y + 8, x + 15, y + 13, ink);
+            c.line(x + 15, y + 8, x + 10, y + 13, ink);
+            return;
+        }
+        _ => {}
+    }
     c.outline_round(Rect::new(x + 1, y + 1, 14, 10), 2, ink);
     c.fill_rect(x + 7, y + 11, 2, 3, ink);
     c.fill_rect(x + 4, y + 14, 8, 1, ink);
@@ -391,7 +527,7 @@ pub fn network_icon(c: &mut Canvas, x: i32, y: i32, net: Net, ink: Color, bg: Co
                 c.fill_rect(x + 4 + i * 3, y + 6, 2, 2, ink);
             }
         }
-        Net::NoCard | Net::NoCable => {
+        _ => {
             // a small cross badge in the corner
             let badge = Rect::new(x + 8, y + 6, 10, 10);
             c.fill_round(badge, 5, bg);

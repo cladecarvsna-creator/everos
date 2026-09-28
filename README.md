@@ -167,6 +167,25 @@ EverOS — операционная система для x86_64 на ASM и Rus
   [Telethon](https://github.com/LonamiWebs/Telethon) с готовыми чатами: он
   печатает, что вписать в `telegram.conf`, код входа `22222` (или `12345`,
   тогда спросит пароль `everos`).
+- **Прокси**: Параметры > Proxy (или команда `proxy`). HTTP-прокси: сайты
+  по https:// и Telegram идут через туннель `CONNECT`, обычные http://
+  страницы отправляются прокси целым адресом. SOCKS5: всё идёт через прокси,
+  имена он ищет сам. Логин и пароль (Basic и RFC 1929), список адресов без
+  прокси (`localhost;127.*`, `*` значит что угодно), кнопка «Check proxy».
+  Настройки хранятся в `C:\$network.conf`. Для проверки есть
+  `scripts/test-proxy.py` (HTTP и SOCKS5 на одном порту).
+- **Wi‑Fi**: значок и кнопка Wi‑Fi в быстрых настройках, список сетей с
+  уровнем сигнала, ввод пароля, «Forget», повторное подключение к последней
+  сети после перезагрузки. WPA2-Personal написан полностью: ключ из пароля
+  (PBKDF2), 4-way handshake, групповой ключ (AES key wrap); `wifi selftest`
+  сверяет всё с ответами из стандартов. **Драйвера настоящего Wi‑Fi чипа пока
+  нет**: им нужна своя прошивка, а QEMU не эмулирует Wi‑Fi карту. Карта
+  Intel, Atheros, Realtek, Broadcom или MediaTek на шине PCI узнаётся и
+  показывается в Параметрах. Чтобы попробовать всё остальное, в Параметры >
+  Network & internet есть **виртуальный адаптер**: он «слышит» несколько
+  сетей (пароль от `EverOS-Home` — `everos2026`, `Cafe Free Wi-Fi` открыта),
+  при подключении идёт настоящий handshake с имитацией точки доступа, а
+  пакеты потом идут через кабельную карту e1000.
 - **Графика**: GRUB включает режим 1920x1080x32. Если GRUB не дал графику,
   ядро работает в текстовом режиме VGA 80x25 с одной оболочкой.
 - **Текст**: `print!`/`println!` с цветами, перенос строк, прокрутка, мигающий
@@ -179,7 +198,10 @@ EverOS — операционная система для x86_64 на ASM и Rus
   совпадает с курсором хоста и QEMU не нужно захватывать мышь. Иначе мышь PS/2
   с частотой 200 Гц: указатель, щелчки левой и правой кнопкой, перетаскивание.
 - **Оболочка**: команды `help`, `clear`, `echo`, `info`, `colors`, `paint`, `calc`,
-  `gfx`, `browser [адрес]`, `telegram` (`tg`; `telegram selftest` проверяет шифрование), `fetch <адрес>` (скачать страницу и показать её
+  `gfx`, `browser [адрес]`, `telegram` (`tg`; `telegram selftest` проверяет шифрование),
+  `wifi` (`scan`, `connect <сеть> [пароль]`, `disconnect`, `forget`, `on`, `off`,
+  `virtual on|off`, `selftest`), `proxy` (`http|socks5 <хост:порт> [логин пароль]`,
+  `off`, `bypass <список>`, `check`, `selftest`), `fetch <адрес>` (скачать страницу и показать её
   заголовок и ссылки), `exit` (закрыть окно терминала), `panic`,
   `whoami`, `users`, `useradd <имя> [пароль]` (только root),
   `passwd [<имя>] <пароль>`, `lock`, файлы: `ls` (`dir`), `cd`, `pwd`,
@@ -210,7 +232,8 @@ EverOS — операционная система для x86_64 на ASM и Rus
 | `kernel/src/keyboard.rs`, `ps2.rs`, `vmmouse.rs` | клавиатура, мышь PS/2 и абсолютная мышь VMware |
 | `kernel/src/shell.rs` | оболочка |
 | `kernel/src/heap.rs` | куча ядра (128 МиБ) для `Vec`, `String` и сети |
-| `kernel/src/pci.rs`, `kernel/src/net/` | шина PCI, драйвер e1000 (`e1000.rs`), TCP/IP, DHCP, DNS (`mod.rs`) |
+| `kernel/src/pci.rs`, `kernel/src/net/` | шина PCI, драйвер e1000 (`e1000.rs`), TCP/IP, DHCP, DNS (`mod.rs`), прокси (`proxy.rs`), Wi‑Fi (`wifi.rs`) и WPA2 (`wpa.rs`), настройки сети на диске (`config.rs`) |
+| `kernel/src/gui/wifipanel.rs` | список сетей Wi‑Fi в быстрых настройках |
 | `kernel/src/web/` | движок браузера: адреса (`url.rs`), HTTP и HTTPS (`http.rs`), DOM (`dom.rs`), CSS (`css.rs`, `style.rs`), раскладка (`layout.rs`), картинки (`image.rs`), страница и мост к JavaScript (`page.rs`, `runtime.js`) |
 | `kernel/src/js/`, `kernel/quickjs/` | движок JavaScript QuickJS (C, собирается clang из `kernel/build.rs`) и маленькая libc для него |
 | `kernel/src/gui/browser.rs` | окно браузера: вкладки, панель, адресная строка, страница, прокрутка |

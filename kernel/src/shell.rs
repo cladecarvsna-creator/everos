@@ -112,6 +112,12 @@ impl Shell {
                 println!("  browser open the web browser (browser <address> goes there)");
                 println!("  telegram open Telegram (telegram selftest checks its crypto)");
                 println!("  fetch   download a web page and show its title and links");
+                println!("  wifi    Wi-Fi: wifi [scan | connect <name> [password] | disconnect |");
+                println!("          forget <name> | on | off | virtual on|off | selftest]");
+                println!(
+                    "  proxy   proxy [http|socks5 <host:port> [user pass] | off | bypass <list> |"
+                );
+                println!("          check [host:port] | selftest]");
                 println!("  exit    close the terminal window");
                 println!("  whoami  show who is signed in; 'users' lists everyone");
                 println!("  useradd add a user: useradd <name> [password]");
@@ -207,6 +213,8 @@ impl Shell {
                 }
             }
             "fetch" => fetch(args.trim()),
+            "wifi" => wifi(args.trim()),
+            "proxy" => proxy(args.trim()),
             "js" => js(args.trim()),
             "whoami" => match users::current_name() {
                 Some(name) => println!("{}", name.as_str()),
@@ -488,4 +496,155 @@ fn js(source: &str) {
         "\njs: done in {} ms\n",
         crate::js::now_ms() - t0
     ));
+}
+
+fn wifi(args: &str) {
+    use crate::net::wifi::{self, Adapter, Security, State};
+    let (cmd, rest) = args.split_once(' ').unwrap_or((args, ""));
+    let rest = rest.trim();
+    match cmd {
+        "" | "status" => {
+            match wifi::adapter() {
+                Adapter::None => println!("Adapter: none"),
+                Adapter::Unsupported(name) => {
+                    println!("Adapter: {} (EverOS has no driver for it yet)", name)
+                }
+                Adapter::Virtual => println!("Adapter: virtual (for testing)"),
+            }
+            match wifi::state() {
+                None => println!("Wi-Fi can't be used. 'wifi virtual on' turns on the test adapter."),
+                Some(State::Off) => println!("Wi-Fi is off."),
+                Some(State::Disconnected) => println!("Not connected."),
+                Some(State::Connecting(s)) => println!("Connecting to {}...", s),
+                Some(State::Connected { ssid, signal }) => {
+                    let ip = crate::net::address().unwrap_or_else(|| String::from("no address yet"));
+                    println!("Connected to {}, signal {}%, {}", ssid, signal, ip)
+                }
+                Some(State::Failed(s, why)) => println!("Could not connect to {}: {}", s, why),
+            }
+        }
+        "scan" | "list" => {
+            let nets = wifi::networks();
+            if nets.is_empty() {
+                println!("No networks found.");
+            }
+            for n in nets {
+                let lock = if n.security == Security::Wpa2 { "WPA2" } else { "open" };
+                let saved = if n.saved { "  saved" } else { "" };
+                println!("  {:3}%  {:5} {}{}", n.signal, lock, n.ssid, saved);
+            }
+        }
+        "connect" | "join" => {
+            // the name may have spaces: the password is the last word if
+            // the whole text isn't a network name
+            let names: alloc::vec::Vec<String> = wifi::networks().into_iter().map(|n| n.ssid).collect();
+            let (ssid, pass) = if names.iter().any(|n| n == rest) {
+                (rest, None)
+            } else {
+                match rest.rsplit_once(' ') {
+                    Some((s, p)) => (s.trim(), Some(p)),
+                    None => (rest, None),
+                }
+            };
+            match wifi::connect(ssid, pass) {
+                Ok(()) => println!("Connecting to {}... ('wifi' shows how it went)", ssid),
+                Err(e) => println!("{}", e),
+            }
+        }
+        "disconnect" => wifi::disconnect(),
+        "forget" => wifi::forget(rest),
+        "on" => wifi::set_on(true),
+        "off" => wifi::set_on(false),
+        "virtual" => match rest {
+            "on" => {
+                wifi::set_virtual(true);
+                println!("The virtual Wi-Fi adapter is on. 'wifi scan' lists its networks.");
+            }
+            "off" => {
+                wifi::set_virtual(false);
+                println!("The virtual Wi-Fi adapter is off; the cable works as before.");
+            }
+            _ => println!("wifi virtual on | off"),
+        },
+        "selftest" => match crate::net::wpa::selftest() {
+            Ok(()) => {
+                println!("WPA2 self-test passed.");
+                crate::serial::write_str("\nwifi: self-test ok\n");
+            }
+            Err(what) => {
+                println!("WPA2 self-test failed: {}", what);
+                crate::serial::write_str("\nwifi: self-test FAILED\n");
+            }
+        },
+        _ => println!("wifi [scan | connect <name> [password] | disconnect | forget <name> | on | off | virtual on|off | selftest]"),
+    }
+}
+
+fn proxy(args: &str) {
+    use crate::net::config::{self, ProxyKind};
+    use crate::net::proxy;
+    let words: alloc::vec::Vec<&str> = args.split_whitespace().collect();
+    let host_port = |s: &str| -> Option<(String, u16)> {
+        let (h, p) = s.rsplit_once(':')?;
+        Some((String::from(h), p.parse().ok()?))
+    };
+    match words.as_slice() {
+        [] => {
+            let p = config::get().proxy;
+            if p.kind == ProxyKind::Off || p.host.is_empty() {
+                println!("No proxy: connections go directly.");
+            } else {
+                let login = if p.user.is_empty() { "" } else { " with a login" };
+                println!("Proxy: {} {}:{}{}", p.kind.name(), p.host, p.port, login);
+                println!("Not used for: {}", p.bypass);
+            }
+        }
+        ["off"] => {
+            config::update(|c| c.proxy.kind = ProxyKind::Off);
+            crate::web::http::clear_pool();
+            println!("Proxy off.");
+        }
+        [kind @ ("http" | "socks5" | "socks"), addr, login @ ..] => {
+            let Some((host, port)) = host_port(addr) else {
+                println!("Give the proxy as host:port, like 10.0.2.2:3128");
+                return;
+            };
+            let kind = ProxyKind::parse(kind).unwrap();
+            config::update(|c| {
+                c.proxy.kind = kind;
+                c.proxy.host = host.clone();
+                c.proxy.port = port;
+                c.proxy.user = String::from(*login.first().unwrap_or(&""));
+                c.proxy.pass = String::from(*login.get(1).unwrap_or(&""));
+            });
+            crate::web::http::clear_pool();
+            println!("Proxy: {} {}:{}", kind.name(), host, port);
+        }
+        ["bypass", list @ ..] => {
+            let list = list.join(" ");
+            config::update(|c| c.proxy.bypass = list.clone());
+            crate::web::http::clear_pool();
+            println!("Not used for: {}", list);
+        }
+        ["check", target @ ..] => {
+            let (host, port) = target
+                .first()
+                .and_then(|t| host_port(t))
+                .unwrap_or((String::from("example.com"), 443));
+            match proxy::check(&config::get().proxy, &host, port) {
+                Ok(()) => println!("The proxy opened a connection to {}:{}.", host, port),
+                Err(e) => println!("{}", e),
+            }
+        }
+        ["selftest"] => {
+            if proxy::selftest() {
+                println!("Proxy self-test passed.");
+                crate::serial::write_str("\nproxy: self-test ok\n");
+            } else {
+                println!("Proxy self-test failed.");
+                crate::serial::write_str("\nproxy: self-test FAILED\n");
+            }
+        }
+        _ => println!("proxy [http|socks5 <host:port> [user pass] | off | bypass <list> | check [host:port] | selftest]"),
+    }
 }

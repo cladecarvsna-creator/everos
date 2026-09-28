@@ -43,6 +43,8 @@ pub struct TextField {
     pub anchor: usize,
     /// How far the text is scrolled to the left, in pixels.
     scroll: i32,
+    /// A password box: shows dots and does not copy.
+    pub masked: bool,
 }
 
 impl TextField {
@@ -54,6 +56,23 @@ impl TextField {
             cursor: n,
             anchor: n,
             scroll: 0,
+            masked: false,
+        }
+    }
+
+    /// An empty password box.
+    pub fn password() -> Self {
+        Self {
+            masked: true,
+            ..Self::new("")
+        }
+    }
+
+    fn shown(&self, c: char) -> char {
+        if self.masked {
+            '•'
+        } else {
+            c
         }
     }
 
@@ -62,7 +81,9 @@ impl TextField {
     }
 
     pub fn set(&mut self, text: &str) {
+        let masked = self.masked;
         *self = Self::new(text);
+        self.masked = masked;
     }
 
     pub fn select_all(&mut self) {
@@ -146,6 +167,7 @@ impl TextField {
             Key::Home => self.move_to(0),
             Key::End => self.move_to(self.text.len()),
             Key::Ctrl('a') => self.select_all(),
+            Key::Ctrl('c') | Key::Ctrl('x') if self.masked => return FieldEvent::None,
             Key::Ctrl('c') | Key::Ctrl('x') => {
                 let (a, b) = self.range();
                 if a < b {
@@ -172,7 +194,7 @@ impl TextField {
         let mut pen = 0;
         let mut pos = self.text.len();
         for (i, &c) in self.text.iter().enumerate() {
-            let w = (UI.advance16(c) as i32 + 8) / 16;
+            let w = (UI.advance16(self.shown(c)) as i32 + 8) / 16;
             if pen + w / 2 > target {
                 pos = i;
                 break;
@@ -186,7 +208,10 @@ impl TextField {
     }
 
     fn width_to(&self, n: usize) -> i32 {
-        let s: i32 = self.text[..n].iter().map(|&c| UI.advance16(c) as i32).sum();
+        let s: i32 = self.text[..n]
+            .iter()
+            .map(|&c| UI.advance16(self.shown(c)) as i32)
+            .sum();
         (s + 8) / 16
     }
 
@@ -218,7 +243,7 @@ impl TextField {
                 theme::selection(),
             );
         }
-        let s: String = self.text.iter().collect();
+        let s: String = self.text.iter().map(|&c| self.shown(c)).collect();
         t.draw_text(x0, y, &s, theme::text());
         if focused && caret {
             t.fill_rect(x0 + caret_x, y, 1, UI.line_height, theme::text());

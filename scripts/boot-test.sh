@@ -5,6 +5,8 @@
 # the terminal window ran them.
 # A small web server on the host checks the network card, TCP/IP and
 # HTTP: the guest reaches the host at 10.0.2.2 through QEMU's user network.
+# A small proxy server (scripts/test-proxy.py) checks that pages load
+# through HTTP and SOCKS5 proxies.
 # The disc starts the installer. First "Try EverOS" runs it from the
 # disc: a blank disk image checks the disk driver and FAT32 (EverOS
 # formats it, the shell writes a file, and after starting QEMU again the
@@ -20,7 +22,7 @@ log="$dir/serial.log"
 monitor="$dir/monitor.sock"
 disk="$dir/disk.img"
 qemu=""
-trap 'kill $qemu "$web" 2> /dev/null; rm -rf "$dir"' EXIT
+trap 'kill $qemu "$web" "$proxy" 2> /dev/null; rm -rf "$dir"' EXIT
 truncate -s 64M "$disk"
 
 mkdir "$dir/www"
@@ -28,6 +30,8 @@ echo '<html><head><title>EverOS test page</title></head><body><h1>It works</h1><
     > "$dir/www/index.html"
 python3 -m http.server 8123 --bind 127.0.0.1 --directory "$dir/www" > /dev/null 2>&1 &
 web=$!
+python3 "$(dirname "$0")/test-proxy.py" 8124 > "$dir/proxy.log" 2>&1 &
+proxy=$!
 
 # start QEMU with the disk and the disc, or from the disk alone when $1
 # is "disk"; the serial log starts empty
@@ -126,9 +130,37 @@ type_keys t e l e g r a m spc s e l f t e s t ret
 wait_for "telegram: self-test ok" || fail "the Telegram self-test failed"
 echo "telegram cryptography works"
 
+# WPA2: known answers, and a whole 4-way handshake
+type_keys w i f i spc s e l f t e s t ret
+wait_for "wifi: self-test ok" || fail "the WPA2 self-test failed"
+echo "WPA2 cryptography works"
+
 type_keys f e t c h spc 1 0 dot 0 dot 2 dot 2 shift-semicolon 8 1 2 3 slash ret
 wait_for 'fetch: "EverOS test page"' || fail "the network test page did not load"
 echo "network and HTTP work"
+
+# the same page through the proxy on the host: as a whole URL through
+# the HTTP proxy, then a tunnel through SOCKS5. The proxy runs on the
+# host, so the page is asked for at the host's own 127.0.0.1.
+proxy_seen() {
+    for _ in $(seq 1 30); do
+        grep -q "$1" "$dir/proxy.log" && return 0
+        sleep 0.5
+    done
+    return 1
+}
+type_keys p r o x y spc s e l f t e s t ret
+wait_for "proxy: self-test ok" || fail "the proxy self-test failed"
+type_keys p r o x y spc h t t p spc 1 0 dot 0 dot 2 dot 2 shift-semicolon 8 1 2 4 ret
+type_keys p r o x y spc b y p a s s ret
+type_keys f e t c h spc 1 2 7 dot 0 dot 0 dot 1 shift-semicolon 8 1 2 3 slash ret
+proxy_seen "http: GET http://127.0.0.1:8123/" || fail "the page did not go through the HTTP proxy"
+echo "HTTP proxy works"
+type_keys p r o x y spc s o c k s 5 spc 1 0 dot 0 dot 2 dot 2 shift-semicolon 8 1 2 4 ret
+type_keys f e t c h spc 1 2 7 dot 0 dot 0 dot 1 shift-semicolon 8 1 2 3 slash ret
+proxy_seen "socks5: CONNECT 127.0.0.1:8123" || fail "the page did not go through the SOCKS5 proxy"
+echo "SOCKS5 proxy works"
+type_keys p r o x y spc o f f ret
 
 # the browser loads pages on a fiber, in the background
 type_keys b r o w s e r spc 1 0 dot 0 dot 2 dot 2 shift-semicolon 8 1 2 3 slash ret
