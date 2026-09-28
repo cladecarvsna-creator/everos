@@ -5,10 +5,12 @@ without a real account (and in places Telegram can't be reached).
 It speaks real MTProto 2.0 over TCP: the key exchange (with its own RSA
 key instead of Telegram's), encrypted messages, containers, gzip, salts,
 and just enough of the API: sign-in with a code and a two-step
-verification password, users, a chat list, history, sending, and an
-answer pushed back a moment after you write.
+verification password, users, a chat list, history, sending, an
+answer pushed back a moment after you write, photos (one kept in another
+data centre), files to save, links and emoji, usernames, searching and
+a public channel to read and join.
 
-    python3 -m venv /tmp/tgvenv && /tmp/tgvenv/bin/pip install telethon
+    python3 -m venv /tmp/tgvenv && /tmp/tgvenv/bin/pip install telethon pillow
     /tmp/tgvenv/bin/python scripts/tg-test-server.py --conf telegram.conf
 
 It prints the telegram.conf lines that point EverOS at it (QEMU's user
@@ -20,8 +22,10 @@ the code 22222 (or 12345 to be asked for the password "everos").
 import argparse
 import gzip
 import hashlib
+import io
 import os
 import random
+import re
 import socketserver
 import struct
 import threading
@@ -47,13 +51,64 @@ G = 3
 PASSWORD = "everos"
 ME = 1000
 USERS = {
-    ME: ("Jack", "", False),
-    1001: ("Алиса", "Смирнова", False),
-    1002: ("Bob", "", False),
-    1003: ("EverBot", "", True),
+    ME: ("Jack", "", False, "jack"),
+    1001: ("Алиса", "Смирнова", False, "alice_s"),
+    1002: ("Bob", "", False, "bob_builder"),
+    1003: ("EverBot", "", True, "everos_bot"),
 }
 GROUP = 2001
 CHANNEL = 3001
+PUBLIC = 3002  # a channel we are not in, found by search
+HOME_DC = 2
+PHOTOS = {}  # id -> (jpeg bytes, data centre)
+DOCS = {}  # id -> bytes
+
+
+def make_jpeg(w, h, seed):
+    """A picture to send: stripes of colour with circles."""
+    from PIL import Image, ImageDraw
+    rnd = random.Random(seed)
+    im = Image.new("RGB", (w, h))
+    d = ImageDraw.Draw(im)
+    for y in range(h):
+        t = y / h
+        d.line([(0, y), (w, y)], fill=(int(40 + 180 * t), int(120 + 60 * (1 - t)), int(200 - 120 * t)))
+    for _ in range(12):
+        x, y, r = rnd.randrange(w), rnd.randrange(h), rnd.randrange(10, 60)
+        d.ellipse([x - r, y - r, x + r, y + r], fill=(rnd.randrange(256), rnd.randrange(256), rnd.randrange(256)))
+    d.text((20, 20), "EverOS test photo %d" % seed, fill=(255, 255, 255))
+    out = io.BytesIO()
+    im.save(out, "JPEG", quality=85)
+    return out.getvalue()
+
+
+def photo(pid, w, h, dc=HOME_DC):
+    PHOTOS[pid] = (make_jpeg(w, h, pid), dc)
+    return types.MessageMediaPhoto(photo=types.Photo(
+        id=pid, access_hash=pid * 3, file_reference=b"ref", date=0, dc_id=dc,
+        sizes=[types.PhotoSize(type="m", w=w // 4, h=h // 4, size=1000),
+               types.PhotoSize(type="x", w=w, h=h, size=len(PHOTOS[pid][0]))]))
+
+
+def document(did, name, data, mime):
+    DOCS[did] = data
+    return types.MessageMediaDocument(document=types.Document(
+        id=did, access_hash=did * 5, file_reference=b"ref", date=0, mime_type=mime, size=len(data),
+        dc_id=HOME_DC, attributes=[types.DocumentAttributeFilename(file_name=name)]))
+
+
+def utf16_len(s):
+    return len(s.encode("utf-16-le")) // 2
+
+
+def entities(text):
+    """Links and @usernames in a text, as Telegram marks them."""
+    out = []
+    for m in re.finditer(r"https?://\S+|@[A-Za-z0-9_]{4,}", text):
+        off, length = utf16_len(text[:m.start()]), utf16_len(m.group())
+        cls = types.MessageEntityMention if m.group().startswith("@") else types.MessageEntityUrl
+        out.append(cls(offset=off, length=length))
+    return out
 
 
 def sha1(*p):
@@ -115,13 +170,29 @@ class World:
         self.add(("user", 1003), 1003, "I am a bot. Write me anything and I will answer.", now - 300)
         self.add(("chat", GROUP), 1001, "Welcome to the EverOS group!", now - 5000)
         self.add(("chat", GROUP), 1002, "A long message that has to wrap over several lines, because it is much wider than a bubble can be in the Telegram window of EverOS.", now - 4000)
-        self.add(("channel", CHANNEL), None, "EverOS now has a Telegram client.", now - 3000, media=True)
+        self.add(("channel", CHANNEL), None, "EverOS now has a Telegram client.", now - 3000,
+                 media=photo(501, 800, 500))
+        self.add(("channel", CHANNEL), None, "Release notes are in the attached file. Questions go to @everos_bot.",
+                 now - 2900, media=document(601, "release-notes.txt",
+                                            ("EverOS release notes\r\n" + "Telegram: photos, files, emoji.\r\n" * 40)
+                                            .encode(), "text/plain"))
         self.add(("user", ME), ME, "Notes to self", now - 100000)
+        self.add(a, 1001, "Смотри, какое фото! Кстати, мой ник @alice_s 😀🎉🇷🇺 ❤️", now - 6000,
+                 media=photo(502, 640, 900, dc=4))
+        self.add(a, 1001, "А это большой файл, чтобы проверить загрузку по частям.", now - 5900,
+                 media=document(602, "big file.bin", bytes(random.Random(1).randrange(256) for _ in range(1_300_000)),
+                                "application/octet-stream"))
+        self.add(a, 1001, "Сайт: http://10.0.2.2:8123/ и канал https://t.me/rustweekly 👍", now - 5800)
+        p = ("channel", PUBLIC)
+        self.add(p, None, "Welcome to Rust Weekly! 🦀 News about Rust every week.", now - 80000)
+        self.add(p, None, "Rust 1.99 is out 🎉 Read more: http://10.0.2.2:8123/", now - 40000, media=photo(503, 900, 600))
+        self.add(p, None, "Crate of the week: smoltcp. Discuss in @everos_devs_chat or with @bob_builder.", now - 1000)
+        self.joined = {CHANNEL}
         self.unread = {a: 1, ("user", 1003): 1}
         self.read_out = {a: 0}
         self.pending = []  # (when, peer, from, text)
 
-    def add(self, peer, from_id, text, date, media=False, out_for_me=None):
+    def add(self, peer, from_id, text, date, media=None, out_for_me=None):
         self.next_id += 1
         kind, pid = peer
         peer_obj = {"user": types.PeerUser, "chat": types.PeerChat, "channel": types.PeerChannel}[kind](pid)
@@ -132,24 +203,43 @@ class World:
             message=text,
             out=(from_id == ME),
             from_id=types.PeerUser(from_id) if from_id and kind != "user" else None,
-            media=types.MessageMediaPhoto(photo=types.PhotoEmpty(1)) if media else None,
+            media=media,
+            entities=entities(text) or None,
         )
         self.history.setdefault(peer, []).append(m)
         return m
 
     def users(self):
         out = []
-        for uid, (first, last, bot) in USERS.items():
+        for uid, (first, last, bot, username) in USERS.items():
             out.append(types.User(id=uid, is_self=uid == ME, bot=bot or None, bot_info_version=1 if bot else None,
-                                  access_hash=uid * 7,
+                                  access_hash=uid * 7, username=username,
                                   first_name=first, last_name=last or None, phone="99966" + str(uid)))
         return out
 
     def chats(self):
         return [
             types.Chat(id=GROUP, title="EverOS devs", photo=types.ChatPhotoEmpty(), participants_count=3, date=0, version=1),
-            types.Channel(id=CHANNEL, title="EverOS News", photo=types.ChatPhotoEmpty(), date=0, broadcast=True, access_hash=555),
+            types.Channel(id=CHANNEL, title="EverOS News", photo=types.ChatPhotoEmpty(), date=0, broadcast=True,
+                          access_hash=555, username="everos_news", left=CHANNEL not in self.joined,
+                          participants_count=42),
+            types.Channel(id=PUBLIC, title="Rust Weekly", photo=types.ChatPhotoEmpty(), date=0, broadcast=True,
+                          access_hash=777, username="rustweekly", left=PUBLIC not in self.joined,
+                          participants_count=12345),
         ]
+
+    def peer_obj(self, key):
+        return {"user": types.PeerUser, "chat": types.PeerChat, "channel": types.PeerChannel}[key[0]](key[1])
+
+    def by_username(self, name):
+        name = name.lower()
+        for uid, u in USERS.items():
+            if u[3] == name:
+                return ("user", uid)
+        for c in self.chats():
+            if getattr(c, "username", None) == name:
+                return ("channel", c.id)
+        return None
 
 
 WORLD = World()
@@ -185,16 +275,17 @@ class Keys:
         cls.path = path
         if os.path.exists(path):
             for line in open(path):
-                key, salt = line.split()
-                key = bytes.fromhex(key)
-                cls.keys[sha1(key)[12:20]] = [key, int(salt)]
+                parts = line.split()
+                key = bytes.fromhex(parts[0])
+                dc = int(parts[2]) if len(parts) > 2 else HOME_DC
+                cls.keys[sha1(key)[12:20]] = [key, int(parts[1]), dc]
 
     @classmethod
-    def add(cls, key, salt):
-        cls.keys[sha1(key)[12:20]] = [key, salt]
+    def add(cls, key, salt, dc):
+        cls.keys[sha1(key)[12:20]] = [key, salt, dc]
         if cls.path:
             with open(cls.path, "a") as f:
-                f.write("%s %d\n" % (key.hex(), salt))
+                f.write("%s %d %d\n" % (key.hex(), salt, dc))
 
 
 class Handler(socketserver.BaseRequestHandler):
@@ -274,6 +365,7 @@ class Handler(socketserver.BaseRequestHandler):
             inner = BinaryReader(padded).tgread_object()
             assert inner.p == ib(0x494C553B) and inner.q == ib(0x53911073), "p, q"
             log("key exchange: client DC", inner.dc)
+            self.new_dc = inner.dc
             self.new_nonce = inner.new_nonce.to_bytes(32, "little", signed=True)
             sn = self.server_nonce.to_bytes(16, "little", signed=True)
             self.a = random.getrandbits(2048)
@@ -296,7 +388,7 @@ class Handler(socketserver.BaseRequestHandler):
             h1 = sha1(self.new_nonce, b"\x01", aux)[4:20]
             sn = self.server_nonce.to_bytes(16, "little", signed=True)
             salt = struct.unpack("<q", bytes(a ^ b for a, b in zip(self.new_nonce[:8], sn[:8])))[0]
-            Keys.add(key, salt)
+            Keys.add(key, salt, self.new_dc)
             log("key exchange: done, key id", sha1(key)[12:20].hex())
             ans = types.DhGenOk(nonce=self.nonce, server_nonce=self.server_nonce,
                                 new_nonce_hash1=int.from_bytes(h1, "little", signed=True))
@@ -319,7 +411,7 @@ class Handler(socketserver.BaseRequestHandler):
             log("unknown key: -404")
             self.send_packet(struct.pack("<i", -404))
             return
-        self.key, salt = Keys.keys[key_id]
+        self.key, salt, self.dc = Keys.keys[key_id]
         msg_key = p[8:24]
         k, iv = self.keys_for(msg_key, 0)
         plain = AES.decrypt_ige(p[24:], k, iv)
@@ -455,6 +547,45 @@ class Handler(socketserver.BaseRequestHandler):
             return types.UpdateShortSentMessage(id=m.id, pts=1, pts_count=1, date=m.date, out=True)
         if n == "LogOutRequest":
             return types.auth.LoggedOut()
+        if n == "ExportAuthorizationRequest":
+            return types.auth.ExportedAuthorization(id=ME, bytes=b"export-%d" % obj.dc_id)
+        if n == "ImportAuthorizationRequest":
+            log("  signed in on DC", self.dc, "with an exported authorization")
+            return self.authorization()
+        if n == "GetFileRequest":
+            loc = obj.location
+            if isinstance(loc, types.InputPhotoFileLocation):
+                data, dc = PHOTOS[loc.id]
+                kind = types.storage.FileJpeg()
+            else:
+                data, dc = DOCS[loc.id], HOME_DC
+                kind = types.storage.FileUnknown()
+            if dc != self.dc:
+                raise RpcError(303, "FILE_MIGRATE_%d" % dc)
+            assert obj.limit % 4096 == 0 and obj.offset % 4096 == 0, "file part rules"
+            return types.upload.File(type=kind, mtime=0, bytes=data[obj.offset:obj.offset + obj.limit])
+        if n == "SearchRequest":
+            q = obj.q.lower().lstrip("@")
+            found = []
+            for uid, u in USERS.items():
+                if uid != ME and (q in u[3] or q in (u[0] + " " + u[1]).lower()):
+                    found.append(types.PeerUser(uid))
+            for c in WORLD.chats():
+                if q in c.title.lower() or q in (getattr(c, "username", None) or ""):
+                    found.append(types.PeerChannel(c.id) if isinstance(c, types.Channel) else types.PeerChat(c.id))
+            return types.contacts.Found(my_results=[], results=found, chats=WORLD.chats(), users=WORLD.users())
+        if n == "ResolveUsernameRequest":
+            key = WORLD.by_username(obj.username)
+            if key is None:
+                raise RpcError(400, "USERNAME_NOT_OCCUPIED")
+            return types.contacts.ResolvedPeer(peer=WORLD.peer_obj(key), chats=WORLD.chats(), users=WORLD.users())
+        if n in ("JoinChannelRequest", "LeaveChannelRequest"):
+            cid = obj.channel.channel_id
+            if n == "JoinChannelRequest":
+                WORLD.joined.add(cid)
+            else:
+                WORLD.joined.discard(cid)
+            return types.Updates(updates=[], users=[], chats=WORLD.chats(), date=int(time.time()), seq=0)
         raise RpcError(400, "METHOD_NOT_IN_TEST_SERVER")
 
     def authorization(self):
@@ -466,6 +597,8 @@ class Handler(socketserver.BaseRequestHandler):
         dialogs, tops = [], []
         order = sorted(WORLD.history.items(), key=lambda kv: -kv[1][-1].date)
         for key, msgs in order:
+            if key[0] == "channel" and key[1] not in WORLD.joined:
+                continue
             peer = {"user": types.PeerUser, "chat": types.PeerChat, "channel": types.PeerChannel}[key[0]](key[1])
             dialogs.append(types.Dialog(peer=peer, top_message=msgs[-1].id, read_inbox_max_id=0,
                                         read_outbox_max_id=WORLD.read_out.get(key, 0), unread_count=WORLD.unread.get(key, 0),
@@ -480,7 +613,8 @@ class Handler(socketserver.BaseRequestHandler):
             time.sleep(0.3)
             now = time.time()
             due = [p for p in WORLD.pending if p[0] <= now]
-            if not due or self.key is None:
+            # only to the main connection, not to one made for files
+            if not due or self.key is None or getattr(self, "dc", None) != HOME_DC:
                 continue
             for p in due:
                 WORLD.pending.remove(p)

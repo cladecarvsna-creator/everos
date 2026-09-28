@@ -2,7 +2,7 @@
 //! chats, sends messages and applies the updates the server pushes. It
 //! runs in a fiber and talks to the window through [`Shared`].
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
@@ -16,7 +16,10 @@ use smoltcp::wire::Ipv4Address;
 use super::crypto;
 use super::mtproto::{self, now_ms, Error, Result, Session, Transport};
 use super::tl::{self, Kind, Obj, Reader, Value};
-use super::{Chat, ChatKind, Cmd, Message, Peer, Shared, Stage};
+use super::{
+    Chat, ChatKind, Cmd, Document, Download, FileLoc, Link, Message, Peer, Photo, Picture, Shared,
+    Stage,
+};
 use crate::{fs, serial};
 
 /// Telegram's data centres, and the test ones.
@@ -37,6 +40,14 @@ const TEST_DCS: [[u8; 4]; 3] = [
 const LAYER: i32 = 229;
 const PING_MS: i64 = 60_000;
 const HISTORY_PAGE: i32 = 40;
+/// Files come in parts this big.
+const CHUNK: i32 = 512 * 1024;
+/// Files bigger than this are not saved (they are kept in memory first).
+const MAX_SAVE: i64 = 48 * 1024 * 1024;
+/// Photos are kept at most this big on their longer side.
+const PICTURE_MAX: usize = 480;
+/// How many photos stay in memory.
+const PICTURES_KEPT: usize = 48;
 
 fn log(s: &str) {
     serial::write_str("\ntelegram: ");
@@ -466,6 +477,7 @@ struct UserInfo {
     access_hash: i64,
     name: String,
     bot: bool,
+    username: String,
 }
 
 #[derive(Clone)]
@@ -473,6 +485,25 @@ struct ChatInfo {
     access_hash: i64,
     title: String,
     broadcast: bool,
+    username: String,
+    /// We are not (or no longer) in it.
+    left: bool,
+    can_post: bool,
+    members: i64,
+}
+
+/// A file being loaded, a part at a time.
+struct Job {
+    loc: FileLoc,
+    save: Option<Save>,
+    offset: i64,
+    data: Vec<u8>,
+}
+
+/// Where a loaded file goes on the disk.
+struct Save {
+    path: String,
+    size: i64,
 }
 
 struct Client {
@@ -489,6 +520,14 @@ struct Client {
     reload: bool,
     /// A chat on screen got new messages: tell the server they were read.
     read: Option<Peer>,
+    /// Files to load: photos to show, files to save (first).
+    jobs: VecDeque<Job>,
+    /// Photos already asked for.
+    asked: BTreeSet<i64>,
+    /// Loaded photos, oldest first, to forget the oldest.
+    pictures: VecDeque<i64>,
+    /// Connections to other data centres, for files kept there.
+    media: BTreeMap<i32, Conn>,
 }
 
 /// Why the client stopped.
@@ -512,6 +551,10 @@ pub fn run(shared: Rc<RefCell<Shared>>) {
         sending: BTreeMap::new(),
         reload: false,
         read: None,
+        jobs: VecDeque::new(),
+        asked: BTreeSet::new(),
+        pictures: VecDeque::new(),
+        media: BTreeMap::new(),
     };
     let mut failures = 0;
     loop {
@@ -531,6 +574,7 @@ pub fn run(shared: Rc<RefCell<Shared>>) {
                 }
                 log(&format!("error: {}", e.text()));
                 c.conn = None;
+                c.media.clear();
                 failures += 1;
                 c.update(|s| {
                     s.online = false;
@@ -614,9 +658,14 @@ impl Client {
             if let Some(cmd) = cmd {
                 self.update(|s| {
                     s.error = None;
-                    s.busy = true;
+                    s.busy = !matches!(cmd, Cmd::Download(..) | Cmd::Search(_));
                 });
                 return Ok(Some(cmd));
+            }
+            if !self.jobs.is_empty() && self.me != 0 {
+                // a part of a file between the user's wishes
+                self.step_job()?;
+                continue;
             }
             crate::fiber::pause();
         }
@@ -928,6 +977,7 @@ impl Client {
                 if !loaded {
                     self.load_history(peer, 0)?;
                 }
+                self.queue_photos(peer);
                 self.mark_read(peer)?;
             }
             Cmd::Older(peer) => {
@@ -941,14 +991,65 @@ impl Client {
                         .map_or(0, |m| m.id)
                 };
                 self.load_history(peer, oldest)?;
+                self.queue_photos(peer);
             }
             Cmd::Send(peer, text) => self.send_message(peer, text)?,
+            Cmd::Search(q) => self.search(q)?,
+            Cmd::Resolve(name) => self.resolve(name)?,
+            Cmd::Join(peer) => {
+                let req = Obj::new(
+                    "channels.joinChannel",
+                    &[("channel", self.input_channel(peer).into())],
+                );
+                let v = self.call(&req)?;
+                if let Some(o) = v.as_obj() {
+                    self.apply(o);
+                }
+                if let Peer::Channel(id) = peer {
+                    if let Some(c) = self.chats.get_mut(&id) {
+                        c.left = false;
+                    }
+                }
+                self.load_dialogs()?;
+                self.update(|s| s.found.retain(|c| c.peer != peer));
+            }
+            Cmd::Leave(peer) => {
+                let req = Obj::new(
+                    "channels.leaveChannel",
+                    &[("channel", self.input_channel(peer).into())],
+                );
+                let v = self.call(&req)?;
+                if let Some(o) = v.as_obj() {
+                    self.apply(o);
+                }
+                if let Peer::Channel(id) = peer {
+                    if let Some(c) = self.chats.get_mut(&id) {
+                        c.left = true;
+                    }
+                }
+                // it stays on screen, now as a chat we are not in
+                let mut chat = self.new_chat(peer);
+                chat.member = false;
+                self.update(|s| {
+                    s.chats.retain(|c| c.peer != peer);
+                    s.found.retain(|c| c.peer != peer);
+                    s.found.insert(0, chat);
+                });
+            }
+            Cmd::Download(peer, id) => self.download(peer, id),
             Cmd::Reload => {
                 self.load_dialogs()?;
                 let open: Vec<Peer> = self.shared.borrow().history.keys().copied().collect();
                 self.update(|s| s.history.clear());
                 for peer in open {
                     self.load_history(peer, 0)?;
+                }
+                // file references may have changed: ask for the photos again
+                self.asked.clear();
+                self.jobs.retain(|j| j.save.is_some());
+                let open = self.shared.borrow().open;
+                if let Some(peer) = open {
+                    self.queue_photos(peer);
                 }
             }
             Cmd::LogOut => {
@@ -1037,6 +1138,36 @@ impl Client {
     }
 
     fn new_chat(&self, peer: Peer) -> Chat {
+        let mut chat = Chat {
+            peer,
+            title: String::new(),
+            last: String::new(),
+            last_out: false,
+            date: 0,
+            unread: 0,
+            pinned: false,
+            read_out: 0,
+            kind: ChatKind::Private,
+            username: String::new(),
+            member: true,
+            can_post: true,
+            members: 0,
+        };
+        match peer {
+            Peer::User(id) => {
+                if let Some(u) = self.users.get(&id) {
+                    chat.username = u.username.clone();
+                }
+            }
+            Peer::Chat(id) | Peer::Channel(id) => {
+                if let Some(c) = self.chats.get(&id) {
+                    chat.username = c.username.clone();
+                    chat.member = !c.left;
+                    chat.can_post = c.can_post;
+                    chat.members = c.members;
+                }
+            }
+        }
         let (title, kind) = match peer {
             Peer::User(id) if id == self.me => (String::from("Saved Messages"), ChatKind::Saved),
             Peer::User(id) => match self.users.get(&id) {
@@ -1062,17 +1193,9 @@ impl Client {
                 None => (String::from("Unknown chat"), ChatKind::Group),
             },
         };
-        Chat {
-            peer,
-            title,
-            last: String::new(),
-            last_out: false,
-            date: 0,
-            unread: 0,
-            pinned: false,
-            read_out: 0,
-            kind,
-        }
+        chat.title = title;
+        chat.kind = kind;
+        chat
     }
 
     /// Load a page of messages older than `before` (0: the newest).
@@ -1191,6 +1314,9 @@ impl Client {
             edited: false,
             random_id,
             failed: false,
+            photo: None,
+            file: None,
+            links: find_links(&text),
         };
         self.sending.insert(random_id, peer);
         self.update(|s| {
@@ -1257,6 +1383,346 @@ impl Client {
         });
     }
 
+    // ---- search and usernames ----------------------------------------------------------
+
+    fn search(&mut self, q: String) -> Result<()> {
+        let q = String::from(q.trim().trim_start_matches('@'));
+        if q.chars().count() < 3 {
+            self.update(|s| {
+                s.found.clear();
+                s.found_for = q;
+            });
+            return Ok(());
+        }
+        let req = Obj::new(
+            "contacts.search",
+            &[("q", Value::str(&q)), ("limit", Value::Int(20))],
+        );
+        let v = match self.call(&req) {
+            Ok(v) => v,
+            Err(Error::Rpc { .. }) => {
+                self.update(|s| {
+                    s.found.clear();
+                    s.found_for = q;
+                });
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let found = v.as_obj().ok_or("bad search result")?;
+        self.remember_all(found);
+        let mut chats: Vec<Chat> = Vec::new();
+        for p in found
+            .vec("my_results")
+            .iter()
+            .chain(found.vec("results").iter())
+        {
+            if let Some(peer) = peer_of(p.as_obj()) {
+                if !chats.iter().any(|c| c.peer == peer) {
+                    chats.push(self.new_chat(peer));
+                }
+            }
+        }
+        self.update(|s| {
+            // the ones already in the list are shown there
+            let listed: Vec<Peer> = s.chats.iter().map(|c| c.peer).collect();
+            chats.retain(|c| !listed.contains(&c.peer));
+            s.found = chats;
+            s.found_for = q;
+        });
+        Ok(())
+    }
+
+    /// Find who has a username and show that chat.
+    fn resolve(&mut self, name: String) -> Result<()> {
+        let name = String::from(name.trim().trim_start_matches('@'));
+        let req = Obj::new(
+            "contacts.resolveUsername",
+            &[("username", Value::str(&name))],
+        );
+        let v = match self.call(&req) {
+            Err(Error::Rpc { message, .. })
+                if message == "USERNAME_NOT_OCCUPIED" || message == "USERNAME_INVALID" =>
+            {
+                self.error(format!("There is no one with the username @{}.", name));
+                return Ok(());
+            }
+            other => other?,
+        };
+        let r = v.as_obj().ok_or("bad resolved peer")?;
+        self.remember_all(r);
+        let peer = peer_of(r.obj("peer")).ok_or("no peer for the username")?;
+        let chat = self.new_chat(peer);
+        self.update(|s| {
+            if !s.chats.iter().any(|c| c.peer == peer) {
+                s.found.retain(|c| c.peer != peer);
+                s.found.insert(0, chat);
+            }
+            s.goto = Some(peer);
+        });
+        Ok(())
+    }
+
+    // ---- photos and files ---------------------------------------------------------------
+
+    /// Ask for the photos of a chat on screen, newest first.
+    fn queue_photos(&mut self, peer: Peer) {
+        let photos: Vec<FileLoc> = {
+            let s = self.shared.borrow();
+            let Some(h) = s.history.get(&peer) else {
+                return;
+            };
+            h.messages
+                .iter()
+                .rev()
+                .filter_map(|m| m.photo.as_ref())
+                .filter(|p| !s.photos.contains_key(&p.loc.id))
+                .map(|p| p.loc.clone())
+                .collect()
+        };
+        for loc in photos {
+            if self.asked.insert(loc.id) {
+                self.jobs.push_back(Job {
+                    loc,
+                    save: None,
+                    offset: 0,
+                    data: Vec::new(),
+                });
+            }
+        }
+    }
+
+    /// Save the file (or the photo) of a message to Downloads.
+    fn download(&mut self, peer: Peer, id: i64) {
+        let found = {
+            let s = self.shared.borrow();
+            s.history
+                .get(&peer)
+                .and_then(|h| h.messages.iter().find(|m| m.id == id))
+                .and_then(|m| match (&m.file, &m.photo) {
+                    (Some(d), _) => Some((d.loc.clone(), d.name.clone(), d.size)),
+                    (None, Some(p)) => Some((
+                        p.loc.clone(),
+                        format!("photo_{}_{}.jpg", peer_number(peer), id),
+                        0,
+                    )),
+                    _ => None,
+                })
+        };
+        let Some((loc, name, size)) = found else {
+            return;
+        };
+        let key = loc.id;
+        if matches!(
+            self.shared.borrow().downloads.get(&key),
+            Some(Download::Going(_))
+        ) {
+            return;
+        }
+        if size > MAX_SAVE {
+            self.update(|s| {
+                s.downloads.insert(
+                    key,
+                    Download::Failed(format!(
+                        "Too big: EverOS saves files up to {} MB",
+                        MAX_SAVE >> 20
+                    )),
+                );
+            });
+            return;
+        }
+        let Some(user) = crate::users::current_name() else {
+            return;
+        };
+        fs::ensure_home(user.as_str());
+        let dir = fs::join(&fs::home(user.as_str()), "Downloads");
+        let clean = safe_name(&name);
+        let (base, ext) = match clean.rfind('.') {
+            Some(i) if i > 0 => (&clean[..i], &clean[i..]),
+            _ => (clean.as_str(), ""),
+        };
+        let path = fs::join(&dir, &fs::unique_name(&dir, base, ext));
+        log(&format!("saving a file to {}", path));
+        self.update(|s| {
+            s.downloads.insert(key, Download::Going(0));
+        });
+        // files the user asked for go before the photos
+        self.jobs.push_front(Job {
+            loc,
+            save: Some(Save { path, size }),
+            offset: 0,
+            data: Vec::new(),
+        });
+    }
+
+    /// Load the next part of the first file waiting.
+    fn step_job(&mut self) -> Result<()> {
+        let Some(mut job) = self.jobs.pop_front() else {
+            return Ok(());
+        };
+        let location = match &job.loc.photo_size {
+            Some(size) => Obj::new(
+                "inputPhotoFileLocation",
+                &[
+                    ("id", Value::Long(job.loc.id)),
+                    ("access_hash", Value::Long(job.loc.access_hash)),
+                    (
+                        "file_reference",
+                        Value::Bytes(job.loc.file_reference.clone()),
+                    ),
+                    ("thumb_size", Value::str(size)),
+                ],
+            ),
+            None => Obj::new(
+                "inputDocumentFileLocation",
+                &[
+                    ("id", Value::Long(job.loc.id)),
+                    ("access_hash", Value::Long(job.loc.access_hash)),
+                    (
+                        "file_reference",
+                        Value::Bytes(job.loc.file_reference.clone()),
+                    ),
+                    ("thumb_size", Value::str("")),
+                ],
+            ),
+        };
+        let req = Obj::new(
+            "upload.getFile",
+            &[
+                ("location", location.into()),
+                ("offset", Value::Long(job.offset)),
+                ("limit", Value::Int(CHUNK)),
+            ],
+        );
+        let dc = job.loc.dc;
+        let part = match self.call_on(dc, &req) {
+            Ok(v) => v,
+            Err(e) => {
+                let home = dc == 0 || dc == self.saved.dc;
+                if home && !matches!(e, Error::Rpc { .. }) {
+                    // the connection broke: try again after reconnecting
+                    self.jobs.push_front(job);
+                    return Err(e);
+                }
+                log(&format!("can't load a file: {}", e.text()));
+                self.job_failed(&job, friendly(&e));
+                return Ok(());
+            }
+        };
+        let bytes = part.as_obj().map(|o| o.bytes("bytes")).unwrap_or(&[]);
+        job.data.extend_from_slice(bytes);
+        job.offset += CHUNK as i64;
+        let done = bytes.len() < CHUNK as usize;
+        if !done && job.data.len() as i64 > MAX_SAVE {
+            self.job_failed(&job, String::from("The file is too big"));
+            return Ok(());
+        }
+        if done {
+            self.job_done(job);
+        } else {
+            if let Some(save) = &job.save {
+                let permille = if save.size > 0 {
+                    (job.data.len() as i64 * 1000 / save.size).clamp(0, 999) as u32
+                } else {
+                    0
+                };
+                let key = job.loc.id;
+                self.update(|s| {
+                    s.downloads.insert(key, Download::Going(permille));
+                });
+            }
+            self.jobs.push_front(job);
+        }
+        Ok(())
+    }
+
+    fn job_failed(&mut self, job: &Job, why: String) {
+        let key = job.loc.id;
+        if job.save.is_some() {
+            self.update(|s| {
+                s.downloads.insert(key, Download::Failed(why));
+            });
+        } else {
+            self.update(|s| {
+                s.photos.insert(key, None);
+            });
+        }
+    }
+
+    fn job_done(&mut self, job: Job) {
+        let key = job.loc.id;
+        if let Some(save) = &job.save {
+            let result = match fs::write(&save.path, &job.data) {
+                Ok(()) => {
+                    log(&format!("saved {} bytes", job.data.len()));
+                    Download::Done(save.path.clone())
+                }
+                Err(e) => Download::Failed(String::from(e.message())),
+            };
+            self.update(|s| {
+                s.downloads.insert(key, result);
+            });
+            return;
+        }
+        let picture = crate::web::image::decode(&job.data).map(|img| shrink(&img, PICTURE_MAX));
+        if picture.is_none() {
+            log("can't decode a photo");
+        }
+        self.pictures.push_back(key);
+        let forget = if self.pictures.len() > PICTURES_KEPT {
+            self.pictures.pop_front()
+        } else {
+            None
+        };
+        if let Some(old) = forget {
+            // it can be loaded again when it is needed
+            self.asked.remove(&old);
+        }
+        self.update(|s| {
+            s.photos.insert(key, picture);
+            if let Some(old) = forget {
+                s.photos.remove(&old);
+            }
+        });
+    }
+
+    /// Call a method in the data centre that keeps a file.
+    fn call_on(&mut self, dc: i32, req: &Obj) -> Result<Value> {
+        if dc == 0 || dc == self.saved.dc {
+            return match self.call(req) {
+                Err(e) if e.number_after("FILE_MIGRATE_").is_some() => {
+                    let to = e.number_after("FILE_MIGRATE_").unwrap_or(0) as i32;
+                    self.call_on(to, req)
+                }
+                other => other,
+            };
+        }
+        if !self.media.contains_key(&dc) {
+            log(&format!("files are in DC {}", dc));
+            // our sign-in, carried over to that data centre
+            let export = Obj::new("auth.exportAuthorization", &[("dc_id", Value::Int(dc))]);
+            let v = self.call(&export)?;
+            let e = v.as_obj().ok_or("bad exported authorization")?;
+            let import = Obj::new(
+                "auth.importAuthorization",
+                &[
+                    ("id", Value::Long(e.int("id"))),
+                    ("bytes", Value::Bytes(e.bytes("bytes").to_vec())),
+                ],
+            );
+            let (mut conn, _) = Conn::open(&self.cfg, dc, None)?;
+            conn.invoke(&self.cfg, &import)?;
+            self.media.insert(dc, conn);
+        }
+        let conn = self.media.get_mut(&dc).ok_or("no connection")?;
+        let v = conn.invoke(&self.cfg, req);
+        conn.updates.clear();
+        if matches!(v, Err(Error::Net(_)) | Err(Error::KeyUnknown)) {
+            self.media.remove(&dc);
+        }
+        v
+    }
+
     // ---- updates -------------------------------------------------------------------------
 
     fn apply(&mut self, u: &Obj) {
@@ -1270,18 +1736,22 @@ impl Client {
                 } else {
                     (Peer::Chat(u.int("chat_id")), u.int("from_id"))
                 };
+                let text = u.string("message");
                 let msg = Message {
                     id: u.int("id"),
                     out,
                     from: self.name_of(from),
                     from_id: from,
-                    text: u.string("message"),
+                    links: links_of(&text, u.vec("entities")),
+                    text,
                     media: None,
                     service: false,
                     date: u.int("date"),
                     edited: false,
                     random_id: 0,
                     failed: false,
+                    photo: None,
+                    file: None,
                 };
                 self.incoming(peer, msg);
             }
@@ -1411,8 +1881,12 @@ impl Client {
                 }
             }
         });
-        if !out && self.shared.borrow().open == Some(peer) {
-            self.read = Some(peer);
+        let open = self.shared.borrow().open == Some(peer);
+        if open {
+            self.queue_photos(peer);
+            if !out {
+                self.read = Some(peer);
+            }
         }
     }
 
@@ -1449,6 +1923,10 @@ impl Client {
                     access_hash: 0,
                     title,
                     broadcast: false,
+                    username: String::new(),
+                    left: c.flag("left") || c.flag("deactivated") || c.is("chatForbidden"),
+                    can_post: true,
+                    members: c.int("participants_count"),
                 },
                 "channel" | "channelForbidden" => {
                     let old = self.chats.get(&id);
@@ -1458,10 +1936,25 @@ impl Client {
                     } else {
                         c.int("access_hash")
                     };
+                    let broadcast = c.flag("broadcast");
+                    let admin = c.flag("creator") || c.get("admin_rights").is_some();
+                    let members = match c.int("participants_count") {
+                        0 => old.map_or(0, |o| o.members),
+                        n => n,
+                    };
+                    let left = if c.flag("min") {
+                        old.is_none_or(|o| o.left)
+                    } else {
+                        c.flag("left") || c.is("channelForbidden")
+                    };
                     ChatInfo {
                         access_hash: hash,
                         title,
-                        broadcast: c.flag("broadcast"),
+                        broadcast,
+                        username: username_of(c),
+                        left,
+                        can_post: !broadcast || admin,
+                        members,
                     }
                 }
                 _ => continue,
@@ -1508,6 +2001,7 @@ impl Client {
                 access_hash: hash,
                 name,
                 bot: u.flag("bot"),
+                username: username_of(u),
             },
         );
     }
@@ -1540,6 +2034,20 @@ impl Client {
         } else {
             (m.string("message"), m.obj("media").and_then(media_label))
         };
+        let media_obj = m.obj("media");
+        let photo = media_obj
+            .filter(|x| x.is("messageMediaPhoto"))
+            .and_then(|x| x.obj("photo"))
+            .and_then(photo_of);
+        let file = media_obj
+            .filter(|x| x.is("messageMediaDocument"))
+            .and_then(|x| x.obj("document"))
+            .and_then(document_of);
+        let links = if service {
+            Vec::new()
+        } else {
+            links_of(&text, m.vec("entities"))
+        };
         Some(Message {
             id: m.int("id"),
             out,
@@ -1552,7 +2060,251 @@ impl Client {
             edited: m.get("edit_date").is_some() && !m.flag("edit_hide"),
             random_id: 0,
             failed: false,
+            photo,
+            file,
+            links,
         })
+    }
+}
+
+fn peer_number(p: Peer) -> i64 {
+    match p {
+        Peer::User(id) | Peer::Chat(id) | Peer::Channel(id) => id,
+    }
+}
+
+/// A user's or a channel's username (the first active one).
+fn username_of(o: &Obj) -> String {
+    let name = o.string("username");
+    if !name.is_empty() {
+        return name;
+    }
+    o.vec("usernames")
+        .iter()
+        .filter_map(|u| u.as_obj())
+        .find(|u| u.flag("active"))
+        .map(|u| u.string("username"))
+        .unwrap_or_default()
+}
+
+fn photo_of(p: &Obj) -> Option<Photo> {
+    if !p.is("photo") {
+        return None;
+    }
+    // the biggest size up to 1280 pixels, or else the smallest
+    let mut best: Option<(String, i32, i32)> = None;
+    let mut smallest: Option<(String, i32, i32)> = None;
+    for s in p.vec("sizes").iter().filter_map(|s| s.as_obj()) {
+        if !s.is("photoSize") && !s.is("photoSizeProgressive") {
+            continue;
+        }
+        let (w, h) = (s.int("w") as i32, s.int("h") as i32);
+        let entry = (s.string("type"), w, h);
+        if w.max(h) <= 1280 && best.as_ref().is_none_or(|b| w * h > b.1 * b.2) {
+            best = Some(entry.clone());
+        }
+        if smallest.as_ref().is_none_or(|b| w * h < b.1 * b.2) {
+            smallest = Some(entry);
+        }
+    }
+    let (size, w, h) = best.or(smallest)?;
+    Some(Photo {
+        loc: FileLoc {
+            id: p.int("id"),
+            access_hash: p.int("access_hash"),
+            file_reference: p.bytes("file_reference").to_vec(),
+            dc: p.int("dc_id") as i32,
+            photo_size: Some(size),
+        },
+        w: w.max(1),
+        h: h.max(1),
+    })
+}
+
+fn document_of(d: &Obj) -> Option<Document> {
+    if !d.is("document") {
+        return None;
+    }
+    let mut name = String::new();
+    let mut kind = "file";
+    for a in d.vec("attributes").iter().filter_map(|a| a.as_obj()) {
+        match a.name() {
+            "documentAttributeFilename" => name = a.string("file_name"),
+            // stickers are shown as their emoji, not as files
+            "documentAttributeSticker" | "documentAttributeCustomEmoji" => return None,
+            "documentAttributeVideo" => kind = "video",
+            "documentAttributeAudio" if a.flag("voice") => kind = "voice",
+            "documentAttributeAudio" => kind = "audio",
+            _ => {}
+        }
+    }
+    if name.is_empty() {
+        let mime = d.string("mime_type");
+        let ext = match mime.as_str() {
+            "video/mp4" => ".mp4",
+            "audio/ogg" => ".ogg",
+            "audio/mpeg" => ".mp3",
+            "image/jpeg" => ".jpg",
+            "image/png" => ".png",
+            "image/gif" => ".gif",
+            "application/pdf" => ".pdf",
+            "text/plain" => ".txt",
+            _ => "",
+        };
+        name = format!("{}_{}{}", kind, d.int("id").unsigned_abs() % 100_000, ext);
+    }
+    Some(Document {
+        loc: FileLoc {
+            id: d.int("id"),
+            access_hash: d.int("access_hash"),
+            file_reference: d.bytes("file_reference").to_vec(),
+            dc: d.int("dc_id") as i32,
+            photo_size: None,
+        },
+        name,
+        size: d.int("size"),
+    })
+}
+
+/// A file name the disk takes.
+fn safe_name(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c < ' ' {
+                '_'
+            } else {
+                c
+            }
+        })
+        .take(100)
+        .collect();
+    out = String::from(out.trim().trim_start_matches('.'));
+    if out.is_empty() {
+        out = String::from("file");
+    }
+    out
+}
+
+/// A character index for an offset counted in UTF-16 units.
+fn char_at_utf16(text: &str, units: i64) -> usize {
+    let mut n = 0i64;
+    for (i, c) in text.chars().enumerate() {
+        if n >= units {
+            return i;
+        }
+        n += c.len_utf16() as i64;
+    }
+    text.chars().count()
+}
+
+/// The links of a message, from its entities (or found in the text).
+fn links_of(text: &str, entities: &[Value]) -> Vec<Link> {
+    if entities.is_empty() {
+        return find_links(text);
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    for e in entities.iter().filter_map(|e| e.as_obj()) {
+        let start = char_at_utf16(text, e.int("offset"));
+        let end = char_at_utf16(text, e.int("offset") + e.int("length")).max(start);
+        let inside: String = chars[start.min(chars.len())..end.min(chars.len())]
+            .iter()
+            .collect();
+        let target = match e.name() {
+            "messageEntityUrl" => inside,
+            "messageEntityTextUrl" => e.string("url"),
+            "messageEntityMention" => inside,
+            _ => continue,
+        };
+        if !target.is_empty() {
+            out.push(Link { start, end, target });
+        }
+    }
+    out
+}
+
+/// Addresses and @usernames in plain text.
+pub fn find_links(text: &str) -> Vec<Link> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_whitespace()
+            || (i > 0 && !chars[i - 1].is_whitespace() && chars[i - 1] != '(')
+        {
+            i += 1;
+            continue;
+        }
+        let mut end = i;
+        while end < chars.len() && !chars[end].is_whitespace() {
+            end += 1;
+        }
+        let word: String = chars[i..end].iter().collect();
+        let lower = word.to_ascii_lowercase();
+        let trimmed = word.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', '"', '\'']);
+        let n = trimmed.chars().count();
+        let is_url = lower.starts_with("http://")
+            || lower.starts_with("https://")
+            || lower.starts_with("www.")
+            || lower.starts_with("t.me/");
+        let is_mention = trimmed.starts_with('@')
+            && n >= 5
+            && trimmed[1..]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if (is_url && n > 7) || is_mention {
+            out.push(Link {
+                start: i,
+                end: i + n,
+                target: String::from(trimmed),
+            });
+        }
+        i = end;
+    }
+    out
+}
+
+/// Make a picture no bigger than `max` on its longer side, averaging.
+fn shrink(img: &crate::web::image::Image, max: usize) -> Picture {
+    let (w, h) = (img.width.max(1), img.height.max(1));
+    let scale_num = max.min(w.max(h));
+    let (nw, nh) = if w >= h {
+        (scale_num, (h * scale_num / w).max(1))
+    } else {
+        ((w * scale_num / h).max(1), scale_num)
+    };
+    let mut pixels = Vec::with_capacity(nw * nh);
+    for y in 0..nh {
+        let y0 = y * h / nh;
+        let y1 = ((y + 1) * h / nh).max(y0 + 1);
+        for x in 0..nw {
+            let x0 = x * w / nw;
+            let x1 = ((x + 1) * w / nw).max(x0 + 1);
+            let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+            // at most 4 x 4 samples a pixel keeps it quick
+            let sy = ((y1 - y0) / 4).max(1);
+            let sx = ((x1 - x0) / 4).max(1);
+            let mut yy = y0;
+            while yy < y1 {
+                let mut xx = x0;
+                while xx < x1 {
+                    let p = img.pixels[yy * w + xx];
+                    r += (p >> 16) & 255;
+                    g += (p >> 8) & 255;
+                    b += p & 255;
+                    n += 1;
+                    xx += sx;
+                }
+                yy += sy;
+            }
+            pixels.push(0xff00_0000 | (r / n) << 16 | (g / n) << 8 | (b / n));
+        }
+    }
+    Picture {
+        w: nw as i32,
+        h: nh as i32,
+        pixels,
     }
 }
 

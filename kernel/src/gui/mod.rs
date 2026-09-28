@@ -23,6 +23,7 @@ mod canvas;
 mod demo;
 mod deskicons;
 mod desktops;
+mod emoji;
 mod explorer;
 mod filedialog;
 #[rustfmt::skip]
