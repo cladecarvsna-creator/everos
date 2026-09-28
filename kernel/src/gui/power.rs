@@ -152,10 +152,15 @@ impl Desktop<'_> {
                     self.damage(self.screen());
                 }
                 if elapsed_ms(since) >= BOOT_MS {
-                    // fade into the lock screen
+                    // fade into the installer or the lock screen
                     self.take_snapshot();
-                    self.phase = Phase::Login;
-                    self.login.lock();
+                    if let Some(setup) = &mut self.setup {
+                        self.phase = Phase::Setup;
+                        setup.show();
+                    } else {
+                        self.phase = Phase::Login;
+                        self.login.lock();
+                    }
                     self.crossfade = Some(Tween::new(0, ONE, anim::ms(500)));
                     self.damage(self.screen());
                 }

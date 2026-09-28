@@ -633,7 +633,7 @@ impl Login {
 
 /// The default user picture: a light silhouette on a grey-blue disc,
 /// sampled 4x4 per pixel for smooth edges. Alpha is in the top byte.
-fn avatar(size: i32) -> Vec<u32> {
+pub(super) fn avatar(size: i32) -> Vec<u32> {
     const S: i64 = 4;
     let n = size as i64 * S;
     let r = n / 2;

@@ -37,6 +37,7 @@ mod popup;
 mod power;
 mod search;
 mod settings;
+mod setup;
 mod start;
 mod taskbar;
 mod telegram;
@@ -398,6 +399,8 @@ enum Phase {
     Boot(u64),
     /// Restarting or shutting down, since this tick.
     Power(power::Power, u64),
+    /// The installer, when EverOS started from the installation disc.
+    Setup,
     /// The lock screen or the sign-in panel.
     Login,
     /// The sign-in screen (in SNAPSHOT) fading into the desktop.
@@ -465,6 +468,8 @@ pub struct Desktop<'a> {
     present_all: bool,
     phase: Phase,
     login: Login,
+    /// The installer, on the installation disc.
+    setup: Option<alloc::boxed::Box<setup::Setup>>,
     /// Who the open windows belong to.
     session_user: Option<usize>,
     /// Mouse buttons as the PS/2 mouse and the vmmouse last reported them.
@@ -591,6 +596,7 @@ impl<'a> Desktop<'a> {
             present_all: false,
             phase: Phase::Boot(interrupts::ticks()),
             login,
+            setup: None,
             session_user: None,
             ps2_buttons: (false, false),
             vm_buttons: (false, false),
@@ -740,6 +746,16 @@ impl<'a> Desktop<'a> {
                 self.damage(self.screen());
             }
             _ => {}
+        }
+        if let Some(setup) = &mut self.setup {
+            let outcome = setup.tick();
+            let (rects, n) = setup.dirty.take();
+            if matches!(self.phase, Phase::Setup) {
+                for r in &rects[..n] {
+                    self.damage(*r);
+                }
+                self.setup_outcome(outcome);
+            }
         }
         self.login.tick();
         let (rects, n) = self.login.dirty.take();
@@ -915,6 +931,24 @@ impl<'a> Desktop<'a> {
         self.desk_count = 1;
         self.current_desk = 0;
         self.peeked.clear();
+    }
+
+    fn setup_outcome(&mut self, outcome: setup::Outcome) {
+        match outcome {
+            setup::Outcome::None => {}
+            setup::Outcome::Try => {
+                // EverOS from the disc: now a blank disk may be formatted
+                crate::fs::init(true);
+                users::load();
+                self.take_snapshot();
+                self.setup = None;
+                self.phase = Phase::Login;
+                self.login.lock();
+                self.crossfade = Some(Tween::new(0, ONE, anim::ms(500)));
+                self.damage(self.screen());
+            }
+            setup::Outcome::Restart => self.power(power::Power::Restart),
+        }
     }
 
     fn login_outcome(&mut self, outcome: login::Outcome) {
@@ -1237,6 +1271,13 @@ impl<'a> Desktop<'a> {
 
     fn on_key(&mut self, key: Key) {
         match self.phase {
+            Phase::Setup => {
+                if let Some(setup) = &mut self.setup {
+                    let outcome = setup.on_key(key);
+                    self.setup_outcome(outcome);
+                }
+                return;
+            }
             Phase::Login => {
                 let outcome = self.login.on_key(key);
                 self.login_outcome(outcome);
@@ -1452,6 +1493,16 @@ impl<'a> Desktop<'a> {
 
         match self.phase {
             Phase::Desktop => {}
+            Phase::Setup => {
+                if let Some(setup) = &mut self.setup {
+                    setup.on_move(self.mouse_x, self.mouse_y);
+                    if self.left && !was_left {
+                        let outcome = setup.on_click(self.mouse_x, self.mouse_y);
+                        self.setup_outcome(outcome);
+                    }
+                }
+                return;
+            }
             Phase::Login => {
                 self.login.on_move(self.mouse_x, self.mouse_y);
                 if self.left && !was_left {
@@ -2080,6 +2131,12 @@ impl<'a> Desktop<'a> {
             Phase::Power(what, since) => return self.draw_power(c, what, since),
             _ => {}
         }
+        if matches!(self.phase, Phase::Setup) {
+            if let Some(setup) = &self.setup {
+                setup.draw(c, self.login.backdrop());
+            }
+            return;
+        }
         if matches!(self.phase, Phase::Login | Phase::Locking(_)) {
             self.login.draw(c, self.wallpaper);
             return;
@@ -2580,6 +2637,14 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
     let mut desk = Desktop::new(fb, boot);
     // the boot animation starts once everything is ready to draw
     desk.phase = Phase::Boot(interrupts::ticks());
+    if boot.setup() {
+        let files = crate::setup::Files::find(boot);
+        desk.setup = Some(alloc::boxed::Box::new(setup::Setup::new(
+            files,
+            desk.width,
+            desk.height,
+        )));
+    }
     // the shell now prints into the terminal window
     CONSOLE.lock().detach(terminal::COLS, terminal::ROWS);
     ACTIVE.store(true, Ordering::Relaxed);
@@ -2664,6 +2729,11 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
             desk.damage_client(App::Terminal);
         }
         desk.login.layout = desk.layout.name();
+        if let Some(setup) = &mut desk.setup {
+            if setup.layout != desk.layout.name() {
+                setup.layout = desk.layout.name();
+            }
+        }
         desk.tick();
         let on_desktop = matches!(desk.phase, Phase::Desktop);
         let now = interrupts::ticks();
@@ -2723,7 +2793,10 @@ pub fn run(fb: Framebuffer, boot: &BootInfo) -> ! {
 
         desk.render();
         // pages loading in the background keep the loop going
-        let busy = desk.browser.busy() || desk.telegram.busy() || desk.settings.busy();
+        let busy = desk.browser.busy()
+            || desk.telegram.busy()
+            || desk.settings.busy()
+            || desk.setup.as_ref().is_some_and(|s| s.busy());
         interrupts::wait_for_interrupt(|| {
             busy || !KEYBOARD_BYTES.is_empty() || !MOUSE_BYTES.is_empty() || !REQUESTS.is_empty()
         });

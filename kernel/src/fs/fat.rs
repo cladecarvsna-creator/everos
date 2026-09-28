@@ -104,6 +104,25 @@ impl Entry {
     }
 }
 
+/// A file being written in pieces (see `Volume::begin_upload`).
+pub struct Upload {
+    path: String,
+    chain: Vec<u32>,
+    size: usize,
+    /// Clusters written so far.
+    written: usize,
+}
+
+impl Upload {
+    /// How much is written, from 0 to 1000.
+    pub fn permille(&self) -> u32 {
+        match self.chain.len() {
+            0 => 1000,
+            n => (self.written * 1000 / n) as u32,
+        }
+    }
+}
+
 /// A directory read into memory.
 struct Dir {
     chain: Vec<u32>,
@@ -112,6 +131,8 @@ struct Dir {
 
 pub struct Volume {
     dev: Device,
+    /// The first sector of the partition.
+    pub start: u64,
     cluster_bytes: usize,
     spc: u32,
     fat_start: u64,
@@ -182,7 +203,7 @@ fn now() -> (u16, u16) {
 
 /// Write an empty FAT32 file system on the disk, in one partition that
 /// fills it, as Windows would. Returns where the partition starts.
-fn format(dev: &mut Device) -> Result<u64, Error> {
+pub fn format(dev: &mut Device) -> Result<u64, Error> {
     let total = dev.sectors();
     let start = if total >= 65536 { PART_START } else { 1 };
     let size = total
@@ -284,15 +305,19 @@ fn format(dev: &mut Device) -> Result<u64, Error> {
 
 impl Volume {
     /// Open the FAT32 file system on a disk. A blank disk (only zeros in
-    /// its first sector) is formatted first; anything else unknown is left
-    /// alone. Returns the volume and whether it was just formatted.
-    pub fn open(mut dev: Device) -> Result<(Volume, bool), Error> {
+    /// its first sector) is formatted first if `format_blank` is set;
+    /// anything else unknown is left alone. Returns the volume and whether
+    /// it was just formatted.
+    pub fn open(mut dev: Device, format_blank: bool) -> Result<(Volume, bool), Error> {
         let mut s0 = [0u8; SECTOR];
         dev.read(0, &mut s0)?;
         let mut formatted = false;
         let start = if is_fat32(&s0) {
             0
         } else if s0.iter().all(|&b| b == 0) {
+            if !format_blank {
+                return Err(Error::Unformatted);
+            }
             formatted = true;
             format(&mut dev)?
         } else if s0[510..] == [0x55, 0xaa] {
@@ -341,6 +366,7 @@ impl Volume {
             fat_start,
             fat_sectors,
             fats,
+            start,
             data_start: fat_start + (fats * fat_sectors) as u64,
             root: u32_at(&b, 44),
             clusters,
@@ -354,6 +380,19 @@ impl Volume {
             dev,
         };
         Ok((volume, formatted))
+    }
+
+    /// Space left, in bytes.
+    pub fn free_bytes(&self) -> u64 {
+        self.free_count as u64 * self.cluster_bytes as u64
+    }
+
+    /// The hard disk it is on.
+    pub fn disk(&self) -> Option<&Ata> {
+        match &self.dev {
+            Device::Ata(a) => Some(a),
+            Device::Ram(_) => None,
+        }
     }
 
     // ---- clusters ---------------------------------------------------------
@@ -428,32 +467,49 @@ impl Volume {
         self.data_start + (c - 2) as u64 * self.spc as u64
     }
 
+    /// Read the clusters of a chain; clusters that follow each other on
+    /// the disk are read together.
     fn read_chain(&mut self, chain: &[u32]) -> Result<Vec<u8>, Error> {
+        let per_run = (128 * SECTOR / self.cluster_bytes).max(1);
         let mut data = vec![0u8; chain.len() * self.cluster_bytes];
-        for (i, &c) in chain.iter().enumerate() {
-            let lba = self.cluster_lba(c);
-            let part = &mut data[i * self.cluster_bytes..(i + 1) * self.cluster_bytes];
+        let mut i = 0;
+        while i < chain.len() {
+            let n = self.run_length(&chain[i..], per_run);
+            let lba = self.cluster_lba(chain[i]);
+            let part = &mut data[i * self.cluster_bytes..(i + n) * self.cluster_bytes];
             self.dev.read(lba, part)?;
+            i += n;
         }
         Ok(data)
     }
 
+    /// How many clusters at the start of `chain` follow each other on
+    /// the disk, at most `max`.
+    fn run_length(&self, chain: &[u32], max: usize) -> usize {
+        let mut n = 1;
+        while n < max && n < chain.len() && chain[n] == chain[0] + n as u32 {
+            n += 1;
+        }
+        n
+    }
+
     /// Write `data` over the clusters of a chain; the last one is padded
-    /// with zeros.
+    /// with zeros. Clusters that follow each other on the disk go in one
+    /// command, up to 64 KiB.
     fn write_chain(&mut self, chain: &[u32], data: &[u8]) -> Result<(), Error> {
-        let mut buf = vec![0u8; self.cluster_bytes];
-        for (i, &c) in chain.iter().enumerate() {
-            let part = data
-                .get(i * self.cluster_bytes..)
-                .unwrap_or(&[])
-                .iter()
-                .take(self.cluster_bytes);
-            buf.fill(0);
-            for (d, s) in buf.iter_mut().zip(part) {
-                *d = *s;
-            }
-            let lba = self.cluster_lba(c);
-            self.dev.write(lba, &buf)?;
+        let per_run = (128 * SECTOR / self.cluster_bytes).max(1);
+        let mut buf = vec![0u8; per_run * self.cluster_bytes];
+        let mut i = 0;
+        while i < chain.len() {
+            let n = self.run_length(&chain[i..], per_run);
+            let bytes = n * self.cluster_bytes;
+            let part = data.get(i * self.cluster_bytes..).unwrap_or(&[]);
+            let take = part.len().min(bytes);
+            buf[..take].copy_from_slice(&part[..take]);
+            buf[take..bytes].fill(0);
+            let lba = self.cluster_lba(chain[i]);
+            self.dev.write(lba, &buf[..bytes])?;
+            i += n;
         }
         Ok(())
     }
@@ -733,9 +789,23 @@ impl Volume {
 
     /// Create or replace a file.
     pub fn write(&mut self, path: &str, bytes: &[u8]) -> Result<(), Error> {
+        let chain = self.reserve(path, bytes.len())?;
+        // write the new contents first, so a full disk keeps the old file
+        if let Err(e) = self.write_chain(&chain, bytes) {
+            if let Some(&c) = chain.first() {
+                self.free(c);
+            }
+            return Err(e);
+        }
+        self.link(path, &chain, bytes.len())
+    }
+
+    /// Check that `path` can be written and take the clusters for `size`
+    /// bytes.
+    fn reserve(&mut self, path: &str, size: usize) -> Result<Vec<u32>, Error> {
         let (parent, name) = split(path);
         let dir_cluster = self.dir_cluster(parent)?;
-        let mut dir = self.load_dir(dir_cluster)?;
+        let dir = self.load_dir(dir_cluster)?;
         let old = Self::find(&dir, name);
         if old.as_ref().is_some_and(|e| e.is_dir()) {
             return Err(Error::IsADirectory);
@@ -743,15 +813,21 @@ impl Volume {
         if old.is_none() && !valid_name(name) {
             return Err(Error::BadName);
         }
-        // write the new contents first, so a full disk keeps the old file
-        let n = bytes.len().div_ceil(self.cluster_bytes);
-        let chain = if n > 0 { self.alloc(n)? } else { Vec::new() };
-        if let Err(e) = self.write_chain(&chain, bytes) {
-            if let Some(&c) = chain.first() {
-                self.free(c);
-            }
-            return Err(e);
+        let n = size.div_ceil(self.cluster_bytes);
+        if n > 0 {
+            self.alloc(n)
+        } else {
+            Ok(Vec::new())
         }
+    }
+
+    /// Point `path` at clusters that already hold its contents, replacing
+    /// the file that was there.
+    fn link(&mut self, path: &str, chain: &[u32], size: usize) -> Result<(), Error> {
+        let (parent, name) = split(path);
+        let dir_cluster = self.dir_cluster(parent)?;
+        let mut dir = self.load_dir(dir_cluster)?;
+        let old = Self::find(&dir, name);
         let cluster = chain.first().copied().unwrap_or(0);
         let (date, time) = now();
         match old {
@@ -761,13 +837,13 @@ impl Volume {
                 raw[11] |= ATTR_ARCHIVE;
                 put16(raw, 20, (cluster >> 16) as u16);
                 put16(raw, 26, cluster as u16);
-                put32(raw, 28, bytes.len() as u32);
+                put32(raw, 28, size as u32);
                 put16(raw, 22, time);
                 put16(raw, 24, date);
                 put16(raw, 18, date);
             }
             None => {
-                let raw = new_entry(ATTR_ARCHIVE, cluster, bytes.len() as u32, date, time);
+                let raw = new_entry(ATTR_ARCHIVE, cluster, size as u32, date, time);
                 if let Err(e) = self.add_entry(&mut dir, name, &raw) {
                     if cluster != 0 {
                         self.free(cluster);
@@ -778,6 +854,51 @@ impl Volume {
         }
         self.save_dir(&dir)?;
         self.sync()
+    }
+
+    /// Start writing a big file a piece at a time, so the screen can show
+    /// progress: `upload_step` writes the pieces, the last one puts the
+    /// file in its folder.
+    pub fn begin_upload(&mut self, path: &str, size: usize) -> Result<Upload, Error> {
+        let chain = self.reserve(path, size)?;
+        Ok(Upload {
+            path: String::from(path),
+            chain,
+            size,
+            written: 0,
+        })
+    }
+
+    /// Write the next clusters of `data` (the whole file), at least
+    /// `bytes` of it. Returns whether the file is complete.
+    pub fn upload_step(
+        &mut self,
+        up: &mut Upload,
+        data: &[u8],
+        bytes: usize,
+    ) -> Result<bool, Error> {
+        if data.len() != up.size {
+            return Err(Error::Io);
+        }
+        let n = bytes.div_ceil(self.cluster_bytes).max(1);
+        let first = up.written;
+        let last = (first + n).min(up.chain.len());
+        let from = (first * self.cluster_bytes).min(data.len());
+        let result = self.write_chain(&up.chain[first..last], &data[from..]);
+        if let Err(e) = result {
+            if let Some(&c) = up.chain.first() {
+                self.free(c);
+            }
+            up.chain.clear();
+            return Err(e);
+        }
+        up.written = last;
+        if last < up.chain.len() {
+            return Ok(false);
+        }
+        let chain = core::mem::take(&mut up.chain);
+        self.link(&up.path.clone(), &chain, up.size)?;
+        Ok(true)
     }
 
     pub fn create_dir(&mut self, path: &str) -> Result<(), Error> {

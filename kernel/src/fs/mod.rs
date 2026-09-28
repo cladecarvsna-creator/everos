@@ -79,12 +79,14 @@ static STORAGE: IrqMutex<Storage> = IrqMutex::new(Storage::None);
 /// Size of the disk in memory when there is no hard disk.
 const RAM_DISK: usize = 8 * 1024 * 1024;
 
-/// Find the disk and open its file system.
-pub fn init() {
+/// Find the disk and open its file system. A blank disk is formatted
+/// if `format_blank` is set; the installer leaves it for the user to
+/// decide.
+pub fn init(format_blank: bool) {
     let mut storage = Storage::None;
     let mut volume = None;
     if let Some(disk) = ata::Ata::find() {
-        match fat::Volume::open(fat::Device::Ata(disk)) {
+        match fat::Volume::open(fat::Device::Ata(disk), format_blank) {
             Ok((v, formatted)) => {
                 serial::write_str(if formatted {
                     "fs: formatted a blank disk as FAT32\n"
@@ -93,6 +95,9 @@ pub fn init() {
                 });
                 volume = Some(v);
                 storage = Storage::Disk;
+            }
+            Err(Error::Unformatted) if !format_blank => {
+                serial::write_str("fs: the disk has no FAT32 file system yet\n");
             }
             Err(e) => {
                 serial::write_str("fs: disk not usable: ");
@@ -105,7 +110,7 @@ pub fn init() {
     }
     if volume.is_none() {
         let dev = fat::Device::Ram(vec![0; RAM_DISK]);
-        if let Ok((v, _)) = fat::Volume::open(dev) {
+        if let Ok((v, _)) = fat::Volume::open(dev, true) {
             serial::write_str("fs: files are kept in memory only\n");
             volume = Some(v);
             storage = Storage::Memory;
@@ -113,6 +118,93 @@ pub fn init() {
     }
     *VOLUME.lock() = volume;
     *STORAGE.lock() = storage;
+}
+
+/// Stop using the disk, so the installer can partition it.
+pub fn unmount() {
+    *VOLUME.lock() = None;
+    *STORAGE.lock() = Storage::None;
+    CHANGES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Use the FAT32 file system on `disk` from now on.
+pub fn mount(disk: ata::Ata) -> Result<(), Error> {
+    let (v, _) = fat::Volume::open(fat::Device::Ata(disk), false)?;
+    *VOLUME.lock() = Some(v);
+    *STORAGE.lock() = Storage::Disk;
+    CHANGES.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Write an empty FAT32 file system over the whole disk, in one
+/// partition. Returns the partition's first sector.
+pub fn format(disk: ata::Ata) -> Result<u64, Error> {
+    fat::format(&mut fat::Device::Ata(disk))
+}
+
+/// Whether the files in use are on this disk.
+pub fn mounted_on(disk: &ata::Ata) -> bool {
+    VOLUME
+        .lock()
+        .as_ref()
+        .and_then(|v| v.disk())
+        .is_some_and(|d| d.same(disk))
+}
+
+/// What is on a disk, for the installer.
+pub struct Probe {
+    /// Where its FAT32 partition starts, if it has one.
+    pub start: Option<u64>,
+    pub free: u64,
+    /// Whether EverOS is installed on it.
+    pub installed: bool,
+    /// Whether it has anything at all in its first sector.
+    pub blank: bool,
+}
+
+pub fn probe(disk: &ata::Ata) -> Probe {
+    let mut s0 = [0u8; 512];
+    let blank = disk.clone().read(0, &mut s0).is_ok() && s0.iter().all(|&b| b == 0);
+    let mut probe = Probe {
+        start: None,
+        free: 0,
+        installed: false,
+        blank,
+    };
+    if let Ok((mut v, _)) = fat::Volume::open(fat::Device::Ata(disk.clone()), false) {
+        probe.start = Some(v.start);
+        probe.free = v.free_bytes();
+        probe.installed = v.exists(INSTALLED);
+    }
+    probe
+}
+
+/// The file the installer leaves on the disk; GRUB on the installation
+/// disc looks for it.
+pub const INSTALLED: &str = "/EverOS/install.cfg";
+
+/// A big file being written in pieces, so the installer can show
+/// progress.
+pub struct Upload(fat::Upload);
+
+impl Upload {
+    /// How much is written, from 0 to 1000.
+    pub fn permille(&self) -> u32 {
+        self.0.permille()
+    }
+}
+
+pub fn begin_upload(path: &str, size: usize) -> Result<Upload, Error> {
+    with(|v| v.begin_upload(path, size)).map(Upload)
+}
+
+/// Write at least `bytes` more of `data`; true once the file is complete.
+pub fn upload_step(up: &mut Upload, data: &[u8], bytes: usize) -> Result<bool, Error> {
+    let done = with(|v| v.upload_step(&mut up.0, data, bytes))?;
+    if done {
+        CHANGES.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(done)
 }
 
 pub fn storage() -> Storage {
