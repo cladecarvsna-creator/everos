@@ -1,0 +1,467 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>EverOS</title>
+<meta name="description" content="EverOS — операционная система для x86_64 на ассемблере и Rust: рабочий стол, браузер, файлы на диске, Wi‑Fi и Telegram.">
+<meta property="og:title" content="EverOS">
+<meta property="og:description" content="Операционная система на ассемблере и Rust: рабочий стол, браузер, файлы, Telegram.">
+<meta property="og:image" content="img/hero.webp">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='1' width='6.5' height='6.5' rx='1.2' fill='%234f8cff'/%3E%3Crect x='8.5' y='1' width='6.5' height='6.5' rx='1.2' fill='%234f8cff'/%3E%3Crect x='1' y='8.5' width='6.5' height='6.5' rx='1.2' fill='%234f8cff'/%3E%3Crect x='8.5' y='8.5' width='6.5' height='6.5' rx='1.2' fill='%234f8cff'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700&family=Onest:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one column that reads like booting the OS — boot log, desktop, then app by app, then how to run it. */
+:root {
+  --bg: #f3f6fc;
+  --surface: #ffffff;
+  --fg: #0f1a33;
+  --muted: #4e5b78;
+  --line: #d6deee;
+  --accent: #1f5fd6;
+  --accent-fg: #ffffff;
+  --term-bg: #0c1220;
+  --term-fg: #c9d4ea;
+  --term-ok: #5fd38d;
+  --term-dim: #6f7f9e;
+  --glow: rgba(79, 140, 255, .22);
+  --shadow: 0 18px 50px -20px rgba(15, 26, 51, .35);
+  --display: "Unbounded", "Segoe UI", system-ui, sans-serif;
+  --body: "Onest", "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", "DejaVu Sans Mono", Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #081230; --surface: #0e1c45; --fg: #e8eeff; --muted: #9fb0d6; --line: #20336b;
+    --accent: #4f8cff; --accent-fg: #061029; --term-bg: #050a18; --glow: rgba(79, 140, 255, .35);
+    --shadow: 0 24px 60px -20px rgba(0, 0, 0, .7); color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #081230; --surface: #0e1c45; --fg: #e8eeff; --muted: #9fb0d6; --line: #20336b;
+  --accent: #4f8cff; --accent-fg: #061029; --term-bg: #050a18; --glow: rgba(79, 140, 255, .35);
+  --shadow: 0 24px 60px -20px rgba(0, 0, 0, .7); color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font: 400 17px/1.6 var(--body);
+  -webkit-font-smoothing: antialiased;
+}
+img { max-width: 100%; display: block; }
+a { color: var(--accent); }
+:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
+.wrap { max-width: 1160px; margin: 0 auto; padding-inline: 20px; }
+h1, h2, h3 { font-family: var(--display); font-weight: 700; line-height: 1.15; text-wrap: balance; margin: 0; }
+h2 { font-size: clamp(28px, 4vw, 42px); letter-spacing: -.01em; }
+h3 { font-size: 20px; font-weight: 500; }
+p { margin: 0; }
+.label { font: 600 12px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--accent); }
+
+/* nav */
+.nav {
+  position: sticky; top: env(safe-area-inset-top, 0px); z-index: 10;
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  border-bottom: 1px solid var(--line);
+}
+.nav .wrap { display: flex; align-items: center; gap: 24px; height: 60px; }
+.logo { display: flex; align-items: center; gap: 10px; font: 700 18px var(--display); color: var(--fg); text-decoration: none; }
+.logo svg { width: 22px; height: 22px; }
+.nav ul { display: flex; gap: 22px; list-style: none; margin: 0 0 0 auto; padding: 0; }
+.nav ul a { color: var(--muted); text-decoration: none; font-weight: 500; font-size: 15px; }
+.nav ul a:hover { color: var(--fg); }
+@media (max-width: 720px) { .nav ul { display: none; } }
+
+/* buttons */
+.btns { display: flex; flex-wrap: wrap; gap: 12px; }
+.btn {
+  display: inline-flex; align-items: center; gap: 10px; padding: 14px 22px; border-radius: 8px;
+  font: 600 16px var(--body); text-decoration: none; border: 1px solid var(--line); color: var(--fg); background: var(--surface);
+  transition: transform .15s ease, box-shadow .15s ease;
+}
+.btn:hover { transform: translateY(-1px); box-shadow: var(--shadow); }
+.btn.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.btn small { font: 400 12px var(--mono); opacity: .75; }
+.btn svg { width: 18px; height: 18px; flex: none; }
+
+/* hero */
+.hero { position: relative; overflow: hidden; padding-block: 72px 40px; }
+.hero::before {
+  content: ""; position: absolute; inset: -20% -10% auto; height: 700px; pointer-events: none;
+  background: radial-gradient(closest-side, var(--glow), transparent 70%);
+}
+.hero-grid { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr); gap: 48px; align-items: center; }
+.hero h1 { font-size: clamp(54px, 9vw, 104px); letter-spacing: -.035em; }
+.hero h1 span { color: var(--accent); }
+.lead { font-size: clamp(18px, 2vw, 21px); color: var(--muted); max-width: 34em; margin-block: 20px 30px; }
+.lead b { color: var(--fg); font-weight: 600; }
+.term {
+  background: var(--term-bg); color: var(--term-fg); border-radius: 10px; padding: 18px 20px;
+  font: 400 13px/1.75 var(--mono); box-shadow: var(--shadow); border: 1px solid #1d2a48; overflow-x: auto;
+}
+.term .bar { display: flex; gap: 6px; margin-bottom: 12px; }
+.term .bar i { width: 10px; height: 10px; border-radius: 50%; background: #2a3958; }
+.term .ok { color: var(--term-ok); }
+.term .dim { color: var(--term-dim); }
+.term .line { white-space: pre; opacity: 1; animation: boot .35s ease both; }
+@keyframes boot { from { opacity: 0; transform: translateY(3px); } }
+.cursor { display: inline-block; width: .6em; height: 1.1em; background: var(--term-ok); vertical-align: -2px; animation: blink 1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+
+.shot {
+  margin: 0; border-radius: 10px; overflow: hidden; border: 1px solid var(--line);
+  box-shadow: var(--shadow); background: var(--term-bg); cursor: zoom-in;
+}
+.shot img { aspect-ratio: 16 / 9; width: 100%; height: auto; object-fit: cover; }
+.hero-shot { margin-top: 48px; }
+.hero-shot figcaption, .caption { font: 400 13px var(--mono); color: var(--muted); padding-top: 10px; }
+
+/* specs strip */
+.specs { border-block: 1px solid var(--line); background: var(--surface); }
+.specs dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin: 0; }
+.specs div { padding: 22px 18px; border-left: 1px solid var(--line); }
+.specs div:first-child { border-left: 0; }
+.specs dt { font: 600 11px var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+.specs dd { margin: 6px 0 0; font: 500 19px var(--display); font-variant-numeric: tabular-nums; }
+
+section { padding-block: 96px; }
+.head { display: grid; gap: 14px; max-width: 46em; margin-bottom: 48px; }
+.head p { color: var(--muted); font-size: 18px; }
+
+/* features */
+.feature { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 48px; align-items: center; padding-block: 36px; }
+.feature:nth-child(even) { grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr); }
+.feature:nth-child(even) .shot { order: 2; }
+.feature .text { display: grid; gap: 14px; }
+.feature .text p { color: var(--muted); }
+.feature ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+.feature li { padding-left: 22px; position: relative; }
+.feature li::before { content: ""; position: absolute; left: 0; top: .62em; width: 10px; height: 10px; border-radius: 2px; background: var(--accent); opacity: .85; }
+.tags { display: flex; flex-wrap: wrap; gap: 8px; }
+.tag { font: 400 12px var(--mono); padding: 4px 9px; border: 1px solid var(--line); border-radius: 5px; color: var(--muted); }
+
+/* gallery */
+.gallery { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+.gallery figure { margin: 0; }
+.gallery .shot { box-shadow: none; }
+.gallery .shot:hover { box-shadow: var(--shadow); }
+
+/* run */
+.run { background: var(--surface); border-block: 1px solid var(--line); }
+.steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; counter-reset: step; list-style: none; margin: 0; padding: 0; }
+.steps li { counter-increment: step; display: grid; gap: 10px; align-content: start; padding: 24px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); }
+.steps li::before { content: counter(step); font: 700 30px var(--display); color: var(--accent); }
+.steps p { color: var(--muted); }
+.steps code, .note code { font: 400 14px var(--mono); background: var(--surface); border: 1px solid var(--line); padding: 1px 6px; border-radius: 4px; word-break: break-word; }
+.cmd { margin-top: 32px; display: grid; gap: 10px; }
+.cmd .term { font-size: 13.5px; }
+.note { color: var(--muted); font-size: 15px; margin-top: 16px; }
+
+/* under the hood */
+.boot-chain { display: flex; flex-wrap: wrap; align-items: stretch; gap: 10px; margin-bottom: 40px; }
+.boot-chain div { flex: 1 1 160px; padding: 16px 18px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.boot-chain b { display: block; font: 500 16px var(--display); margin-bottom: 4px; }
+.boot-chain span { font: 400 13px var(--mono); color: var(--muted); }
+.libs { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 0; border-top: 1px solid var(--line); }
+.libs div { padding: 18px 0; border-bottom: 1px solid var(--line); display: grid; gap: 4px; padding-right: 24px; }
+.libs b { font: 600 15px var(--mono); }
+.libs span { color: var(--muted); font-size: 15px; }
+
+footer { padding-block: 40px 56px; color: var(--muted); font-size: 15px; }
+footer .wrap { display: flex; flex-wrap: wrap; gap: 16px 32px; justify-content: space-between; align-items: center; }
+
+/* lightbox */
+.lightbox { position: fixed; inset: 0; z-index: 50; background: rgba(4, 8, 20, .92); display: grid; place-items: center; padding: 20px; cursor: zoom-out; }
+.lightbox img { max-height: 88vh; border-radius: 8px; box-shadow: 0 30px 80px rgba(0,0,0,.6); }
+.lightbox p { color: #c9d4ea; font: 400 14px var(--mono); margin-top: 12px; text-align: center; }
+
+@media (max-width: 900px) {
+  .hero-grid, .feature, .feature:nth-child(even) { grid-template-columns: minmax(0, 1fr); gap: 28px; }
+  .feature:nth-child(even) .shot { order: 0; }
+  .gallery { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .steps { grid-template-columns: minmax(0, 1fr); }
+  section { padding-block: 64px; }
+}
+@media (max-width: 520px) {
+  .gallery { grid-template-columns: minmax(0, 1fr); }
+  .specs div { border-left: 0; border-top: 1px solid var(--line); }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before { animation: none !important; transition: none !important; }
+  html { scroll-behavior: auto; }
+}
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="wrap">
+    <a class="logo" href="#top" aria-label="EverOS">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1" y="1" width="6.4" height="6.4" rx="1.3" fill="#4f8cff"/><rect x="8.6" y="1" width="6.4" height="6.4" rx="1.3" fill="#2f6fe8"/><rect x="1" y="8.6" width="6.4" height="6.4" rx="1.3" fill="#2f6fe8"/><rect x="8.6" y="8.6" width="6.4" height="6.4" rx="1.3" fill="#1f5fd6"/></svg>
+      EverOS
+    </a>
+    <ul>
+      <li><a href="#features">Возможности</a></li>
+      <li><a href="#screens">Скриншоты</a></li>
+      <li><a href="#run">Как запустить</a></li>
+      <li><a href="#inside">Внутри</a></li>
+      <li><a href="https://github.com/cladecarvsna-creator/everos">GitHub</a></li>
+    </ul>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="wrap hero-grid">
+    <div>
+      <p class="label">x86_64 · ASM + Rust · с нуля</p>
+      <h1 style="margin-top:18px">Ever<span>OS</span></h1>
+      <p class="lead">Операционная система, написанная с нуля на <b>ассемблере и Rust</b>. Загружается в рабочий стол 1920×1080, открывает сайты по HTTPS, хранит файлы на диске и переписывается в <b>Telegram</b>.</p>
+      <div class="btns">
+        <a class="btn primary" href="https://github.com/cladecarvsna-creator/everos/releases/latest/download/everos.iso">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m0 0-5-5m5 5 5-5M4 20h16"/></svg>
+          Скачать ISO <small>последняя сборка</small>
+        </a>
+        <a class="btn" href="https://github.com/cladecarvsna-creator/everos">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.52-1.33-1.28-1.69-1.28-1.69-1.05-.71.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.42-2.7 5.4-5.26 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .5Z"/></svg>
+          Исходный код
+        </a>
+      </div>
+    </div>
+    <div class="term" role="img" aria-label="Журнал загрузки EverOS">
+      <div class="bar"><i></i><i></i><i></i></div>
+      <div class="line" style="animation-delay:.1s"><span class="dim">GRUB</span>  multiboot2 → boot/boot.asm</div>
+      <div class="line" style="animation-delay:.35s"><span class="ok">[ ok ]</span> CPUID: long mode supported</div>
+      <div class="line" style="animation-delay:.6s"><span class="ok">[ ok ]</span> paging on, entering 64-bit mode</div>
+      <div class="line" style="animation-delay:.85s"><span class="ok">[ ok ]</span> kernel_main() — Rust, no_std</div>
+      <div class="line" style="animation-delay:1.1s"><span class="ok">[ ok ]</span> ATA disk 0: FAT32, C:\ mounted</div>
+      <div class="line" style="animation-delay:1.35s"><span class="ok">[ ok ]</span> e1000: link up, DHCP 10.0.2.15</div>
+      <div class="line" style="animation-delay:1.6s"><span class="ok">[ ok ]</span> framebuffer 1920x1080x32</div>
+      <div class="line" style="animation-delay:1.85s"><span class="dim">everos&gt;</span> <span class="cursor"></span></div>
+    </div>
+  </div>
+  <div class="wrap" style="position:relative">
+    <figure class="shot hero-shot" data-full="img/hero.webp">
+      <img src="img/hero.webp" width="1600" height="900" alt="Рабочий стол EverOS в тёмной теме: открыты меню Start, Параметры и Терминал">
+    </figure>
+    <p class="caption">Настоящий снимок экрана из QEMU: тёмная тема, меню Start, Параметры и Терминал.</p>
+  </div>
+</header>
+
+<div class="specs">
+  <div class="wrap">
+    <dl>
+      <div><dt>Архитектура</dt><dd>x86_64</dd></div>
+      <div><dt>Экран</dt><dd>1920×1080</dd></div>
+      <div><dt>Диск</dt><dd>FAT32 · ATA</dd></div>
+      <div><dt>Сеть</dt><dd>TCP/IP · TLS 1.3</dd></div>
+      <div><dt>JavaScript</dt><dd>ES2023</dd></div>
+      <div><dt>Telegram</dt><dd>MTProto 2.0</dd></div>
+    </dl>
+  </div>
+</div>
+
+<section id="features">
+  <div class="wrap">
+    <div class="head">
+      <p class="label">Возможности</p>
+      <h2>Всё, что ждёшь от компьютера, только своё</h2>
+      <p>Каждая часть написана для EverOS: драйверы, файловая система, оконная система, браузерный движок и клиент Telegram.</p>
+    </div>
+
+    <div class="features">
+      <article class="feature">
+        <figure class="shot" data-full="img/desktop.webp"><img src="img/desktop.webp" width="1600" height="900" loading="lazy" alt="Рабочий стол EverOS со значками и панелью задач"></figure>
+        <div class="text">
+          <h3>Рабочий стол в стиле Windows 11</h3>
+          <p>Система сразу загружается в графический рабочий стол. Сглаженные шрифты, скруглённые углы, мягкие тени, и ничего не мерцает.</p>
+          <ul>
+            <li>Окна перетаскиваются, сворачиваются в панель и плавно появляются</li>
+            <li>Меню Start с поиском по программам, клавиша Win</li>
+            <li>Виртуальные рабочие столы, Корзина, закрепление на панели</li>
+          </ul>
+        </div>
+      </article>
+
+      <article class="feature">
+        <figure class="shot" data-full="img/signin.webp"><img src="img/signin.webp" width="1600" height="900" loading="lazy" alt="Экран входа EverOS с аватаром и полем пароля"></figure>
+        <div class="text">
+          <h3>Экран блокировки и вход</h3>
+          <p>Большие часы на экране блокировки, по клавише он уезжает вверх и открывает вход на размытом фоне. Неверный пароль встряхивает поле.</p>
+          <ul>
+            <li>Несколько пользователей, у каждого своя папка <code style="font:400 14px var(--mono)">C:\Users\имя</code></li>
+            <li>Пароли хранятся только как хеш с солью</li>
+          </ul>
+        </div>
+      </article>
+
+      <article class="feature">
+        <figure class="shot" data-full="img/browser.webp"><img src="img/browser.webp" width="1600" height="900" loading="lazy" alt="Браузер EverBrowser с двумя вкладками Википедии"></figure>
+        <div class="text">
+          <h3>Браузер со своим движком</h3>
+          <p>EverBrowser открывает сайты по HTTP и HTTPS, разбирает HTML и CSS, раскладывает flexbox и grid и выполняет JavaScript. Страницы грузятся в фоне, рабочий стол при этом не замирает.</p>
+          <div class="tags"><span class="tag">вкладки</span><span class="tag">TLS 1.3</span><span class="tag">QuickJS</span><span class="tag">PNG · JPEG</span><span class="tag">cookie</span><span class="tag">формы</span></div>
+        </div>
+      </article>
+
+      <article class="feature">
+        <figure class="shot" data-full="img/explorer.webp"><img src="img/explorer.webp" width="1600" height="900" loading="lazy" alt="Проводник EverOS в виде таблицы"></figure>
+        <div class="text">
+          <h3>Файлы, Проводник и Блокнот</h3>
+          <p>Драйвер жёсткого диска и FAT32 с длинными русскими именами. Файлы переживают перезагрузку, а тот же диск открывается в Windows и Linux.</p>
+          <ul>
+            <li>Проводник: адресная строка, поиск, «Таблица» и «Значки», F2 и Del</li>
+            <li>Блокнот: UTF-8 и Windows-1251, отмена, выделение, Сохранить как</li>
+          </ul>
+        </div>
+      </article>
+
+      <article class="feature">
+        <figure class="shot" data-full="img/telegram.webp"><img src="img/telegram.webp" width="1600" height="900" loading="lazy" alt="Клиент Telegram в EverOS: список чатов и переписка"></figure>
+        <div class="text">
+          <h3>Telegram</h3>
+          <p>Свой клиент в стиле Telegram Desktop, протокол MTProto 2.0 написан с нуля. Вход по номеру и коду, личные чаты, группы, каналы, фото, файлы и цветные эмодзи.</p>
+          <p class="note" style="margin:0">Ключи api_id и api_hash у каждого свои, их получают на my.telegram.org. В EverOS их нет.</p>
+        </div>
+      </article>
+
+      <article class="feature">
+        <figure class="shot" data-full="img/installer.webp"><img src="img/installer.webp" width="1600" height="900" loading="lazy" alt="Мастер установки EverOS: выбор диска"></figure>
+        <div class="text">
+          <h3>Установка на диск</h3>
+          <p>ISO запускает мастер установки: язык, лицензия, выбор диска, учётная запись. Установщик размечает диск, копирует ядро и ставит GRUB, после перезагрузки EverOS стартует уже с диска.</p>
+          <p>Можно и не устанавливать: кнопка «Попробовать EverOS» запускает систему прямо с ISO.</p>
+        </div>
+      </article>
+
+      <article class="feature">
+        <figure class="shot" data-full="img/wifi.webp"><img src="img/wifi.webp" width="1600" height="900" loading="lazy" alt="Список сетей Wi‑Fi в быстрых настройках EverOS"></figure>
+        <div class="text">
+          <h3>Сеть, Wi‑Fi и прокси</h3>
+          <p>Сетевая карта Intel e1000, DHCP и DNS: в QEMU интернет работает без настройки. WPA2-Personal написан целиком, а в Параметрах есть HTTP и SOCKS5 прокси.</p>
+        </div>
+      </article>
+
+      <article class="feature">
+        <figure class="shot" data-full="img/personalize.webp"><img src="img/personalize.webp" width="1600" height="900" loading="lazy" alt="Параметры персонализации EverOS: темы и обои"></figure>
+        <div class="text">
+          <h3>Темы и обои</h3>
+          <p>Светлая и тёмная тема, цвет акцента, свои обои, анимации загрузки, перезагрузки и выключения.</p>
+        </div>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section id="screens" style="padding-top:0">
+  <div class="wrap">
+    <div class="head">
+      <p class="label">Скриншоты</p>
+      <h2>Как это выглядит</h2>
+      <p>Все снимки сделаны в QEMU. Нажмите, чтобы открыть крупно.</p>
+    </div>
+    <div class="gallery">
+      <figure><div class="shot" data-full="img/lock.webp"><img src="img/lock.webp" width="1600" height="900" loading="lazy" alt="Экран блокировки с часами"></div><figcaption class="caption">Экран блокировки</figcaption></figure>
+      <figure><div class="shot" data-full="img/taskview.webp"><img src="img/taskview.webp" width="1600" height="900" loading="lazy" alt="Представление задач и виртуальные рабочие столы"></div><figcaption class="caption">Виртуальные рабочие столы</figcaption></figure>
+      <figure><div class="shot" data-full="img/notepad.webp"><img src="img/notepad.webp" width="1600" height="900" loading="lazy" alt="Блокнот с русским текстом"></div><figcaption class="caption">Блокнот</figcaption></figure>
+      <figure><div class="shot" data-full="img/settings.webp"><img src="img/settings.webp" width="1600" height="900" loading="lazy" alt="Параметры, страница Система"></div><figcaption class="caption">Параметры</figcaption></figure>
+      <figure><div class="shot" data-full="img/paint.webp"><img src="img/paint.webp" width="1600" height="900" loading="lazy" alt="Paint с рисунком"></div><figcaption class="caption">Paint</figcaption></figure>
+      <figure><div class="shot" data-full="img/telegram-dark.webp"><img src="img/telegram-dark.webp" width="1600" height="900" loading="lazy" alt="Telegram в тёмной теме"></div><figcaption class="caption">Telegram, тёмная тема</figcaption></figure>
+    </div>
+  </div>
+</section>
+
+<section class="run" id="run">
+  <div class="wrap">
+    <div class="head">
+      <p class="label">Как запустить</p>
+      <h2>Три шага до рабочего стола</h2>
+      <p>EverOS запускается в виртуальной машине QEMU. Каждый раз, когда в репозитории появляется новый код, собирается свежий ISO.</p>
+    </div>
+    <ol class="steps">
+      <li>
+        <h3>Скачайте файлы</h3>
+        <p><a href="https://github.com/cladecarvsna-creator/everos/releases/latest/download/everos.iso">everos.iso</a> и <a href="https://github.com/cladecarvsna-creator/everos/releases/latest/download/run-windows.bat">run-windows.bat</a>, положите их в одну папку.</p>
+      </li>
+      <li>
+        <h3>Поставьте QEMU</h3>
+        <p>Для Windows установщик есть на <a href="https://www.qemu.org/download/#windows">qemu.org</a>. Скрипт найдёт его в <code>C:\Program Files\qemu</code>.</p>
+      </li>
+      <li>
+        <h3>Запустите</h3>
+        <p>Дважды щёлкните <code>run-windows.bat</code>. Первый запуск откроет установщик, дальше EverOS стартует с диска <code>everos-disk.vhd</code>.</p>
+      </li>
+    </ol>
+    <div class="cmd">
+      <p class="label">Linux и macOS</p>
+      <div class="term"><span class="dim">$</span> qemu-img create -f raw everos-disk.img 128M
+<br><span class="dim">$</span> qemu-system-x86_64 -cdrom everos.iso -boot order=cd -m 512M \
+<br>    -drive file=everos-disk.img,format=raw,if=ide -nic user,model=e1000</div>
+      <p class="note">Флаг <code>-nic user,model=e1000</code> даёт EverOS интернет через сеть компьютера. Из исходников: <code>make run</code>.</p>
+    </div>
+  </div>
+</section>
+
+<section id="inside">
+  <div class="wrap">
+    <div class="head">
+      <p class="label">Внутри</p>
+      <h2>От включения до рабочего стола</h2>
+      <p>Загрузчик GRUB передаёт управление коду на ассемблере, тот готовит процессор и вызывает ядро на Rust. Дальше всё своё.</p>
+    </div>
+    <div class="boot-chain">
+      <div><b>GRUB 2</b><span>multiboot2</span></div>
+      <div><b>boot/*.asm</b><span>CPUID, страницы, long mode</span></div>
+      <div><b>kernel/</b><span>Rust, no_std</span></div>
+      <div><b>Драйверы</b><span>ATA, e1000, PS/2, framebuffer</span></div>
+      <div><b>Рабочий стол</b><span>окна, анимации, программы</span></div>
+    </div>
+    <div class="libs">
+      <div><b>smoltcp</b><span>стек TCP/IP</span></div>
+      <div><b>embedded-tls</b><span>HTTPS, TLS 1.3</span></div>
+      <div><b>QuickJS</b><span>JavaScript в браузере</span></div>
+      <div><b>zune-png · zune-jpeg</b><span>картинки</span></div>
+      <div><b>MTProto 2.0</b><span>Telegram, написан с нуля</span></div>
+      <div><b>WPA2-Personal</b><span>PBKDF2, 4-way handshake</span></div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>EverOS · лицензия MIT</span>
+    <a href="https://github.com/cladecarvsna-creator/everos">github.com/cladecarvsna-creator/everos</a>
+  </div>
+</footer>
+
+<script>
+(function () {
+  document.querySelectorAll('[data-full]').forEach(function (el) {
+    el.tabIndex = 0;
+    el.setAttribute('role', 'button');
+    function open() {
+      var img = el.querySelector('img');
+      var box = document.createElement('div');
+      box.className = 'lightbox';
+      box.innerHTML = '<div><img alt=""><p></p></div>';
+      box.querySelector('img').src = el.getAttribute('data-full');
+      box.querySelector('img').alt = img.alt;
+      box.querySelector('p').textContent = img.alt;
+      function close() { box.remove(); document.removeEventListener('keydown', onKey); el.focus(); }
+      function onKey(e) { if (e.key === 'Escape') close(); }
+      box.addEventListener('click', close);
+      document.addEventListener('keydown', onKey);
+      document.body.appendChild(box);
+    }
+    el.addEventListener('click', open);
+    el.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+  });
+})();
+</script>
+</body>
+</html>
