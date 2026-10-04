@@ -47,6 +47,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html { scroll-behavior: smooth; }
 body {
   margin: 0; background: var(--bg); color: var(--fg);
@@ -154,14 +155,30 @@ section { padding-block: 96px; }
 
 /* run */
 .run { background: var(--surface); border-block: 1px solid var(--line); }
-.steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; counter-reset: step; list-style: none; margin: 0; padding: 0; }
-.steps li { counter-increment: step; display: grid; gap: 10px; align-content: start; padding: 24px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); }
-.steps li::before { content: counter(step); font: 700 30px var(--display); color: var(--accent); }
+.tabs { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 28px; }
+.tab {
+  display: grid; gap: 2px; text-align: left; flex: 1 1 220px; padding: 16px 18px; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--bg); color: var(--fg); font: inherit;
+}
+.tab b { font: 500 17px var(--display); }
+.tab span { font: 400 13px var(--mono); color: var(--muted); }
+.tab[aria-selected="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.tab[aria-selected="true"] b { color: var(--accent); }
+.panel { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 32px 48px; align-items: start; }
+.panel h3 { margin-bottom: 14px; }
+.steps { counter-reset: step; list-style: none; margin: 0; padding: 0; display: grid; gap: 18px; }
+.steps li { counter-increment: step; display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 4px 14px; }
+.steps li::before { content: counter(step); grid-row: span 2; font: 700 22px/1.2 var(--display); color: var(--accent); }
+.steps b { font-weight: 600; }
 .steps p { color: var(--muted); }
-.steps code, .note code { font: 400 14px var(--mono); background: var(--surface); border: 1px solid var(--line); padding: 1px 6px; border-radius: 4px; word-break: break-word; }
-.cmd { margin-top: 32px; display: grid; gap: 10px; }
-.cmd .term { font-size: 13.5px; }
-.note { color: var(--muted); font-size: 15px; margin-top: 16px; }
+.steps code, .note code, .side code { font: 400 14px var(--mono); background: var(--bg); border: 1px solid var(--line); padding: 1px 6px; border-radius: 4px; word-break: break-word; }
+.side { display: grid; gap: 14px; min-width: 0; }
+.side .term { font-size: 13px; white-space: pre; }
+.note { color: var(--muted); font-size: 15px; }
+.warn { border: 1px solid var(--line); border-left: 3px solid #e0a43a; border-radius: 8px; padding: 14px 16px; background: var(--bg); font-size: 15px; display: grid; gap: 6px; }
+.warn b { font-weight: 600; }
+.warn ul { margin: 0; padding-left: 18px; color: var(--muted); display: grid; gap: 4px; }
+@media (max-width: 900px) { .panel { grid-template-columns: minmax(0, 1fr); } }
 
 /* under the hood */
 .boot-chain { display: flex; flex-wrap: wrap; align-items: stretch; gap: 10px; margin-bottom: 40px; }
@@ -380,29 +397,90 @@ footer .wrap { display: flex; flex-wrap: wrap; gap: 16px 32px; justify-content: 
   <div class="wrap">
     <div class="head">
       <p class="label">Как запустить</p>
-      <h2>Три шага до рабочего стола</h2>
-      <p>EverOS запускается в виртуальной машине QEMU. Каждый раз, когда в репозитории появляется новый код, собирается свежий ISO.</p>
+      <h2>Три способа запустить EverOS</h2>
+      <p>Готовый ISO собирается автоматически при каждом изменении кода. Его можно записать на флешку, запустить в QEMU или собрать самому из исходников.</p>
     </div>
-    <ol class="steps">
-      <li>
-        <h3>Скачайте файлы</h3>
-        <p><a href="https://github.com/cladecarvsna-creator/everos/releases/latest/download/everos.iso">everos.iso</a> и <a href="https://github.com/cladecarvsna-creator/everos/releases/latest/download/run-windows.bat">run-windows.bat</a>, положите их в одну папку.</p>
-      </li>
-      <li>
-        <h3>Поставьте QEMU</h3>
-        <p>Для Windows установщик есть на <a href="https://www.qemu.org/download/#windows">qemu.org</a>. Скрипт найдёт его в <code>C:\Program Files\qemu</code>.</p>
-      </li>
-      <li>
-        <h3>Запустите</h3>
-        <p>Дважды щёлкните <code>run-windows.bat</code>. Первый запуск откроет установщик, дальше EverOS стартует с диска <code>everos-disk.vhd</code>.</p>
-      </li>
-    </ol>
-    <div class="cmd">
-      <p class="label">Linux и macOS</p>
-      <div class="term"><span class="dim">$</span> qemu-img create -f raw everos-disk.img 128M
-<br><span class="dim">$</span> qemu-system-x86_64 -cdrom everos.iso -boot order=cd -m 512M \
-<br>    -drive file=everos-disk.img,format=raw,if=ide -nic user,model=e1000</div>
-      <p class="note">Флаг <code>-nic user,model=e1000</code> даёт EverOS интернет через сеть компьютера. Из исходников: <code>make run</code>.</p>
+
+    <div class="tabs" role="tablist" aria-label="Способ запуска">
+      <button class="tab" role="tab" id="tab-usb" aria-controls="run-usb" aria-selected="true"><b>Флешка</b><span>Ventoy или Rufus, настоящий ПК</span></button>
+      <button class="tab" role="tab" id="tab-build" aria-controls="run-build" aria-selected="false"><b>Сборка из исходников</b><span>Rust, nasm, GRUB, make</span></button>
+      <button class="tab" role="tab" id="tab-qemu" aria-controls="run-qemu" aria-selected="false"><b>QEMU</b><span>виртуальная машина, проще всего</span></button>
+    </div>
+
+    <div class="panel" role="tabpanel" id="run-usb" aria-labelledby="tab-usb">
+      <div>
+        <h3>Ventoy</h3>
+        <ol class="steps">
+          <li><b>Скачайте <a href="https://github.com/cladecarvsna-creator/everos/releases/latest/download/everos.iso">everos.iso</a></b><p>Это последняя сборка из релизов на GitHub.</p></li>
+          <li><b>Подготовьте флешку Ventoy</b><p>Скачайте <a href="https://www.ventoy.net/">Ventoy</a>, запустите Ventoy2Disk и нажмите Install. Если Ventoy на флешке уже есть, этот шаг не нужен.</p></li>
+          <li><b>Скопируйте ISO на флешку</b><p>Просто перетащите <code>everos.iso</code> на диск Ventoy, как обычный файл.</p></li>
+          <li><b>Загрузитесь с флешки</b><p>В меню загрузки компьютера (обычно F12, F11, F8 или Esc) выберите флешку, затем EverOS в меню Ventoy.</p></li>
+        </ol>
+        <h3 style="margin-top:32px">Rufus</h3>
+        <ol class="steps">
+          <li><b>Откройте <a href="https://rufus.ie/">Rufus</a> и выберите everos.iso</b><p>Устройство: ваша флешка. Всё на ней будет стёрто.</p></li>
+          <li><b>Схема разделов MBR, целевая система BIOS</b><p>Если Rufus спросит режим записи, выберите «Записать в режиме DD-образа».</p></li>
+          <li><b>Нажмите «Старт» и загрузитесь с флешки</b><p>Через меню загрузки, как в способе с Ventoy.</p></li>
+        </ol>
+      </div>
+      <div class="side">
+        <div class="warn">
+          <b>Что нужно от компьютера</b>
+          <ul>
+            <li>Загрузка в режиме Legacy BIOS (CSM). Чистый UEFI пока не поддерживается: включите CSM в настройках BIOS и отключите Secure Boot.</li>
+            <li>Диск SATA в режиме IDE (Legacy). Диски NVMe и режим AHCI EverOS пока не видит, тогда она работает без диска, а файлы живут до перезагрузки.</li>
+            <li>Интернет работает только с сетевой картой Intel e1000. Драйвера настоящего Wi‑Fi чипа пока нет.</li>
+            <li>Клавиатура и мышь USB работают через эмуляцию PS/2 в BIOS (USB Legacy Support), обычно она включена.</li>
+          </ul>
+        </div>
+        <p class="note">На флешке EverOS запускается так же, как в QEMU: сначала мастер установки. Можно нажать «Попробовать EverOS без установки» и ничего не ставить на диск компьютера.</p>
+      </div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="run-build" aria-labelledby="tab-build" hidden>
+      <div>
+        <h3>Собрать ISO самому</h3>
+        <ol class="steps">
+          <li><b>Нужен Linux</b><p>Ubuntu, Debian или WSL на Windows. Сборке нужны <code>grub-mkrescue</code> и инструменты GNU.</p></li>
+          <li><b>Поставьте Rust</b><p>Через <a href="https://rustup.rs">rustup.rs</a>. Нужную версию и цель <code>x86_64-unknown-none</code> он сам возьмёт из <code>rust-toolchain.toml</code>.</p></li>
+          <li><b>Поставьте инструменты</b><p>Ассемблер nasm, GRUB, xorriso, mtools и QEMU для проверки.</p></li>
+          <li><b>Скачайте код и соберите</b><p>Команда <code>make</code> собирает ядро на Rust, код на ассемблере и упаковывает всё в <code>build/everos.iso</code>.</p></li>
+        </ol>
+      </div>
+      <div class="side">
+        <div class="term"><span class="dim"># инструменты (Ubuntu/Debian)</span>
+<span class="dim">$</span> sudo apt install nasm build-essential clang \
+    grub-pc-bin grub-common xorriso mtools qemu-system-x86
+<span class="dim">$</span> curl https://sh.rustup.rs -sSf | sh
+
+<span class="dim"># код и сборка</span>
+<span class="dim">$</span> git clone https://github.com/cladecarvsna-creator/everos
+<span class="dim">$</span> cd everos
+<span class="dim">$</span> make        <span class="dim"># → build/everos.iso</span>
+<span class="dim">$</span> make run    <span class="dim"># запустить в QEMU</span>
+<span class="dim">$</span> make test   <span class="dim"># проверка без экрана</span></div>
+        <p class="note">Готовый <code>build/everos.iso</code> можно записать на флешку или запустить в QEMU, как в двух других способах.</p>
+      </div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="run-qemu" aria-labelledby="tab-qemu" hidden>
+      <div>
+        <h3>Windows</h3>
+        <ol class="steps">
+          <li><b>Поставьте QEMU</b><p>Установщик с <a href="https://qemu.weilnetz.de/w64/">qemu.weilnetz.de</a> или командой <code>winget install SoftwareFreedomConservancy.QEMU</code>.</p></li>
+          <li><b>Скачайте два файла в одну папку</b><p><a href="https://github.com/cladecarvsna-creator/everos/releases/latest/download/everos.iso">everos.iso</a> и <a href="https://github.com/cladecarvsna-creator/everos/releases/latest/download/run-windows.bat">run-windows.bat</a>.</p></li>
+          <li><b>Запустите run-windows.bat</b><p>Двойным щелчком. Он сам создаст диск <code>everos-disk.vhd</code>, первый запуск откроет установщик, дальше EverOS стартует с диска.</p></li>
+        </ol>
+        <p class="note" style="margin-top:20px">Если окно 1920×1080 не помещается на экран, нажмите Ctrl+Alt+F. Чтобы снова открыть установщик, запустите <code>run-windows.bat setup</code>.</p>
+      </div>
+      <div class="side">
+        <p class="label">Linux и macOS</p>
+        <div class="term"><span class="dim">$</span> qemu-img create -f raw everos-disk.img 128M
+<span class="dim">$</span> qemu-system-x86_64 -cdrom everos.iso -boot order=cd \
+    -m 512M -rtc base=localtime -nic user,model=e1000 \
+    -drive file=everos-disk.img,format=raw,if=ide</div>
+        <p class="note">Флаг <code>-nic user,model=e1000</code> даёт EverOS интернет через сеть компьютера, ничего настраивать не нужно.</p>
+      </div>
     </div>
   </div>
 </section>
@@ -461,6 +539,26 @@ footer .wrap { display: flex; flex-wrap: wrap; gap: 16px 32px; justify-content: 
     el.addEventListener('click', open);
     el.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
   });
+
+  var tabs = document.querySelectorAll('.tab');
+  function select(t) {
+    tabs.forEach(function (x) {
+      var on = x === t;
+      x.setAttribute('aria-selected', on);
+      x.tabIndex = on ? 0 : -1;
+      document.getElementById(x.getAttribute('aria-controls')).hidden = !on;
+    });
+  }
+  tabs.forEach(function (t, i) {
+    t.addEventListener('click', function () { select(t); });
+    t.addEventListener('keydown', function (e) {
+      var d = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
+      if (d) { var n = tabs[(i + d + tabs.length) % tabs.length]; select(n); n.focus(); }
+    });
+  });
+  var h = location.hash.slice(1);
+  tabs.forEach(function (t) { if (t.getAttribute('aria-controls') === h) { select(t); } });
+  select(document.querySelector('.tab[aria-selected="true"]'));
 })();
 </script>
 </body>
